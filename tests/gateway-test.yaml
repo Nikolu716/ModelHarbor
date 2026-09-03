@@ -1,0 +1,74 @@
+# 端到端测试配置：指向本地 mock 中转站
+gateway:
+  host: 127.0.0.1
+  port: 8000
+  max_attempts: 3
+  retry_backoff: 0.2
+  probe_interval: 5
+  fail_threshold: 2
+  cool_down: 30
+  first_byte_timeout: 5
+  read_timeout: 10
+  connect_timeout: 3
+  rate_limit_cooldown: 30
+  data_dir: data
+  webhook_url: http://127.0.0.1:9109/webhook
+
+stations:
+  - name: good
+    base_url: http://127.0.0.1:9101/v1
+    api_key: test-good-key
+    models: [mock-model]
+    priority: 1
+    billing: balance
+    probe_chat: true
+
+  - name: slow
+    base_url: http://127.0.0.1:9102/v1
+    api_key: test-slow-key
+    models: [mock-model]
+    priority: 2
+    billing: subscription
+    probe_chat: true
+
+  - name: stuck
+    base_url: http://127.0.0.1:9103/v1
+    api_key: test-stuck-key
+    models: [mock-model]
+    priority: 3
+    billing: balance
+
+  - name: bad401
+    base_url: http://127.0.0.1:9104/v1
+    api_key: test-bad-key
+    models: [mock-model]
+    priority: 1
+    billing: balance
+
+  - name: busy
+    base_url: http://127.0.0.1:9105/v1
+    api_key: test-busy-key
+    models: [mock-model]
+    priority: 1
+    billing: subscription
+
+  - name: noquota
+    base_url: http://127.0.0.1:9106/v1
+    api_key: test-noquota-key
+    models: [mock-model]
+    priority: 1
+    billing: balance
+
+  - name: subexpired
+    base_url: http://127.0.0.1:9107/v1
+    api_key: test-subexpired-key
+    models: [mock-model]
+    priority: 1
+    billing: subscription
+
+  - name: ratelimit
+    base_url: http://127.0.0.1:9108/v1
+    api_key: test-ratelimit-key
+    models: [mock-model]
+    priority: 1
+    billing: subscription

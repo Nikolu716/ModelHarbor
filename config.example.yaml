@@ -1,0 +1,52 @@
+# Local runtime configuration
+# Copy this file to config.yaml, then replace every placeholder before exposing the gateway.
+
+gateway:
+  # Keep loopback for a single-machine deployment. Use 0.0.0.0 only behind trusted network controls.
+  host: 127.0.0.1
+  port: 8000
+  max_attempts: 3
+  retry_backoff: 0.3
+  max_rounds: 3
+  round_backoff: 1.0
+  max_round_backoff: 30
+  max_retry_seconds: 300
+  probe_interval: 15
+  quota_auto_recover: true
+  quota_probe_interval: 60
+  quota_probe_max_interval: 300
+  fail_threshold: 3
+  cool_down: 60
+  connect_timeout: 10
+  first_byte_timeout: 120
+  read_timeout: 600
+  rate_limit_cooldown: 30
+
+  # Empty means local clients are not authenticated. Set a strong random value for shared access.
+  api_keys: []
+  # Set a separate strong random value before enabling remote administration.
+  admin_key: ""
+  sse_keepalive_interval: 60
+  webhook_url: ""
+  data_dir: data
+  data_retention_days: 30
+
+stations:
+  # Replace this mock endpoint and key with a real OpenAI-compatible upstream.
+  # The bundled tests use the same shape with tests/mock_upstream.py.
+  - name: local-mock
+    base_url: http://127.0.0.1:9101/v1
+    api_key: replace-with-upstream-key
+    models:
+      - mock-model
+    priority: 1
+    weight: 1.0
+    timeout: 300
+    max_concurrency: 20
+    probe_models: true
+    probe_chat: false
+    billing: balance
+    headers: {}
+    wire_api: auto
+    inject: {}
+    enabled: true

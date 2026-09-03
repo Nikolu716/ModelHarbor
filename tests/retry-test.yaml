@@ -1,0 +1,26 @@
+# 多轮重试测试配置
+gateway:
+  host: 127.0.0.1
+  port: 8001
+  max_attempts: 2
+  max_rounds: 3
+  round_backoff: 1.0
+  retry_backoff: 0.1
+  probe_interval: 60
+  fail_threshold: 10
+  cool_down: 30
+  first_byte_timeout: 3
+  read_timeout: 10
+  connect_timeout: 3
+  data_dir: data
+
+stations:
+  - name: s1
+    base_url: http://127.0.0.1:9201/v1
+    api_key: k1
+    models: [m]
+
+  - name: s2
+    base_url: http://127.0.0.1:9202/v1
+    api_key: k2
+    models: [m]

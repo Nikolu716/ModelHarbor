@@ -1,0 +1,8 @@
+{
+  "name": "modelharbor-dashboard-tests",
+  "private": true,
+  "description": "Local-only dashboard safety test dependencies",
+  "dependencies": {
+    "jsdom": "^24.1.3"
+  }
+}

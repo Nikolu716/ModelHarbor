@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">ZGateway</title>
+  <desc id="desc">Black rounded square with an original white angular route mark.</desc>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#090909"/>
+  <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="13.25"
+        fill="none" stroke="#f5f5f7" stroke-width="1.5"/>
+  <g fill="#f5f5f7">
+    <rect x="15" y="15" width="34" height="8"/>
+    <path d="M39 15h10L25 49H15Z"/>
+    <rect x="15" y="41" width="34" height="8"/>
+  </g>
+</svg>

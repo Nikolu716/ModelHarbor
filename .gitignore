@@ -1,0 +1,51 @@
+# Runtime and generated state
+config.yaml
+data/
+
+# Python environments and caches
+.venv/
+venv/
+.env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local overrides
+.env*
+*.secret
+*.secrets
+
+# Logs, backups, captures, and temporary files
+*.log
+*.tmp
+*.bak
+*.bak-*
+*.err.log
+*_out.*
+
+# Local migration packages and build output
+ZGateway-migration-*.zip
+ZGateway-*.zip
+tools/nssm.zip
+build/
+dist/
+
+# Workspace/editor state
+.zcode/
+.vscode/
+.vscode-test/
+**/node_modules/
+
+# Separate vendored projects and local fixtures
+opencode-src/
+opencode-go-vscode/
+_codetest/
+query
+opencode_openapi.json
+vscode-shot.png
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#090909">
+  <title>中转站智能网关 · 控制台</title>
+  <link rel="icon" href="/static/brand-mark.svg?v=2" type="image/svg+xml">
+  <link rel="icon" href="/static/favicon.ico?v=2" sizes="any">
+  <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=2">
+  <link rel="stylesheet" href="/static/dashboard.css?v=6">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <img class="brand-mark" id="brandMark" src="/static/brand-mark.svg?v=2" alt="" width="34" height="34">
+        <div class="brand-copy">
+          <span class="brand-kicker">RELAY CONTROL</span>
+          <h1>中转站智能网关</h1>
+        </div>
+      </div>
+      <div class="sync-state" id="syncState" role="status" aria-live="polite">
+        <span class="sync-dot" aria-hidden="true"></span>
+        <span id="syncText">正在同步</span>
+      </div>
+    </header>
+
+    <div class="system-line">
+      <p class="system-meta" id="sub">正在连接网关</p>
+      <div class="route-live" id="routeLive" role="status" aria-live="polite">
+        <span class="route-dot" aria-hidden="true"></span>
+        <span class="route-label" id="routeLabel">当前路由</span>
+        <strong class="route-station" id="routeStation">等待首次路由</strong>
+        <span class="route-model" id="routeModel"></span>
+        <span class="route-meta" id="routeMeta"></span>
+      </div>
+    </div>
+
+    <section class="summary-strip" aria-label="网关概览">
+      <article class="metric">
+        <span class="metric-label">在线站点</span>
+        <strong class="metric-value" id="s-online">-</strong>
+      </article>
+      <article class="metric">
+        <span class="metric-label">累计调用</span>
+        <strong class="metric-value" id="s-calls">-</strong>
+      </article>
+      <article class="metric">
+        <span class="metric-label">故障切换</span>
+        <strong class="metric-value" id="s-switch">-</strong>
+      </article>
+      <article class="metric">
+        <span class="metric-label">整体成功率</span>
+        <strong class="metric-value" id="s-rate">-</strong>
+      </article>
+    </section>
+
+    <div class="control-row">
+      <nav class="primary-tabs" role="tablist" aria-label="数据范围">
+        <button id="tab-monitor" class="tab-button is-active" type="button" role="tab"
+                aria-selected="true" aria-controls="monitor-wrap" data-tab="monitor">实时监控</button>
+        <button id="tab-stats" class="tab-button" type="button" role="tab"
+                aria-selected="false" aria-controls="stats-wrap" data-tab="stats">今日统计</button>
+        <button id="tab-stations" class="tab-button" type="button" role="tab"
+                aria-selected="false" aria-controls="stations-wrap" data-tab="stations">站点管理</button>
+        <button id="tab-retry" class="tab-button" type="button" role="tab"
+                aria-selected="false" aria-controls="retry-wrap" data-tab="retry">重试设置</button>
+        <button id="tab-events" class="tab-button" type="button" role="tab"
+                aria-selected="false" aria-controls="events-wrap" data-tab="events">最近事件</button>
+      </nav>
+
+      <div class="view-switch" id="viewSwitch" role="group" aria-label="站点展示方式">
+        <button id="btn-list" class="view-button is-active" type="button" aria-pressed="true"
+                data-view="list">列表</button>
+        <button id="btn-card" class="view-button" type="button" aria-pressed="false"
+                data-view="card">卡片</button>
+      </div>
+    </div>
+
+    <main>
+      <section id="monitor-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-monitor">
+        <div class="station-grid" id="grid" hidden></div>
+        <div id="list-wrap"></div>
+      </section>
+
+      <section id="stats-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stats" hidden>
+        <div class="stats-overview">
+          <section class="stats-section usage-share" aria-labelledby="share-heading">
+            <div class="section-heading compact">
+              <div>
+                <span class="section-kicker">TOKEN DISTRIBUTION</span>
+                <h2 id="share-heading">模型 Token 分布</h2>
+              </div>
+            </div>
+            <div class="usage-tabs" id="usageTabs" role="tablist" aria-label="选择站点"></div>
+            <div class="usage-chart" id="usageChartPanel" role="tabpanel">
+              <div class="donut-stage">
+                <svg id="donut" class="donut" viewBox="0 0 180 180" role="group"
+                     aria-label="所选站点的模型 Token 用量"></svg>
+                <div class="donut-center" aria-hidden="true">
+                  <strong id="donutValue">0</strong>
+                  <span id="donutLabel">站点 Token</span>
+                </div>
+              </div>
+              <div class="usage-detail">
+                <div class="chart-inspector" id="chartInspector" aria-live="polite"></div>
+                <div class="model-breakdown" id="modelBreakdown" aria-label="选中站点的模型明细" hidden></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="stats-section daily-total" aria-labelledby="daily-heading">
+            <div class="section-heading compact">
+              <div>
+                <span class="section-kicker">TODAY</span>
+                <h2 id="daily-heading">今日汇总</h2>
+              </div>
+            </div>
+            <div class="daily-metrics" id="stats-summary"></div>
+            <div class="station-usage-list" id="stationUsageList" aria-label="各站点 Token 对比"></div>
+          </section>
+        </div>
+
+        <section class="cache-compare-section" aria-labelledby="cache-heading">
+          <div class="section-heading compact">
+            <div>
+              <span class="section-kicker">CACHE HIT</span>
+              <h2 id="cache-heading">各站缓存命中</h2>
+            </div>
+            <span class="section-note" id="cacheWindowNote">按命中率排序</span>
+          </div>
+          <div class="cache-window-tabs" id="cacheWindowTabs" role="tablist" aria-label="缓存统计窗口"></div>
+          <div class="cache-rank-list" id="cacheRankList" aria-label="各站点缓存命中率对比"></div>
+        </section>
+
+        <section class="timeline-section" aria-labelledby="timeline-heading">
+          <div class="section-heading compact">
+            <div>
+              <span class="section-kicker">HOURLY LOAD</span>
+              <h2 id="timeline-heading">每小时调用量</h2>
+            </div>
+            <span class="section-note">00:00 - 24:00</span>
+          </div>
+          <div class="gantt-scroll">
+            <div class="gantt-content">
+              <div class="gantt-axis" aria-hidden="true">
+                <span>00</span><span>06</span><span>12</span><span>18</span><span>24</span>
+              </div>
+              <div id="gantt"></div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section id="stations-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stations" hidden>
+        <div class="stations-layout">
+          <section class="stats-section station-form-panel" aria-labelledby="sf-heading">
+            <div class="section-heading compact">
+              <div><span class="section-kicker">STATION</span>
+                <h2 id="sf-heading">添加 / 编辑站点</h2></div>
+              <button class="button" type="button" id="sf-cancel" hidden>取消编辑</button>
+            </div>
+            <form id="station-form" class="station-form">
+              <div class="form-grid">
+                <label>名称 <input id="sf-name" required autocomplete="off" placeholder="如 station-a"></label>
+                <label>Base URL <input id="sf-base-url" type="url" required autocomplete="url" placeholder="https://api.xxx.com/v1"></label>
+                <label>API Key <input id="sf-api-key" type="password" required autocomplete="new-password" placeholder="your-upstream-key"></label>
+                <label>模型（逗号分隔）<input id="sf-models" placeholder="gpt-5.5, gpt-4o"></label>
+                <label>优先级 <input id="sf-priority" type="number" value="5" min="1"></label>
+                <label>计费模式
+                  <select id="sf-billing"><option value="balance">余额制</option><option value="subscription">订阅制</option></select></label>
+                <label class="checkbox"><input type="checkbox" id="sf-probe-chat"> 真实链路探测</label>
+                <label class="checkbox"><input type="checkbox" id="sf-probe-models"> 探测模型列表</label>
+                <label class="checkbox"><input type="checkbox" id="sf-enabled" checked> 启用</label>
+              </div>
+              <p class="form-status" id="stationFormStatus" role="status" aria-live="polite"></p>
+              <div class="station-form-actions">
+                <button class="button primary" type="submit" id="sf-submit">添加站点</button>
+              </div>
+            </form>
+          </section>
+          <section class="stats-section" aria-labelledby="sl-heading">
+            <div class="section-heading compact">
+              <div>
+                <span class="section-kicker">MANAGED</span>
+                <h2 id="sl-heading">站点列表 <span class="muted" id="stationsCount"></span></h2>
+              </div>
+              <div class="station-list-actions">
+                <button class="button secondary" type="button" id="stations-refresh">刷新</button>
+                <button class="button primary" type="button" id="stations-add">添加站点</button>
+              </div>
+            </div>
+            <p class="station-list-status" id="stationListStatus" role="status" aria-live="polite"></p>
+            <div class="table-shell" id="stationsTableShell"><table class="monitor-table station-table" id="stations-table">
+              <thead><tr><th>名称</th><th>地址</th><th>模型</th><th>优先级</th><th>计费</th><th>状态</th><th class="station-actions-col">操作</th></tr></thead>
+              <tbody id="stations-body"></tbody>
+            </table></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="retry-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-retry" hidden>
+        <div class="retry-settings-layout">
+          <div class="section-heading retry-settings-heading">
+            <div>
+              <span class="section-kicker">RETRY POLICY</span>
+              <h2 id="retry-heading">重试设置</h2>
+            </div>
+            <button class="button secondary" id="retry-reload" type="button">重新加载</button>
+          </div>
+
+          <form id="retry-form" class="retry-settings-form">
+            <fieldset class="retry-settings-group">
+              <legend>站点切换</legend>
+              <div class="retry-field-grid">
+                <label class="retry-field" for="retry-max-attempts">
+                  <span>单次最多尝试站点</span>
+                  <input id="retry-max-attempts" name="max_attempts" type="number"
+                         min="1" max="100" step="1" required inputmode="numeric">
+                </label>
+                <label class="retry-field" for="retry-backoff">
+                  <span>站点切换等待（秒）</span>
+                  <input id="retry-backoff" name="retry_backoff" type="number"
+                         min="0" max="60" step="0.1" required inputmode="decimal">
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset class="retry-settings-group">
+              <legend>整体重试</legend>
+              <label class="settings-toggle" for="retry-infinite-rounds">
+                <input id="retry-infinite-rounds" type="checkbox">
+                <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+                <span class="settings-toggle-label">不限轮次</span>
+              </label>
+              <div class="retry-field-grid">
+                <label class="retry-field" id="retry-max-rounds-field" for="retry-max-rounds">
+                  <span>最大重试轮次</span>
+                  <input id="retry-max-rounds" name="max_rounds" type="number"
+                         min="1" max="10000" step="1" required inputmode="numeric">
+                </label>
+                <label class="retry-field" for="retry-round-backoff">
+                  <span>轮间基础等待（秒）</span>
+                  <input id="retry-round-backoff" name="round_backoff" type="number"
+                         min="0.1" max="300" step="0.1" required inputmode="decimal">
+                </label>
+                <label class="retry-field" for="retry-max-round-backoff">
+                  <span>轮间最长等待（秒）</span>
+                  <input id="retry-max-round-backoff" name="max_round_backoff" type="number"
+                         min="0.1" max="600" step="0.1" required inputmode="decimal">
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset class="retry-settings-group">
+              <legend>总时长</legend>
+              <label class="settings-toggle" for="retry-unlimited-duration">
+                <input id="retry-unlimited-duration" type="checkbox">
+                <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+                <span class="settings-toggle-label">不限总时长</span>
+              </label>
+              <div class="retry-field-grid">
+                <label class="retry-field" id="retry-max-seconds-field" for="retry-max-seconds">
+                  <span>总重试时长上限（秒）</span>
+                  <input id="retry-max-seconds" name="max_retry_seconds" type="number"
+                         min="1" max="86400" step="1" required inputmode="decimal">
+                </label>
+              </div>
+            </fieldset>
+
+            <div class="retry-settings-footer">
+              <p class="form-status" id="retrySettingsStatus" role="status" aria-live="polite"></p>
+              <button class="button primary" id="retry-save" type="submit">保存设置</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section id="events-wrap" class="tab-panel events-section" role="tabpanel"
+               aria-labelledby="tab-events" hidden>
+        <div class="section-heading">
+          <div>
+            <span class="section-kicker">ACTIVITY</span>
+            <h2 id="events-heading">最近事件</h2>
+          </div>
+          <span class="section-note" id="eventCount">0 条记录</span>
+        </div>
+        <div class="table-shell event-shell">
+          <table class="event-table">
+            <caption class="sr-only">网关最近调用事件</caption>
+            <colgroup>
+              <col class="event-time-col"><col class="event-station-col"><col class="event-model-col">
+              <col class="event-result-col"><col class="event-latency-col"><col>
+            </colgroup>
+            <thead>
+              <tr><th>时间</th><th>站点</th><th>模型</th><th>结果</th><th>延迟</th><th>详情</th></tr>
+            </thead>
+            <tbody id="log-body">
+              <tr><td colspan="6" class="empty-cell">正在读取事件</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="event-pagination" aria-label="事件分页">
+          <span id="eventPageInfo">第 1 / 1 页</span>
+          <div class="pagination-actions">
+            <button class="button secondary" id="eventPrev" type="button" disabled>上一页</button>
+            <button class="button secondary" id="eventNext" type="button" disabled>下一页</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="auth-dialog" id="authDialog">
+    <form method="dialog" id="authForm">
+      <span class="section-kicker">ADMIN ACCESS</span>
+      <h2>连接管理接口</h2>
+      <p>输入 gateway.admin_key 以读取状态并执行站点操作。</p>
+      <label for="adminKeyInput">管理密钥</label>
+      <input id="adminKeyInput" type="password" autocomplete="current-password" required>
+      <div class="dialog-actions">
+        <button class="button secondary" value="cancel" type="button" id="authCancel">取消</button>
+        <button class="button primary" value="confirm" type="submit">连接</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/static/dashboard.js?v=2" defer></script>
+</body>
+</html>
