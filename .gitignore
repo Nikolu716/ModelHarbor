@@ -28,6 +28,8 @@ __pycache__/
 # Local migration packages and build output
 ZGateway-migration-*.zip
 ZGateway-*.zip
+tools/nssm-2.24/src/
+tools/nssm-2.24/win32/
 tools/nssm.zip
 build/
 dist/
