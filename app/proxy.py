@@ -33,7 +33,11 @@ from .errors import (
 from .router import Router
 from .state import Registry, StationState
 from .stats import EventLog
-from .wire import ChatStreamToResponsesTranslator, chat_to_responses, prepare_request
+from .wire import ChatStreamToResponsesTranslator, NamespaceMemory, chat_to_responses, prepare_request
+from .health import _retry_after_seconds
+from .protocols import MESSAGES, GENERATE, STREAM_GENERATE, GEMINI_PATHS, inference_url, native_text, error_body
+from .providers import MissingOpenCodeSession, inference_headers, request_context
+from .wire import UnsupportedWireRequest
 
 from .juice import response_model, response_text
 
@@ -94,10 +98,11 @@ def _error_response(status: int, message: str, err_type: str = "upstream_error")
     )
 
 
-def _error_sse(message: str) -> bytes:
+def _error_sse(message: str, path="") -> bytes:
     """SSE 流中途出错的回补事件。"""
-    obj = {"error": {"message": message, "type": "upstream_error", "param": None, "code": 500}}
-    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
+    obj = error_body(502, message, path)
+    prefix = "event: error\n" if path == MESSAGES else ""
+    return f"{prefix}data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 def _all_failed_message(attempts: list[str]) -> str:
@@ -152,13 +157,8 @@ def _strip_reasoning(body: dict):
     return None
 
 
-def _build_headers(st: StationState) -> dict:
-    return {
-        "Authorization": f"Bearer {st.cfg.api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        **st.cfg.headers,
-    }
+def _build_headers(st: StationState, client_headers=None, path=None) -> dict:
+    return inference_headers(st.cfg, client_headers, path=path)
 
 
 def _chunk_has_content(chunk: bytes) -> bool:
@@ -177,6 +177,18 @@ def _chunk_has_content(chunk: bytes) -> bool:
             continue
         if not isinstance(obj, dict):
             continue
+        if obj.get("error") or obj.get("type") == "error":
+            return True
+        if obj.get("type") == "content_block_delta":
+            delta = obj.get("delta") or {}
+            if delta.get("text") or delta.get("partial_json") or delta.get("thinking"):
+                return True
+        if obj.get("type") == "content_block_start" and (obj.get("content_block") or {}).get("type") in ("tool_use", "server_tool_use"):
+            return True
+        if obj.get("candidates"):
+            candidate = obj["candidates"][0]
+            if candidate.get("content", {}).get("parts") or candidate.get("finishReason"):
+                return True
         # responses 流式事件
         if obj.get("type") == "response.output_text.delta":
             return True
@@ -209,6 +221,11 @@ def stream_text(chunk: bytes) -> str:
             continue
         if not isinstance(obj, dict):
             continue
+        native = native_text(obj)
+        if native:
+            return native
+        if obj.get("type") == "content_block_delta":
+            return obj.get("delta", {}).get("text", "")
         for choice in obj.get("choices", []) or []:
             if isinstance(choice, dict):
                 delta = choice.get("delta")
@@ -222,6 +239,8 @@ def stream_text(chunk: bytes) -> str:
 def _looks_like_error(chunk: bytes) -> bool:
     """部分中转站用 200 + error JSON 表示失败，需识别并触发切换。"""
     s = chunk.decode("utf-8", errors="replace").strip()
+    if s.startswith(("event:", "data:")):
+        return any(_looks_like_error(line[5:].strip().encode()) for line in s.splitlines() if line.startswith("data:"))
     if s.startswith("data:"):
         s = s[5:].strip()
     if not s or s == "[DONE]":
@@ -325,8 +344,32 @@ def _parse_usage(usage) -> UsageBreakdown | None:
 
 
 def _usage_from_payload(obj) -> UsageBreakdown | None:
+    if isinstance(obj, list):
+        return next((usage for item in reversed(obj) if (usage := _usage_from_payload(item)) is not None), None)
     if not isinstance(obj, dict):
         return None
+    if isinstance(obj.get("usageMetadata"), dict):
+        meta = obj["usageMetadata"]
+        inp = _first_usage_int(meta.get("promptTokenCount"))
+        out = _first_usage_int(meta.get("candidatesTokenCount"))
+        thoughts = _first_usage_int(meta.get("thoughtsTokenCount"))
+        if thoughts is not None:
+            out = (out or 0) + thoughts
+        return UsageBreakdown(tokens=_first_usage_int(meta.get("totalTokenCount")),
+                              input_tokens=inp, output_tokens=out,
+                              cache_read=_first_usage_int(meta.get("cachedContentTokenCount")))
+    if obj.get("type") == "message_start":
+        obj = obj.get("message") or {}
+    if obj.get("type") in ("message", "message_delta") and isinstance(obj.get("usage"), dict):
+        raw = obj["usage"]
+        usage = _parse_usage(raw)
+        if usage is not None:
+            # Anthropic input_tokens excludes both cache reads and cache writes.
+            if usage.input_tokens is not None:
+                usage.input_tokens += (usage.cache_read or 0) + (usage.cache_write or 0)
+            usage.tokens = (usage.input_tokens + usage.output_tokens
+                            if usage.input_tokens is not None and usage.output_tokens is not None else None)
+        return usage
     usage = obj.get("usage")
     response = obj.get("response")
     if not isinstance(usage, dict) and isinstance(response, dict):
@@ -373,13 +416,44 @@ class _StreamUsageParser:
         self._buffer = ""
         self._data_lines: list[str] = []
         self.last: UsageBreakdown | None = None
+        self.error = ""
+        self._anthropic_usage: dict = {}
+        self.messages_finished = False
+        self.gemini_candidates: set[int] = set()
+        self.gemini_finished: set[int] = set()
 
     def _finish_event(self) -> int | None:
         if not self._data_lines:
             return None
         payload = "\n".join(self._data_lines)
         self._data_lines.clear()
-        usage = _usage_from_sse_data(payload)
+        try:
+            obj = json.loads(payload)
+        except (ValueError, TypeError):
+            obj = {}
+        if isinstance(obj, dict) and obj.get("error"):
+            err = obj["error"]
+            self.error = str(err.get("message", "上游流式错误") if isinstance(err, dict) else err)[:500]
+        if isinstance(obj, dict):
+            kind = obj.get("type")
+            if kind == "message_stop":
+                self.messages_finished = True
+            for position, candidate in enumerate(obj.get("candidates") or []):
+                index = candidate.get("index", position)
+                self.gemini_candidates.add(index)
+                if candidate.get("finishReason"):
+                    self.gemini_finished.add(index)
+            if kind in ("message_start", "message_delta"):
+                source = (obj.get("message") or {}) if kind == "message_start" else obj
+                raw = source.get("usage")
+                if isinstance(raw, dict):
+                    self._anthropic_usage.update({key: value for key, value in raw.items() if value is not None})
+                # Merge cumulative raw fields before adding cached input tokens.
+                usage = _usage_from_payload({"type": "message", "usage": self._anthropic_usage})
+            else:
+                usage = _usage_from_payload(obj)
+        else:
+            usage = _usage_from_payload(obj)
         if usage is None:
             return None
         self.last = usage
@@ -425,6 +499,28 @@ class _StreamUsageParser:
         return result
 
 
+class _NamespaceStreamScanner(_StreamUsageParser):
+    """Learn tool namespaces from complete SSE frames without changing bytes."""
+    def __init__(self, memory):
+        super().__init__()
+        self.memory = memory
+
+    def _finish_event(self):
+        payload = '\n'.join(self._data_lines)
+        self._data_lines.clear()
+        try:
+            self.memory.remember_sse(json.loads(payload))
+        except (ValueError, TypeError):
+            pass
+        return None
+
+    def feed(self, chunk):
+        super().feed(chunk)
+        if len(self._buffer) + sum(map(len, self._data_lines)) > 2 * 1024 * 1024:
+            self._buffer = ''
+            self._data_lines.clear()
+
+
 def _extract_stream_tokens(chunk: bytes) -> int | None:
     """Compatibility helper for a complete SSE byte sequence."""
     parser = _StreamUsageParser()
@@ -455,6 +551,7 @@ async def _read_until_content(stream_iter, timeout: float):
     注意：不做内部 aclose，由调用方在失败路径统一清理。
     """
     buffered: list[bytes] = []
+    scan = bytearray()
     while True:
         try:
             chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=timeout)
@@ -463,8 +560,15 @@ async def _read_until_content(stream_iter, timeout: float):
         except BaseException:
             raise
         buffered.append(chunk)
-        if _chunk_has_content(chunk):
+        scan.extend(chunk)
+        if _chunk_has_content(bytes(scan)):
             return buffered, True
+        # Retain only the partial event when the upstream fragments SSE frames.
+        boundary = scan.rfind(b"\n\n")
+        if boundary >= 0:
+            del scan[:boundary + 2]
+        if len(scan) > 2_000_000:
+            raise httpx.StreamError("Upstream SSE event exceeds the buffer limit")
         # 无内容事件（created/reasoning/keepalive 等）继续等待
     """取首个数据块（首字节）。返回 (stream_iter, first_bytes)。
 
@@ -491,14 +595,49 @@ class OpenAIProxy:
         self.eventlog = eventlog
         self.notifier = notifier
         self.router = Router(registry, gateway)
+        self.namespace_memory = NamespaceMemory()
         self.api = APIRouter(prefix="/v1")
         self.api.add_api_route("/chat/completions", self.chat_completions, methods=["POST"])
         self.api.add_api_route("/completions", self.completions, methods=["POST"])
         self.api.add_api_route("/embeddings", self.embeddings, methods=["POST"])
         self.api.add_api_route("/responses", self.responses, methods=["POST"])
         self.api.add_api_route("/models", self.list_models, methods=["GET"])
+        self.api.add_api_route("/messages", self.messages, methods=["POST"])
+        self.google_api = APIRouter(prefix="/v1beta")
+        self.google_api.add_api_route("/models", self.google_models, methods=["GET"])
+        for api in (self.api, self.google_api):
+            api.add_api_route("/models/{model}:generateContent", self.generate_content, methods=["POST"])
+            api.add_api_route("/models/{model}:streamGenerateContent", self.stream_generate_content, methods=["POST"])
 
-    def _has_retryable_station(self, model: str) -> bool:
+    async def _native_dispatch(self, request, path, model=None):
+        result = await self._dispatch(request, path, model_override=model)
+        if isinstance(result, JSONResponse) and result.status_code >= 400:
+            payload = json.loads(result.body)
+            message = (payload.get("error") or {}).get("message", "请求失败")
+            return JSONResponse(status_code=result.status_code, content=error_body(result.status_code, message, path))
+        return result
+
+    async def messages(self, request: Request):
+        return await self._native_dispatch(request, MESSAGES)
+
+    async def generate_content(self, model: str, request: Request):
+        return await self._native_dispatch(request, GENERATE, model)
+
+    async def stream_generate_content(self, model: str, request: Request):
+        alt = request.query_params.get("alt", "json")
+        if alt not in ("json", "sse"):
+            return JSONResponse(status_code=400, content=error_body(400, "alt 必须为 sse 或 json", GENERATE))
+        path = STREAM_GENERATE + ("?alt=sse" if alt == "sse" else "")
+        return await self._native_dispatch(request, path, model)
+
+    async def google_models(self):
+        models = sorted({model for st in self.registry.states.values()
+                         for model in st.effective_models if st.supports_model(model, GENERATE)})
+        return {"models": [{"name": "models/" + model, "displayName": model,
+                             "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
+                            for model in models]}
+
+    def _has_retryable_station(self, model: str, path: str | None = None) -> bool:
         """Whether a configured station may become routeable again.
 
         ``Router.pick`` intentionally filters stations that are cooling down,
@@ -511,14 +650,14 @@ class OpenAIProxy:
         for st in self.registry.states.values():
             if not st.enabled or st.quota_exhausted:
                 continue
-            if (self._station_matches_model(st, model)
+            if (self._station_matches_model(st, model, path)
                     or self._model_discovery_unresolved(st)):
                 return True
         return False
 
     @staticmethod
-    def _station_matches_model(st: StationState, model: str) -> bool:
-        return st.accepts_any_model or model in st.effective_models
+    def _station_matches_model(st: StationState, model: str, path: str | None = None) -> bool:
+        return st.supports_model(model, path)
 
     @staticmethod
     def _model_discovery_unresolved(st: StationState) -> bool:
@@ -529,11 +668,11 @@ class OpenAIProxy:
             and st.last_probe_ok is not True
         )
 
-    def _routing_precondition_error(self, model: str) -> JSONResponse | None:
+    def _routing_precondition_error(self, model: str, path: str | None = None) -> JSONResponse | None:
         """Classify deterministic no-route states before starting a round."""
         matching = [
             st for st in self.registry.states.values()
-            if self._station_matches_model(st, model)
+            if self._station_matches_model(st, model, path)
         ]
         if any(st.enabled and not st.quota_exhausted for st in matching):
             return None
@@ -557,7 +696,7 @@ class OpenAIProxy:
             )
         return _error_response(
             400,
-            f"模型 {model} 未在任何中转站配置",
+            f"模型 {model} 没有支持 {path or '当前协议'} 的站点，请检查模型目录与路由范围",
             "invalid_request_error",
         )
 
@@ -597,7 +736,7 @@ class OpenAIProxy:
         return _error_response(499, "客户端已断开，已停止后台重试")
 
     def _terminal_failure(self, model: str, response: JSONResponse,
-                          attempts: int) -> JSONResponse:
+                          attempts: int, client_ip: str | None = None) -> JSONResponse:
         """Record one client-visible failure, regardless of internal rounds."""
         if getattr(response, "_zg_failure_recorded", False):
             return response
@@ -608,6 +747,7 @@ class OpenAIProxy:
             0,
             _response_error_message(response),
             attempts=max(1, attempts),
+            client_ip=client_ip,
         )
         response._zg_failure_recorded = True  # type: ignore[attr-defined]
         return response
@@ -628,18 +768,34 @@ class OpenAIProxy:
         """Responses API（Codex/OpenAI 新版客户端使用），透传 + 故障切换。"""
         return await self._dispatch(request, "/responses")
 
-    async def _dispatch(self, request: Request, path: str):
+    async def _dispatch(self, request: Request, path: str, model_override: str | None = None):
+        peer = getattr(request, 'client', None)
+        client_ip = peer.host if peer else None
+        client_headers = request_context(getattr(request, 'headers', None))
+
+        def failure(model, response, attempts):
+            return self._terminal_failure(model, response, attempts, client_ip)
+
         try:
             body = await request.json()
         except Exception:
             return _error_response(400, "请求体不是合法的 JSON", "invalid_request_error")
         if not isinstance(body, dict):
             return _error_response(400, "请求体必须是 JSON 对象", "invalid_request_error")
+        if model_override is not None:
+            if (not model_override or any(ch in model_override for ch in "/\\?#%")
+                    or model_override in (".", "..")):
+                return _error_response(400, "Gemini 模型 ID 无效", "invalid_request_error")
+            body["model"] = model_override
         model = body.get("model")
         if not isinstance(model, str) or not model.strip():
             return _error_response(400, "model 必须是非空字符串", "invalid_request_error")
+        if path == '/responses':
+            self.namespace_memory.restore(body)
 
         stream = path != "/embeddings" and body.get("stream")
+        if path in GEMINI_PATHS:
+            stream = path.endswith("?alt=sse")
         max_retry_seconds = self.gateway.max_retry_seconds
         deadline = (time.monotonic() + max_retry_seconds) if max_retry_seconds else None
         round_index = 0
@@ -649,22 +805,22 @@ class OpenAIProxy:
         while self.gateway.max_rounds == 0 or round_index < self.gateway.max_rounds:
             if await request.is_disconnected():
                 return self._client_disconnected_response()
-            precondition_error = self._routing_precondition_error(model)
+            precondition_error = self._routing_precondition_error(model, path)
             if precondition_error is not None:
-                return self._terminal_failure(model, precondition_error, total_attempts)
+                return failure(model, precondition_error, total_attempts)
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
-                return self._terminal_failure(
+                return failure(
                     model, self._retry_timeout_response(max_retry_seconds), total_attempts)
             try:
-                forward = (self._forward_stream(path, body, model) if stream
-                           else self._forward_json(path, body, model))
+                forward = (self._forward_stream(path, body, model, client_ip, client_headers) if stream
+                           else self._forward_json(path, body, model, client_ip, client_headers))
                 if remaining is None:
                     result, has_transient = await forward
                 else:
                     result, has_transient = await asyncio.wait_for(forward, remaining)
             except asyncio.TimeoutError:
-                return self._terminal_failure(
+                return failure(
                     model, self._retry_timeout_response(max_retry_seconds), total_attempts)
             total_attempts += getattr(result, "_zg_attempts", 0)
             if getattr(result, "status_code", 0) != 502:
@@ -675,18 +831,18 @@ class OpenAIProxy:
                         try:
                             remaining = None if deadline is None else deadline - time.monotonic()
                             if remaining is not None and remaining <= 0:
-                                return self._terminal_failure(
+                                return failure(
                                     model,
                                     self._retry_timeout_response(max_retry_seconds),
                                     total_attempts,
                                 )
-                            forward = self._forward_json(path, degraded, model)
+                            forward = self._forward_json(path, degraded, model, client_ip, client_headers)
                             if remaining is None:
                                 result, _ = await forward
                             else:
                                 result, _ = await asyncio.wait_for(forward, remaining)
                         except asyncio.TimeoutError:
-                            return self._terminal_failure(
+                            return failure(
                                 model,
                                 self._retry_timeout_response(max_retry_seconds),
                                 total_attempts,
@@ -695,21 +851,21 @@ class OpenAIProxy:
                             return result
                 return result
             if not has_transient:
-                return self._terminal_failure(
+                return failure(
                     model, result, total_attempts)  # 确定性失败：快速返回
             round_index += 1
             if self.gateway.max_rounds and round_index >= self.gateway.max_rounds:
-                return self._terminal_failure(model, result, total_attempts)
+                return failure(model, result, total_attempts)
             delay = self._round_delay(round_index - 1)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return self._terminal_failure(
+                    return failure(
                         model, self._retry_timeout_response(max_retry_seconds), total_attempts)
                 delay = min(delay, remaining)
             if not await self._wait_for_retry(request, delay):
                 return self._client_disconnected_response()
-        return self._terminal_failure(
+        return failure(
             model, _error_response(502, "重试已停止"), total_attempts)
 
     async def list_models(self):
@@ -727,7 +883,12 @@ class OpenAIProxy:
     # ------------------------------------------------------------------
     # 失败处理（计费模式策略）
     # ------------------------------------------------------------------
-    def _handle_failure(self, st: StationState, err: UpstreamError) -> UpstreamError:
+    def _record_request_failure(self, st: StationState, err: UpstreamError):
+        st.record_failure(err)
+        if err.retryable and not err.deterministic and not err.quota and err.status_code != 429:
+            st.mark_transient_failure(err, self.gateway, source='request')
+
+    def _handle_failure(self, st: StationState, err: UpstreamError, retry_after: str | None = None) -> UpstreamError:
         """记录失败并按计费策略处理，返回 err 供调用方判断是否继续换站/重试。
 
         - quota 错误（余额不足/订阅到期）→ 标记 quota_exhausted，从路由排除，
@@ -735,21 +896,23 @@ class OpenAIProxy:
         - 429 限流 → 短冷却（rate_limit_cooldown 秒内不路由该站），
           订阅制站点尤其重要：避免重试风暴烧掉订阅配额
         """
-        st.record_failure(err)
+        self._record_request_failure(st, err)
         if err.quota:
             st.mark_quota_exhausted(err)
             if self.notifier is not None:
                 asyncio.create_task(self.notifier.send(
                     "station_quota", st.cfg.name,
-                    f"配额问题: {err.message[:120]}（将自动探测直到额度恢复）"))
+                    f"配额问题: {err.message[:120]}（请检查对应计费入口与额度，恢复方式以站点策略为准）"))
         if err.status_code == 429:
-            st.mark_rate_limited(self.gateway.rate_limit_cooldown)
+            wait = _retry_after_seconds(retry_after)
+            st.mark_rate_limited(max(self.gateway.rate_limit_cooldown, wait), reason=str(err),
+                                source='request', wait_source='upstream' if wait > self.gateway.rate_limit_cooldown else 'gateway')
         return err
 
     # ------------------------------------------------------------------
     # 非流式转发（完整缓冲，可无缝切换）
     # ------------------------------------------------------------------
-    async def _forward_json(self, path: str, body: dict, model: str):
+    async def _forward_json(self, path: str, body: dict, model: str, client_ip: str | None = None, client_headers=None):
         """非流式转发：完整缓冲 + 站级无缝切换。
 
         返回 (response, has_transient)：has_transient=True 表示本轮存在瞬时失败，
@@ -757,30 +920,36 @@ class OpenAIProxy:
         """
         attempts: list[str] = []
         has_transient = False
-        candidates = self.router.pick(model)
+        local_errors: list[str] = []
+        candidates = self.router.pick(model, path)
         # No candidates can mean all matching stations are in a temporary
         # cooldown/rate-limit window.  Preserve that signal so _dispatch can
         # apply the configured round retry budget instead of returning 502
         # immediately (which otherwise leaves retries solely to the client).
         if not candidates:
-            has_transient = self._has_retryable_station(model)
+            has_transient = self._has_retryable_station(model, path)
 
         for idx, st in enumerate(candidates):
             if idx >= self.gateway.max_attempts:
                 break
+            try:
+                target_path, target_body, adapter = prepare_request(st, path, body)
+                headers = _build_headers(st, client_headers, target_path)
+                url = inference_url(st.cfg, target_path, model)
+            except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
+                local_errors.append(str(exc))
+                continue  # No upstream I/O, semaphore, or station-health failure.
             if not await self.router.acquire(st):
                 attempts.append(f"[{st.cfg.name}] 并发已满")
                 has_transient = True  # 下一轮可能不忙
                 continue
             if attempts:  # 之前失败过，切换前稍作退避
                 await asyncio.sleep(self.gateway.retry_backoff)
-            route_id = self.registry.begin_route(st.cfg.name, model)
+            route_id = self.registry.begin_route(st.cfg.name, model, client_ip)
             route_outcome = "failed"
             route_error = ""
-            target_path, target_body, adapter = prepare_request(st, path, body)
             try:
                 client = self.registry.ensure_client(st)
-                url = st.cfg.api_base + target_path
                 timeout = httpx.Timeout(
                     connect=self.gateway.connect_timeout,
                     read=st.cfg.timeout,
@@ -788,11 +957,11 @@ class OpenAIProxy:
                 )
                 t0 = time.perf_counter()
                 req = client.build_request("POST", url, json=target_body,
-                                           headers=_build_headers(st), timeout=timeout)
+                                           headers=headers, timeout=timeout)
                 # send 会一直等到响应头返回：用首字节超时兜底卡死站点
                 # （卡死 = 响应头都不回，超时后取消并切换下一站）
                 resp = await asyncio.wait_for(
-                    client.send(req, stream=True),
+                    client.send(req, stream=True, follow_redirects=False),
                     timeout=self.gateway.first_byte_timeout,
                 )
 
@@ -805,7 +974,7 @@ class OpenAIProxy:
                     except (asyncio.TimeoutError, httpx.TimeoutException):
                         await resp.aclose()
                         err = first_byte_error(st.cfg.name)
-                        st.record_failure(err)
+                        self._record_request_failure(st, err)
                         route_error = str(err)
                         attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                         has_transient = True
@@ -813,7 +982,7 @@ class OpenAIProxy:
                     except httpx.TransportError as e:
                         await resp.aclose()
                         err = connect_error(st.cfg.name, type(e).__name__)
-                        st.record_failure(err)
+                        self._record_request_failure(st, err)
                         route_error = str(err)
                         attempts.append(str(err))
                         has_transient = True
@@ -829,7 +998,7 @@ class OpenAIProxy:
                         await resp.aclose()
                         err = timeout_error(st.cfg.name,
                                             f"读取中断: {type(e).__name__}")
-                        st.record_failure(err)
+                        self._record_request_failure(st, err)
                         route_error = str(err)
                         attempts.append(str(err))
                         has_transient = True
@@ -842,6 +1011,11 @@ class OpenAIProxy:
                     st.record_success(latency / 1000, switched=switched)
                     detail = "成功" + (f" (经{len(attempts)}次切换)" if switched else "")
                     body_bytes = b"".join(chunks)
+                    if target_path == '/responses':
+                        try:
+                            self.namespace_memory.remember_response(json.loads(body_bytes))
+                        except (ValueError, UnicodeDecodeError):
+                            pass
                     usage = _extract_usage(body_bytes)
                     tokens = None if usage is None else usage.tokens
                     # 协议翻译：chat 响应 → responses（Codex 入口 + chat 站）
@@ -854,6 +1028,7 @@ class OpenAIProxy:
                             pass  # 翻译失败降级为透传原响应
                     self.eventlog.add(st.cfg.name, model, True, latency,
                                       detail, attempts=len(attempts) + 1,
+                                      client_ip=client_ip, route_id=route_id,
                                       **(usage.as_kwargs() if usage else {
                                           "tokens": tokens}))
                     # Juice 被动统计：上游头家族 + model 回显比对 + 真实响应特征指纹
@@ -872,7 +1047,7 @@ class OpenAIProxy:
                 payload = await resp.aread()
                 await resp.aclose()
                 err = classify_error(st.cfg.name, resp.status_code, payload)
-                err = self._handle_failure(st, err)
+                err = self._handle_failure(st, err, resp.headers.get("retry-after"))
                 route_error = str(err)
                 if not err.retryable:
                     # 客户端问题，无需再试其他站
@@ -886,19 +1061,19 @@ class OpenAIProxy:
                 raise
             except asyncio.TimeoutError:
                 err = first_byte_error(st.cfg.name)
-                st.record_failure(err)
+                self._record_request_failure(st, err)
                 route_error = str(err)
                 attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                 has_transient = True
             except httpx.TimeoutException:
                 err = timeout_error(st.cfg.name)
-                st.record_failure(err)
+                self._record_request_failure(st, err)
                 route_error = str(err)
                 attempts.append(str(err))
                 has_transient = True
             except httpx.TransportError as e:
                 err = connect_error(st.cfg.name, type(e).__name__)
-                st.record_failure(err)
+                self._record_request_failure(st, err)
                 route_error = str(err)
                 attempts.append(str(err))
                 has_transient = True
@@ -908,6 +1083,8 @@ class OpenAIProxy:
                 self.registry.end_route(route_id, route_outcome, route_error)
                 self.router.release(st)
 
+        if local_errors and not attempts and not has_transient:
+            return (_error_response(400, local_errors[0], "invalid_request_error"), False)
         msg = _all_failed_message(attempts)
         response = _annotate_attempts(_error_response(502, msg), len(attempts))
         return (response, has_transient)
@@ -915,20 +1092,28 @@ class OpenAIProxy:
     # ------------------------------------------------------------------
     # 流式转发（SSE 透传，首字节前可切换）
     # ------------------------------------------------------------------
-    async def _forward_stream(self, path: str, body: dict, model: str):
+    async def _forward_stream(self, path: str, body: dict, model: str, client_ip: str | None = None, client_headers=None):
         """流式转发：SSE 透传 + 首字节前无缝切换 + 长流保活。
 
         返回 (response, has_transient)，语义同 _forward_json。
         """
         attempts: list[str] = []
         has_transient = False
-        candidates = self.router.pick(model)
+        local_errors: list[str] = []
+        candidates = self.router.pick(model, path)
         if not candidates:
-            has_transient = self._has_retryable_station(model)
+            has_transient = self._has_retryable_station(model, path)
 
         for idx, st in enumerate(candidates):
             if idx >= self.gateway.max_attempts:
                 break
+            try:
+                target_path, target_body, adapter = prepare_request(st, path, body)
+                headers = _build_headers(st, client_headers, target_path)
+                url = inference_url(st.cfg, target_path, model)
+            except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
+                local_errors.append(str(exc))
+                continue  # No upstream I/O, semaphore, or station-health failure.
             if not await self.router.acquire(st):
                 attempts.append(f"[{st.cfg.name}] 并发已满")
                 has_transient = True
@@ -936,15 +1121,13 @@ class OpenAIProxy:
             if attempts:
                 await asyncio.sleep(self.gateway.retry_backoff)
 
-            route_id = self.registry.begin_route(st.cfg.name, model)
+            route_id = self.registry.begin_route(st.cfg.name, model, client_ip)
             route_outcome = "failed"
             route_error = ""
             transferred = False
             resp = None
-            target_path, target_body, adapter = prepare_request(st, path, body)
             try:
                 client = self.registry.ensure_client(st)
-                url = st.cfg.api_base + target_path
                 timeout = httpx.Timeout(
                     connect=self.gateway.connect_timeout,
                     read=self.gateway.read_timeout,
@@ -952,30 +1135,30 @@ class OpenAIProxy:
                 )
                 t0 = time.perf_counter()
                 req = client.build_request("POST", url, json=target_body,
-                                           headers=_build_headers(st), timeout=timeout)
+                                           headers=headers, timeout=timeout)
                 try:
                     # send 会一直等到响应头返回：用首字节超时兜底卡死站点
                     resp = await asyncio.wait_for(
-                        client.send(req, stream=True),
+                        client.send(req, stream=True, follow_redirects=False),
                         timeout=self.gateway.first_byte_timeout,
                     )
                 except asyncio.TimeoutError:
                     err = first_byte_error(st.cfg.name)
-                    st.record_failure(err)
+                    self._record_request_failure(st, err)
                     route_error = str(err)
                     attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                     has_transient = True
                     continue
                 except httpx.TimeoutException:
                     err = timeout_error(st.cfg.name)
-                    st.record_failure(err)
+                    self._record_request_failure(st, err)
                     route_error = str(err)
                     attempts.append(str(err))
                     has_transient = True
                     continue
                 except httpx.TransportError as e:
                     err = connect_error(st.cfg.name, type(e).__name__)
-                    st.record_failure(err)
+                    self._record_request_failure(st, err)
                     route_error = str(err)
                     attempts.append(str(err))
                     has_transient = True
@@ -985,7 +1168,7 @@ class OpenAIProxy:
                 if resp.status_code != 200:
                     payload = await resp.aread()
                     err = classify_error(st.cfg.name, resp.status_code, payload)
-                    err = self._handle_failure(st, err)
+                    err = self._handle_failure(st, err, resp.headers.get("retry-after"))
                     route_error = str(err)
                     if not err.retryable:
                         return (_error_response(err.status_code or 400, err.message,
@@ -1003,7 +1186,7 @@ class OpenAIProxy:
                 except (asyncio.TimeoutError, httpx.TimeoutException):
                     await stream_iter.aclose()
                     err = first_byte_error(st.cfg.name)
-                    st.record_failure(err)
+                    self._record_request_failure(st, err)
                     route_error = str(err)
                     attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                     has_transient = True
@@ -1011,7 +1194,7 @@ class OpenAIProxy:
                 except httpx.TransportError as e:
                     await stream_iter.aclose()
                     err = connect_error(st.cfg.name, type(e).__name__)
-                    st.record_failure(err)
+                    self._record_request_failure(st, err)
                     route_error = str(err)
                     attempts.append(str(err))
                     has_transient = True
@@ -1019,9 +1202,14 @@ class OpenAIProxy:
                 first = buffered[0] if buffered else b""
 
                 # ---- 首块校验（200 + error JSON 的情况） ----
-                if _looks_like_error(first):
-                    err = classify_error(st.cfg.name, 200, first)
-                    err = self._handle_failure(st, err)
+                if _looks_like_error(b"".join(buffered)):
+                    raw_error = b"".join(buffered)
+                    for line in raw_error.splitlines():
+                        if line.startswith(b"data:") and _looks_like_error(line[5:].strip()):
+                            raw_error = line[5:].strip()
+                            break
+                    err = classify_error(st.cfg.name, 200, raw_error)
+                    err = self._handle_failure(st, err, resp.headers.get("retry-after"))
                     route_error = str(err)
                     if not err.retryable:
                         return (_error_response(400, err.message,
@@ -1040,7 +1228,7 @@ class OpenAIProxy:
                 event_time = self.eventlog.add(
                     st.cfg.name, model, True, latency,
                     detail, attempts=len(attempts) + 1,
-                    ttft_ms=ttft_ms)
+                    ttft_ms=ttft_ms, client_ip=client_ip, route_id=route_id)
                 st.note_upstream(resp.headers, None, model)  # Juice: 上游头家族（流式）
                 self.registry.note_fingerprint(st, model, stream_text(first))
                 self.registry.mark_routed(st.cfg.name, model, latency)
@@ -1062,10 +1250,14 @@ class OpenAIProxy:
                                   if adapter == ("r2c",) else None)
                     stream_tokens = None
                     usage_parser = _StreamUsageParser()
+                    namespace_scanner = _NamespaceStreamScanner(self.namespace_memory) if target_path == '/responses' else None
                     stream_outcome = "cancelled"
                     stream_error = "client_stream_closed"
+                    pending_read = None
                     try:
                         for chunk in prefetch:
+                            if namespace_scanner:
+                                namespace_scanner.feed(chunk)
                             parsed_tokens = usage_parser.feed(chunk)
                             if parsed_tokens is not None:
                                 stream_tokens = parsed_tokens
@@ -1077,8 +1269,13 @@ class OpenAIProxy:
                                 yield chunk
                         while True:
                             try:
+                                if pending_read is None:
+                                    pending_read = asyncio.ensure_future(stream_iter.__anext__())
                                 chunk = await asyncio.wait_for(
-                                    stream_iter.__anext__(), timeout=keepalive or None)
+                                    asyncio.shield(pending_read), timeout=keepalive or None)
+                                pending_read = None
+                                if namespace_scanner:
+                                    namespace_scanner.feed(chunk)
                                 parsed_tokens = usage_parser.feed(chunk)
                                 if parsed_tokens is not None:
                                     stream_tokens = parsed_tokens
@@ -1089,11 +1286,22 @@ class OpenAIProxy:
                                 else:
                                     yield chunk
                             except StopAsyncIteration:
+                                pending_read = None
+                                if namespace_scanner:
+                                    namespace_scanner.finish()
                                 parsed_tokens = usage_parser.finish()
                                 if parsed_tokens is not None:
                                     stream_tokens = parsed_tokens
-                                stream_outcome = "success"
-                                stream_error = ""
+                                incomplete = (
+                                    target_path == MESSAGES and not usage_parser.messages_finished
+                                    or target_path in GEMINI_PATHS and (
+                                        not usage_parser.gemini_candidates
+                                        or not usage_parser.gemini_candidates <= usage_parser.gemini_finished))
+                                if incomplete and not usage_parser.error:
+                                    usage_parser.error = "上游流提前结束，未收到完整结束事件"
+                                    yield _error_sse(usage_parser.error, path)
+                                stream_outcome = "stream_error" if usage_parser.error else "success"
+                                stream_error = usage_parser.error
                                 if translator:
                                     tail = translator.finish()
                                     if tail:
@@ -1112,8 +1320,12 @@ class OpenAIProxy:
                         stream_outcome = "stream_error"
                         stream_error = type(e).__name__
                         yield _error_sse(
-                            f"上游 {st.cfg.name} 流中断: {type(e).__name__}")
+                            f"上游 {st.cfg.name} 流中断: {type(e).__name__}", path)
                     finally:
+                        if pending_read is not None:
+                            if not pending_read.done():
+                                pending_read.cancel()
+                            await asyncio.gather(pending_read, return_exceptions=True)
                         usage = usage_parser.last
                         if usage is not None and usage.tokens is not None:
                             eventlog.add_tokens(
@@ -1121,11 +1333,11 @@ class OpenAIProxy:
                                 occurred_at=route_event_time,
                                 input_tokens=usage.input_tokens,
                                 cache_read=usage.cache_read,
-                                cache_write=usage.cache_write)
+                                cache_write=usage.cache_write, route_id=route_id)
                         elif stream_tokens is not None:
                             eventlog.add_tokens(
                                 st.cfg.name, route_model, stream_tokens,
-                                occurred_at=route_event_time)
+                                occurred_at=route_event_time, route_id=route_id)
                         await lease.close(stream_outcome, stream_error)
 
                 response = StreamingResponse(
@@ -1151,6 +1363,8 @@ class OpenAIProxy:
                         self.router.release(st)
 
         # ---- 全部失败 ----
+        if local_errors and not attempts and not has_transient:
+            return (_error_response(400, local_errors[0], "invalid_request_error"), False)
         msg = _all_failed_message(attempts)
         response = _annotate_attempts(_error_response(502, msg), len(attempts))
         return (response, has_transient)

@@ -19,9 +19,50 @@ RETRY_SETTING_FIELDS = (
 )
 
 
+DEFAULT_EVENT_RETENTION = 500
+MAX_EVENT_RETENTION = 10_000
+
+
 def retry_settings_view(gateway: GatewayConfig) -> dict[str, int | float]:
     """Return the public, non-secret retry configuration."""
     return {field: getattr(gateway, field) for field in RETRY_SETTING_FIELDS}
+
+
+def probe_settings_view(gateway: GatewayConfig) -> dict[str, int | float | bool]:
+    return {
+        "generation_probe_enabled": gateway.generation_probe_enabled,
+        "generation_probe_interval": gateway.generation_probe_interval,
+    }
+
+
+def validate_probe_settings(
+    values: object,
+    *,
+    current: dict[str, int | float | bool] | None = None,
+) -> dict[str, int | float | bool]:
+    if not isinstance(values, dict):
+        raise ValueError("探测设置必须是 JSON 对象")
+    fields = {"generation_probe_enabled", "generation_probe_interval"}
+    unknown = sorted(set(values) - fields)
+    if unknown:
+        raise ValueError(f"不支持的探测字段: {', '.join(unknown)}")
+    result = dict(current or {})
+    result.update(values)
+    if set(result) != fields:
+        raise ValueError("探测设置缺少必需字段")
+    enabled = result["generation_probe_enabled"]
+    if not isinstance(enabled, bool):
+        raise ValueError("generation_probe_enabled 必须是布尔值")
+    interval = result["generation_probe_interval"]
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+        raise ValueError("generation_probe_interval 必须是数字")
+    interval = float(interval)
+    if not math.isfinite(interval) or not 300 <= interval <= 86400:
+        raise ValueError("generation_probe_interval 必须在 300 到 86400 秒之间")
+    return {
+        "generation_probe_enabled": enabled,
+        "generation_probe_interval": interval,
+    }
 
 
 def validate_retry_settings(
@@ -98,16 +139,107 @@ class GatewaySettingsStore:
             print(f"[settings] 加载失败（忽略，使用 config.yaml）: {exc}")
             return None
 
+    def load_probe(self, defaults: GatewayConfig) -> dict[str, int | float | bool] | None:
+        if not self.path.exists():
+            return None
+        try:
+            payload: Any = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("根节点必须是对象")
+            values = payload.get("probe")
+            if values is None:
+                return None
+            return validate_probe_settings(
+                values,
+                current=probe_settings_view(defaults),
+            )
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            print(f"[settings] 探测设置加载失败（忽略，使用 config.yaml）: {exc}")
+            return None
+
+    def load_logs(self, default: int = DEFAULT_EVENT_RETENTION) -> int:
+        if not self.path.exists():
+            return default
+        try:
+            payload: Any = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("settings root must be an object")
+            value = payload.get("event_retention", default)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError("event_retention must be an integer")
+            if not 100 <= value <= MAX_EVENT_RETENTION:
+                raise ValueError("event_retention is outside the supported range")
+            return value
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            print(f"[settings] event log retention load failed; using default: {exc}")
+            return default
+
+    def save_logs(self, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("event_retention must be an integer")
+        if not 100 <= value <= MAX_EVENT_RETENTION:
+            raise ValueError("event_retention must be between 100 and 10000")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            payload: dict[str, Any] = {}
+            if self.path.exists():
+                try:
+                    loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        payload = loaded
+                except (json.JSONDecodeError, OSError):
+                    pass
+            payload["event_retention"] = value
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError as exc:
+            print(f"[settings] event log retention save failed: {exc}")
+            raise
+
     def save(self, values: dict[str, int | float]) -> None:
         normalized = validate_retry_settings(values)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
+            payload: dict[str, Any] = {}
+            if self.path.exists():
+                try:
+                    loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        payload = loaded
+                except (json.JSONDecodeError, OSError):
+                    pass
+            payload["retry"] = normalized
             tmp.write_text(
-                json.dumps({"retry": normalized}, ensure_ascii=False, indent=1),
+                json.dumps(payload, ensure_ascii=False, indent=1),
                 encoding="utf-8",
             )
             tmp.replace(self.path)
         except OSError as exc:
             print(f"[settings] 保存失败: {exc}")
+            raise
+
+    def save_probe(self, values: dict[str, int | float | bool]) -> None:
+        normalized = validate_probe_settings(values)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            payload: dict[str, Any] = {}
+            if self.path.exists():
+                try:
+                    loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        payload = loaded
+                except (json.JSONDecodeError, OSError):
+                    pass
+            payload["probe"] = normalized
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            tmp.replace(self.path)
+        except OSError as exc:
+            print(f"[settings] 探测设置保存失败: {exc}")
             raise

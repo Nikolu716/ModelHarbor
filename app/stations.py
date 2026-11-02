@@ -25,8 +25,8 @@ class StationStore:
             if not isinstance(data, dict):
                 raise ValueError("根节点必须是对象")
             items = data.get("stations")
-            if not isinstance(items, list) or not items:
-                raise ValueError("stations 必须是非空列表")
+            if not isinstance(items, list):
+                raise ValueError("stations 必须是列表")
             stations = []
             for item in items:
                 if not isinstance(item, dict):
@@ -76,7 +76,12 @@ def dataclass_to_dict(cfg: StationConfig) -> dict:
         "base_url": cfg.base_url,
         "api_key": cfg.api_key,
         "models": cfg.models,
+        "model_routing": cfg.model_routing,
+        "route_models": cfg.route_models,
+        "provider": cfg.provider,
+        "opencode_plan": cfg.opencode_plan,
         "priority": cfg.priority,
+        "priority_auto": cfg.priority_auto,
         "weight": cfg.weight,
         "timeout": cfg.timeout,
         "max_concurrency": cfg.max_concurrency,
@@ -85,6 +90,7 @@ def dataclass_to_dict(cfg: StationConfig) -> dict:
         "probe_interval": cfg.probe_interval,
         "probe_chat": cfg.probe_chat,
         "probe_chat_path": cfg.probe_chat_path,
+        "probe_chat_model": cfg.probe_chat_model,
         "probe_balance": cfg.probe_balance,
         "billing": cfg.billing,
         "headers": cfg.headers,

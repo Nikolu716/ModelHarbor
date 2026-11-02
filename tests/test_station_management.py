@@ -23,10 +23,19 @@ class RecordingMonitor:
     async def probe(self, station) -> None:
         self.probes.append(station.cfg.name)
 
-    async def probe_quota_recovery(self, station) -> bool:
+    async def probe_quota_recovery(self, station, *, manual=False) -> bool:
         self.probes.append(station.cfg.name)
         station.reset_quota()
         return True
+
+    async def discover_models(self, station, *, manual=False):
+        self.probes.append(('models', station.cfg.name, manual))
+        station.probed_models = {'visible-model'}
+        station.models_discovery_status = 'ready'
+
+    async def test_generation(self, station):
+        self.probes.append(('generation', station.cfg.name, station.selected_probe_model))
+        return {'name': station.cfg.name, 'model': station.selected_probe_model, 'ok': True}
 
 
 class StationManagementTests(unittest.TestCase):
@@ -132,6 +141,53 @@ class StationManagementTests(unittest.TestCase):
         self.assertFalse(stored["beta"].enabled)
         self.assertEqual(stored["beta"].api_key, "secret-beta")
 
+    def test_new_defaults_and_existing_priority_mode_persist(self):
+        body = {'name': 'new-auto', 'base_url': 'https://new.invalid', 'api_key': 'private-key'}
+        self.assertEqual(self.client.post('/admin/stations', json=body).status_code, 201)
+        new = self.registry.get('new-auto')
+        self.assertTrue(new.cfg.priority_auto)
+        self.assertTrue(new.cfg.probe_models)
+        self.assertFalse(new.cfg.probe_chat)
+        self.assertFalse(self.registry.get('alpha').cfg.priority_auto)
+        self.assertEqual(self.client.put('/admin/stations/alpha', json={'priority_auto': True}).status_code, 200)
+        stored = {s.name: s for s in self.store.load()}
+        self.assertTrue(stored['alpha'].priority_auto)
+        self.assertEqual(stored['alpha'].priority, 1)
+        self.assertEqual(self.client.put('/admin/stations/alpha', json={'priority_auto': 'false'}).status_code, 400)
+
+    def test_model_refresh_is_separate_from_generation_and_exposes_safe_metadata(self):
+        response = self.client.post('/admin/station/alpha/models/refresh')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.monitor.probes, [('models', 'alpha', True)])
+        self.assertEqual(response.json()['detected_models'], ['visible-model'])
+        station = self.client.get('/admin/stations').json()[0]
+        self.assertEqual(station['effective_models'], ['configured-model', 'visible-model'])
+        self.assertEqual(station['model_discovery']['status'], 'ready')
+        self.assertNotIn('secret-alpha', response.text)
+        self.client.post('/admin/station/alpha/toggle')
+        self.assertEqual(self.client.post('/admin/station/alpha/models/refresh').status_code, 400)
+
+    def test_probe_model_selection_persists_and_manual_test_does_not_enable_background(self):
+        station = self.registry.get('alpha')
+        station.probed_models = {'a-second', 'z-first'}
+        station.probed_model_order = ['z-first', 'a-second']
+        view = self.client.get('/admin/stations').json()[0]
+        self.assertEqual(view['probe_model_candidates'][:2], ['z-first', 'a-second'])
+        self.assertEqual(view['generation_probe']['model'], 'z-first')
+        response = self.client.put('/admin/stations/alpha', json={'probe_chat_model': 'a-second'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.store.load()[0].probe_chat_model, 'a-second')
+        response = self.client.post('/admin/station/alpha/generation-probe')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['model'], 'a-second')
+        self.assertFalse(self.gateway.generation_probe_enabled)
+        self.assertEqual(self.monitor.probes, [('generation', 'alpha', 'a-second')])
+        self.client.put('/admin/stations/alpha', json={'probe_chat_model': ''})
+        self.assertEqual(self.store.load()[0].probe_chat_model, '')
+        self.assertEqual(self.registry.get('alpha').selected_probe_model, 'z-first')
+        self.client.post('/admin/station/alpha/toggle')
+        self.assertEqual(self.client.post('/admin/station/alpha/generation-probe').status_code, 400)
+
     def test_invalid_updates_do_not_change_runtime_configuration(self) -> None:
         before = self.registry.get("alpha").cfg
         cases = [
@@ -169,11 +225,10 @@ class StationManagementTests(unittest.TestCase):
         finally:
             self.registry.end_route(route_id, "success")
 
-    def test_store_load_rejects_malformed_or_empty_files(self) -> None:
+    def test_store_load_rejects_malformed_files(self) -> None:
         malformed = [
             [],
             {},
-            {"stations": []},
             {"stations": [None]},
             {"stations": [{
                 "name": "alpha", "base_url": "https://a.invalid",
@@ -188,6 +243,10 @@ class StationManagementTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.store.path.write_text(json.dumps(payload), encoding="utf-8")
                 self.assertIsNone(self.store.load())
+
+    def test_store_preserves_intentionally_empty_account(self):
+        self.store.save([])
+        self.assertEqual(self.store.load(), [])
 
     def test_runtime_add_failure_rolls_back_persisted_file(self) -> None:
         original = self.registry.ensure_client

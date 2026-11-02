@@ -13,8 +13,8 @@ function Check([string]$Name, [scriptblock]$Action) {
     try { & $Action; Write-Host "PASS $Name" }
     catch { $script:failed = $true; Write-Host "FAIL $Name - $($_.Exception.Message)" }
 }
-Check "ZGateway service" {
-    $service = Get-Service -Name "ZGateway" -ErrorAction Stop
+Check "ModelHarbor service" {
+    $service = Get-Service -Name "ModelHarbor" -ErrorAction Stop
     if ($service.Status -ne "Running") { throw "status is $($service.Status)" }
 }
 Check "/healthz" {
@@ -24,7 +24,7 @@ Check "/healthz" {
 }
 Check "dashboard static page" {
     $response = Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/static/index.html" -TimeoutSec 5
-    if ($response.StatusCode -ne 200 -or $response.Content -notmatch 'RELAY CONTROL') { throw "unexpected response" }
+    if ($response.StatusCode -ne 200 -or $response.Content -notmatch 'ModelHarbor') { throw "unexpected response" }
 }
 if ($ApiKey) {
     Check "/v1/models with supplied key" {
@@ -44,4 +44,4 @@ Check "persisted retry settings" {
     if (-not $settings.retry) { throw "retry settings missing" }
 }
 if ($failed) { exit 1 }
-Write-Host "ZGateway verification completed."
+Write-Host "ModelHarbor verification completed."

@@ -10,6 +10,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 from starlette.responses import Response
@@ -265,6 +266,29 @@ class RegistryActivityTests(unittest.TestCase):
 
 
 class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_log_uses_connected_peer_and_ignores_forwarded_ip(self) -> None:
+        registry, gateway = make_registry()
+        with tempfile.TemporaryDirectory() as directory:
+            eventlog = EventLog(directory)
+            proxy = OpenAIProxy(registry, gateway, eventlog)
+            request = DispatchRequest(
+                {"model": "model-a"},
+                headers={"x-forwarded-for": "198.51.100.90"},
+            )
+            request.client = SimpleNamespace(host="203.0.113.7")
+
+            async def successful_forward(path, body, model, client_ip=None, client_headers=None):
+                eventlog.add("alpha", model, True, 1, client_ip=client_ip)
+                return Response(status_code=200), False
+
+            proxy._forward_json = successful_forward  # type: ignore[method-assign]
+            result = await proxy._dispatch(request, "/responses")
+
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(eventlog.events[-1]["client_ip"], "203.0.113.7")
+            self.assertNotEqual(eventlog.events[-1]["client_ip"], "198.51.100.90")
+        await registry.close_clients()
+
     async def test_empty_candidates_during_cooldown_are_retryable(self) -> None:
         registry, gateway = make_registry()
         alpha = registry.get("alpha")
@@ -342,7 +366,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
 
-            async def discover_then_forward(path: str, body: dict, model: str):
+            async def discover_then_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
@@ -397,7 +421,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def flaky_forward(path: str, body: dict, model: str):
+            async def flaky_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
@@ -424,7 +448,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def recovering_forward(path: str, body: dict, model: str):
+            async def recovering_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
                 nonlocal calls
                 calls += 1
                 if calls < 3:
@@ -490,7 +514,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             eventlog = EventLog(directory)
             proxy = OpenAIProxy(registry, gateway, eventlog)
 
-            async def unavailable_forward(path: str, body: dict, model: str):
+            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
                 nonlocal calls
                 calls += 1
                 return Response(status_code=502), True
@@ -517,7 +541,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def unavailable_forward(path: str, body: dict, model: str):
+            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
                 nonlocal calls
                 calls += 1
                 return Response(status_code=502), True
@@ -542,7 +566,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             cancelled = False
 
-            async def slow_forward(path: str, body: dict, model: str):
+            async def slow_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
                 nonlocal cancelled
                 try:
                     await asyncio.sleep(1.0)
@@ -571,7 +595,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def unavailable_forward(path: str, body: dict, model: str):
+            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
                 nonlocal calls
                 calls += 1
                 return Response(status_code=502), True
@@ -663,7 +687,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, eventlog)
             response, transient = await proxy._forward_stream(
                 "/chat/completions", {"model": "model-b", "stream": True},
-                "model-b")
+                "model-b", client_ip="192.0.2.7")
             self.assertFalse(transient)
 
             activity = registry.snapshot()["route_activity"]
@@ -690,6 +714,11 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(final["last_attempt"]["outcome"], "success")
             self.assertTrue(controlled.closed)
             self.assertEqual(recorded_tokens, [("alpha", "model-b", 11)])
+            self.assertEqual(eventlog.events[-1]["tokens"], 11)
+            usage = eventlog.log_analytics(ip="192.0.2.7")
+            self.assertEqual(usage["tokens"], 11)
+            self.assertEqual(usage["usage_reports"], 1)
+            self.assertEqual(usage["ip_models"][0]["ip"], "192.0.2.7")
 
         await registry.close_clients()
 

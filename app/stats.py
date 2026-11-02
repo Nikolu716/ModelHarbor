@@ -1,35 +1,56 @@
 """调用统计与事件日志。
 
 - 内存环形缓冲记录最近调用/切换事件
-- 定期 + 退出时 JSON 落盘（data/stats.json），重启恢复历史
+- SQLite 事务保存；旧 JSON 只读迁移，重启恢复历史
 - 今日按站聚合统计（占比/时间线，供仪表盘"今日统计"tab）
 """
 from __future__ import annotations
 
 import json
+import ipaddress
 import time
+import uuid
+import sqlite3
+import logging
+import math
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from .stats_store import StatsStore, StaleStatsWriter
 
-EVENT_MAXLEN = 500
+EVENT_MAXLEN = 10_000
+EVENT_PAGE_MAXLEN = 500
+EVENT_DEFAULT_MAXLEN = 500
 EVENT_DETAIL_MAXLEN = 2048
 EVENT_NAME_MAXLEN = 256
-STATS_RETENTION_DAYS = 31
+STATS_RETENTION_DAYS = 365
 MODEL_BUCKET_MAXLEN = 128
 MODEL_CANDIDATE_MAXLEN = 256
 OTHER_MODEL_KEY = "__zg_other_models__"
 STATS_SCHEMA_VERSION = 2
+DAY_STORES = ('daily', 'daily_models', 'daily_totals', 'daily_hours', 'hourly_cache')
+logger = logging.getLogger(__name__)
 
 
 class EventLog:
-    def __init__(self, data_dir: str, maxlen: int = EVENT_MAXLEN,
-                 retention_days: int = 30):
+    def __init__(self, data_dir: str, maxlen: int = EVENT_DEFAULT_MAXLEN,
+                 retention_days: int = STATS_RETENTION_DAYS, *, durable: bool = True):
         self.path = Path(data_dir) / "stats.json"
+        self.store = StatsStore(data_dir)
+        self.durable = durable
+        self._loaded = False
+        self._read_only = False
+        self._storage_error = ''
+        self._last_saved = 0.0
+        self._retry_at = 0.0
+        self._runtime = {}
+        self._pending = {}
+        self._reported_usage = {}
+        self._boot_id = uuid.uuid4().hex
+        self._maintenance_day = ''
         self.retention_days = retention_days
-        # EVENT_MAXLEN is a hard storage ceiling.  A smaller value remains
-        # useful for tests and constrained deployments, but callers cannot
-        # accidentally create an unbounded (or oversized) event history.
+        # Keep the request ring bounded while allowing operators to choose a
+        # useful retention window for both browsing and log analytics.
         self.maxlen = max(1, min(int(maxlen), EVENT_MAXLEN))
         self.events: deque[dict] = deque(maxlen=self.maxlen)
         self.station_counters: dict[str, dict] = {}
@@ -46,13 +67,26 @@ class EventLog:
         self.hourly_cache: dict[str, dict[str, list[dict]]] = {}
 
     def load(self) -> None:
-        if not self.path.exists():
+        if self._loaded:
+            return
+        self._loaded = True
+        if not self.durable:
             return
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = self.store.read()
+            imported = data is None
+            if imported:
+                data = (json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else
+                        dict(self._summary(), **{name: getattr(self, name) for name in DAY_STORES}, events=list(self.events)))
+            if not isinstance(data, dict):
+                raise ValueError('Statistics root must be an object')
             stored_events = data.get("events", [])
-            if not isinstance(stored_events, list):
-                stored_events = []
+            if not isinstance(stored_events, list) or any(not isinstance(e, dict) for e in stored_events):
+                raise ValueError('Invalid request history')
+            for name in ('stations', *DAY_STORES, 'runtime', 'pending'):
+                if not isinstance(data.get(name, {}), dict):
+                    raise ValueError('Invalid statistics section: ' + name)
+            self._validate_data(data)
             # Persisted order is oldest -> newest.  Keep the newest records;
             # the previous incremental load stopped at maxlen and therefore
             # retained the oldest records from an oversized legacy file.
@@ -62,6 +96,8 @@ class EventLog:
                 for event in stored_events[-self.maxlen:]
                 if isinstance(event, dict)
             )
+            for event in self.events:
+                event.setdefault('event_id', uuid.uuid4().hex)
             self.station_counters = data.get("stations", {})
             self.daily = data.get("daily", {})
             self.daily_models = data.get("daily_models", {})
@@ -82,8 +118,180 @@ class EventLog:
                 self._rebuild_legacy_totals()
             self._prune_history()
             self._prune_daily(retention_days=self.retention_days)
-        except (json.JSONDecodeError, OSError):
-            pass
+            self._runtime = data.get('runtime', {})
+            self._pending = data.get('pending', {})
+            self._last_saved = data.get('saved_at', 0.0)
+            if imported:
+                self.store.initialise(self._summary(), self._days(), list(self.events), self.maxlen)
+                self._last_saved = time.time()
+            # Startup reconciliation is one transaction; a crash cannot duplicate recovery rows.
+            for pending in list(self._pending.values()):
+                event = next((e for e in self.events if e.get('event_id') == pending['event_id']), None)
+                if event:
+                    self._mark_interrupted(event, '服务重启中断，最终用量可能未上报')
+                elif not pending.get('logged'):
+                    old_durable, self.durable = self.durable, False
+                    try:
+                        self.add(pending['station'], pending['model'], False, 0,
+                                 '服务重启中断，最终用量未上报', client_ip=pending.get('client_ip'),
+                                 occurred_at=pending['started_at'], outcome='interrupted',
+                                 event_id=pending['event_id'])
+                    finally:
+                        self.durable = old_durable
+            if self._pending:
+                self._pending.clear()
+                self.persist()
+            self.maintenance()
+        except (ValueError, TypeError, KeyError, OverflowError, OSError, sqlite3.Error, StaleStatsWriter) as exc:
+            self._read_only = True
+            self._storage_error = '历史统计读取失败，已保护原文件；新记录暂存内存。请检查磁盘或从备份恢复后重启。'
+            logger.error('Statistics loading failed; original files protected: %s', type(exc).__name__)
+
+    def _summary(self):
+        return {'stats_schema': STATS_SCHEMA_VERSION, 'stations': self.station_counters}
+
+    @staticmethod
+    def _validate_data(data):
+        version = data.get('stats_schema', 0)
+        if int(version or 0) > STATS_SCHEMA_VERSION:
+            raise ValueError('Unsupported statistics content version')
+        numeric = {'calls', 'failures', 'ms', 'tokens', 'usage_reports', 'input_tokens',
+                   'cache_read', 'cache_write', 'cache_reports', 'cache_input', 'ttft_sum', 'ttft_n'}
+
+        def bucket(value):
+            if not isinstance(value, dict):
+                raise ValueError('Invalid statistics bucket')
+            for key in numeric.intersection(value):
+                number = value[key]
+                if not isinstance(number, (int, float)) or not math.isfinite(number) or number < 0:
+                    raise ValueError('Invalid statistics counter')
+
+        for name in DAY_STORES:
+            table = data.get(name, {})
+            if not isinstance(table, dict):
+                raise ValueError('Invalid statistics section')
+            for day, values in table.items():
+                datetime.strptime(day, '%Y-%m-%d')
+                if not isinstance(values, dict):
+                    raise ValueError('Invalid daily statistics')
+                if name == 'daily_totals':
+                    bucket(values)
+                elif name in ('daily', 'daily_models'):
+                    for value in values.values():
+                        if name == 'daily':
+                            bucket(value)
+                        else:
+                            if not isinstance(value, dict):
+                                raise ValueError('Invalid model statistics')
+                            for model in value.values():
+                                if isinstance(model, dict):
+                                    bucket(model)
+                                elif not isinstance(model, (int, float)) or not math.isfinite(model) or model < 0:
+                                    raise ValueError('Invalid legacy model usage')
+        for event in data.get('events', []):
+            if not isinstance(event, dict):
+                raise ValueError('Invalid request history')
+            timestamp = event.get('ts')
+            if not isinstance(timestamp, (int, float)) or not math.isfinite(timestamp):
+                raise ValueError('Invalid request time')
+            datetime.fromtimestamp(timestamp)
+        for pending in data.get('pending', {}).values():
+            if not isinstance(pending, dict) or not all(isinstance(pending.get(k), str) for k in ('event_id', 'station', 'model')):
+                raise ValueError('Invalid unfinished request')
+            datetime.fromtimestamp(pending['started_at'])
+
+    def _days(self, only=None):
+        dates = {only} if only is not None else {day for name in DAY_STORES for day in getattr(self, name)}
+        return {day: {name: getattr(self, name)[day] for name in DAY_STORES if day in getattr(self, name)} for day in dates}
+
+    def storage_view(self):
+        return {'backend': 'sqlite', 'ok': not bool(self._storage_error), 'read_only': self._read_only,
+                'last_saved_at': self._last_saved, 'message': self._storage_error or '本地 SQLite · 请求完成即保存 · 重启保留',
+                'scope': 'account', 'legacy_retained': self.path.exists()}
+
+    def _commit(self, **changes):
+        if not self.durable or self._read_only:
+            return False
+        if self._storage_error:
+            if time.time() < self._retry_at:
+                return False
+            return self.persist()
+        try:
+            self._last_saved = self.store.write(maxlen=self.maxlen, **changes)
+            return True
+        except (OSError, ValueError, sqlite3.Error, StaleStatsWriter) as exc:
+            if isinstance(exc, StaleStatsWriter):
+                self._read_only = True
+            self._storage_error = ('检测到另一网关进程写入统计，已停止覆盖；请只保留一个服务进程。'
+                                   if self._read_only else '统计保存失败，新记录暂存内存；正在重试，请检查磁盘空间和目录权限。')
+            self._retry_at = time.time() + 5
+            logger.error('Statistics commit failed: %s', type(exc).__name__)
+            return False
+
+    def maintenance(self):
+        """Bounded daily backup, not a full file rewrite every polling interval."""
+        if not self.durable or self._read_only:
+            return
+        if self._storage_error and not self.persist():
+            return
+        day = datetime.now().strftime('%Y-%m-%d')
+        if day == self._maintenance_day:
+            return
+        self._prune_daily(self.retention_days)
+        if not self.persist():
+            return
+        target = self.store.path.parent / 'backups' / f'stats-{day}.sqlite3'
+        try:
+            if not target.exists():
+                self.store.backup(target)
+            backups = sorted(target.parent.glob('stats-????-??-??.sqlite3'))
+            for old in backups[:-3]:
+                old.unlink()
+            self._maintenance_day = day
+        except (OSError, sqlite3.Error) as exc:
+            logger.error('Statistics backup failed: %s', type(exc).__name__)
+
+    def save_runtime(self, name, state):
+        self.load()
+        previous = self._runtime.get(name, {})
+        # Dashboard polling only recomputes scores; it must not write to disk
+        # or renew the age of historical performance evidence.
+        if any(previous.get(key) != state.get(key) for key in ('signature', 'values', 'window_results')):
+            self._runtime[name] = state
+            self._commit(runtime={name: state})
+
+    def start_route(self, route_id, station, model, client_ip=None):
+        self.load()
+        key = f'{self._boot_id}:{route_id}'
+        pending = {'event_id': uuid.uuid4().hex, 'station': station, 'model': model,
+                   'client_ip': client_ip, 'started_at': time.time(), 'logged': False}
+        self._pending[key] = pending
+        self._commit(pending={key: pending})
+
+    def _mark_interrupted(self, event, detail):
+        if event.get('ok'):
+            day = datetime.fromtimestamp(event['ts']).strftime('%Y-%m-%d')
+            for bucket in (self.daily_totals.get(day), self.daily.get(day, {}).get(event['station']),
+                           self.daily_models.get(day, {}).get(event['station'], {}).get(event['model'])):
+                if isinstance(bucket, dict):
+                    bucket['failures'] = int(bucket.get('failures', 0)) + 1
+        event.update(ok=False, outcome='interrupted', detail=detail)
+
+    def finish_route(self, route_id, outcome, error=''):
+        key = f'{self._boot_id}:{route_id}'
+        pending = self._pending.pop(key, None)
+        if not pending:
+            return
+        event = next((e for e in self.events if e.get('event_id') == pending['event_id']), None)
+        if event:
+            if outcome not in ('ok', 'success'):
+                self._mark_interrupted(event, '请求中断：' + (error or outcome))
+            else:
+                event['outcome'] = 'success'
+            day = datetime.fromtimestamp(event['ts']).strftime('%Y-%m-%d')
+            self._commit(events=[event], days=self._days(day), remove_pending=[key])
+        else:
+            self._commit(remove_pending=[key])
 
     @staticmethod
     def _safe_text(value: object, limit: int) -> str:
@@ -95,7 +303,17 @@ class EventLog:
         result["station"] = cls._safe_text(result.get("station"), EVENT_NAME_MAXLEN) or "-"
         result["model"] = cls._safe_text(result.get("model"), EVENT_NAME_MAXLEN) or "-"
         result["detail"] = cls._safe_text(result.get("detail"), EVENT_DETAIL_MAXLEN)
+        client_ip = result.get("client_ip")
+        try:
+            result["client_ip"] = str(ipaddress.ip_address(client_ip)) if client_ip else None
+        except ValueError:
+            result["client_ip"] = None
         return result
+
+    def set_limit(self, maxlen: int) -> None:
+        self.load()
+        self.maxlen = max(1, min(int(maxlen), EVENT_MAXLEN))
+        self.events = deque(self.events, maxlen=self.maxlen)
 
     @classmethod
     def _cap_model_map(cls, models: dict) -> None:
@@ -511,11 +729,19 @@ class EventLog:
             input_tokens: int | None = None,
             cache_read: int | None = None,
             cache_write: int | None = None,
-            ttft_ms: float | None = None) -> float:
-        now = time.time()
+            ttft_ms: float | None = None,
+            client_ip: str | None = None,
+            route_id: int | None = None, occurred_at: float | None = None,
+            outcome: str | None = None, event_id: str | None = None) -> float:
+        self.load()
+        now = time.time() if occurred_at is None else occurred_at
         station = self._safe_text(station, EVENT_NAME_MAXLEN) or "-"
         model = self._safe_text(model, EVENT_NAME_MAXLEN) or "-"
         detail = self._safe_text(detail, EVENT_DETAIL_MAXLEN)
+        try:
+            client_ip = str(ipaddress.ip_address(client_ip)) if client_ip else None
+        except ValueError:
+            client_ip = None
         date = datetime.fromtimestamp(now).strftime("%Y-%m-%d")
 
         totals = self.daily_totals.get(date)
@@ -535,7 +761,11 @@ class EventLog:
 
         if station != "-" and date not in self.daily_hours:
             self.daily_hours[date] = self._timeline_from_events(date)
+        pending_key = f'{self._boot_id}:{route_id}'
+        pending = self._pending.get(pending_key)
         self.events.append({
+            'event_id': event_id or (pending['event_id'] if pending else uuid.uuid4().hex),
+            'outcome': outcome or ('in_progress' if pending else 'success' if ok else 'failed'),
             "ts": now,
             "station": station,
             "model": model,
@@ -544,6 +774,8 @@ class EventLog:
             "detail": detail,
             "attempts": attempts,
             "tokens": tokens,
+            "client_ip": client_ip,
+            **({"route_id": route_id} if route_id is not None else {}),
         })
         # 今日按站聚合（跨天自动切换日期键；"-" 为全站失败记录，不计入单站）
         if station != "-":
@@ -584,18 +816,47 @@ class EventLog:
             station_hours = self._normalise_hours(station_hours)
             station_hours[datetime.fromtimestamp(now).hour] += 1
             self.daily_hours[date][station] = station_hours
+        if pending:
+            pending['logged'] = True
+        self._commit(events=[self.events[-1]], days=self._days(date),
+                     pending={pending_key: pending} if pending else None)
         return now
 
     def add_tokens(self, station: str, model: str, tokens: int,
                    occurred_at: float | None = None,
                    input_tokens: int | None = None,
                    cache_read: int | None = None,
-                   cache_write: int | None = None) -> None:
+                   cache_write: int | None = None,
+                   route_id: int | None = None) -> None:
         """流式请求结束后补记 token 用量（add 时可能未知）。"""
+        self.load()
+        matched_event = None
         station = self._safe_text(station, EVENT_NAME_MAXLEN) or "-"
         model = self._safe_text(model, EVENT_NAME_MAXLEN) or "-"
         if station == "-" or tokens is None:
             return
+        token_count = self._optional_count(tokens)
+        if token_count is None:
+            return
+        usage_key = (station, model, occurred_at, route_id)
+        pending_key = f'{self._boot_id}:{route_id}'
+        pending = self._pending.get(pending_key)
+        if occurred_at is not None and (usage_key in self._reported_usage or pending and pending.get('usage_reported')):
+            return
+        # Streaming usage arrives after the log row is created. Correlate by
+        # request start and route, so concurrent calls never share IP usage.
+        # An evicted row must not be recreated; daily totals still receive it.
+        if occurred_at is not None:
+            matches = [event for event in self.events
+                       if event.get("ts") == occurred_at
+                       and event.get("station") == station
+                       and event.get("model") == model
+                       and (route_id is None or event.get("route_id") == route_id)]
+            if len(matches) == 1:
+                if matches[0].get("tokens") is not None:
+                    return  # A final usage report must only count once.
+                matches[0]["tokens"] = token_count
+                matched_event = matches[0]
         timestamp = time.time() if occurred_at is None else occurred_at
         date = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
         existing_station = self.daily.setdefault(date, {}).get(station)
@@ -619,6 +880,14 @@ class EventLog:
         self._record_hour_cache(
             date, datetime.fromtimestamp(timestamp).hour, station,
             cache_read, input_tokens)
+        if occurred_at is not None:
+            self._reported_usage[usage_key] = True
+            if len(self._reported_usage) > EVENT_MAXLEN:
+                del self._reported_usage[next(iter(self._reported_usage))]
+        if pending:
+            pending['usage_reported'] = True
+        self._commit(events=[matched_event] if matched_event else [], days=self._days(date),
+                     pending={pending_key: pending} if pending else None)
 
     def daily_stats(self) -> dict:
         """今日统计：各站 token/调用占比 + 站×模型明细 + 按小时时间线。"""
@@ -736,11 +1005,58 @@ class EventLog:
     def recent(self, n: int = 50) -> list[dict]:
         return list(self.events)[-n:]
 
-    def paginated(self, page: int = 1, page_size: int = 50) -> dict:
-        """Return a stable, newest-first page plus pagination metadata."""
+    @staticmethod
+    def _date_value(value: date | str | None) -> date | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        return date.fromisoformat(str(value))
+
+    @staticmethod
+    def _event_date(event: dict) -> date | None:
+        try:
+            return datetime.fromtimestamp(float(event.get("ts", 0))).date()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    @classmethod
+    def _matches_log_filters(cls, event: dict, *, ip: str | None = None,
+                             model: str | None = None,
+                             date_from: date | str | None = None,
+                             date_to: date | str | None = None) -> bool:
+        event_ip = event.get("client_ip")
+        if ip:
+            if ip == "unknown":
+                if event_ip:
+                    return False
+            elif event_ip != ip:
+                return False
+        if model and event.get("model", "-") != model:
+            return False
+        day = cls._event_date(event)
+        start, end = cls._date_value(date_from), cls._date_value(date_to)
+        if (start or end) and day is None:
+            return False
+        if start and day < start:
+            return False
+        if end and day > end:
+            return False
+        return True
+
+    def paginated(self, page: int = 1, page_size: int = 50, *,
+                  ip: str | None = None, model: str | None = None,
+                  date_from: date | str | None = None,
+                  date_to: date | str | None = None) -> dict:
+        """Return filtered retained events, newest first, with page metadata."""
         page = max(1, int(page))
-        page_size = max(1, min(int(page_size), EVENT_MAXLEN))
-        newest_first = list(reversed(self.events))
+        page_size = max(1, min(int(page_size), EVENT_PAGE_MAXLEN))
+        newest_first = [event for event in reversed(self.events)
+                        if self._matches_log_filters(
+                            event, ip=ip, model=model,
+                            date_from=date_from, date_to=date_to)]
         total = len(newest_first)
         pages = (total + page_size - 1) // page_size
         # If retention or a refresh removed a formerly valid last page, give
@@ -754,9 +1070,179 @@ class EventLog:
             "page_size": page_size,
             "pages": pages,
             "max_events": self.maxlen,
+            "retained_events": len(self.events),
         }
 
-    def _prune_daily(self, retention_days: int = 30) -> None:
+    def log_analytics(self, date_from: date | str | None = None,
+                      date_to: date | str | None = None,
+                      ip: str | None = None, model: str | None = None,
+                      group_by: str = "ip") -> dict:
+        """Aggregate charts and filter options from the retained event ring only."""
+        today = datetime.now().date()
+        end = self._date_value(date_to) or today
+        start = self._date_value(date_from) or (end - timedelta(days=6))
+        if start > end:
+            raise ValueError("date_from must not be after date_to")
+        days = (end - start).days + 1
+        if days > 366:
+            raise ValueError("log chart range cannot exceed 366 days")
+        if group_by not in ("ip", "model"):
+            raise ValueError("group_by must be ip or model")
+
+        retained = list(self.events)
+        ips = {}
+        models = {}
+        for event in retained:
+            event_ip = event.get("client_ip")
+            ip_key = event_ip or "unknown"
+            model_key = str(event.get("model", "-") or "-")
+            ips[ip_key] = ips.get(ip_key, 0) + 1
+            models[model_key] = models.get(model_key, 0) + 1
+        ip_options = [{"value": value, "label": "未记录 IP" if value == "unknown" else value}
+                      for value, _ in sorted(ips.items(), key=lambda item: (-item[1], item[0]))[:100]]
+        model_options = [{"value": value, "label": value}
+                         for value, _ in sorted(models.items(), key=lambda item: (-item[1], item[0]))[:100]]
+
+        matched = [event for event in retained
+                   if self._matches_log_filters(
+                       event, ip=ip, model=model,
+                       date_from=start, date_to=end)]
+        metrics = ("calls", "failures", "tokens", "usage_reports")
+        def empty_bucket():
+            return dict.fromkeys(metrics, 0)
+
+        def accumulate(bucket, event):
+            bucket["calls"] += 1
+            bucket["failures"] += not bool(event.get("ok", False))
+            tokens = event.get("tokens")
+            if isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and tokens >= 0:
+                bucket["tokens"] += int(tokens)
+                bucket["usage_reports"] += 1
+
+        daily = {}
+        for offset in range(days):
+            current = start + timedelta(days=offset)
+            daily[current.isoformat()] = {"date": current.isoformat(), **empty_bucket()}
+        breakdown: dict[str, dict[str, int]] = {}
+        ip_models = {}
+        totals = empty_bucket()
+        for event in matched:
+            day = self._event_date(event)
+            if day is None:
+                continue
+            bucket = daily[day.isoformat()]
+            accumulate(bucket, event)
+            accumulate(totals, event)
+            key = ((event.get("client_ip") or "unknown") if group_by == "ip"
+                   else str(event.get("model", "-") or "-"))
+            item = breakdown.setdefault(key, empty_bucket())
+            accumulate(item, event)
+            pair = (event.get("client_ip") or "unknown", str(event.get("model") or "-"))
+            accumulate(ip_models.setdefault(pair, empty_bucket()), event)
+        ranked = sorted(breakdown.items(), key=lambda item: (-item[1]["calls"], item[0]))
+        visible = ranked[:12]
+        if len(ranked) > 12:
+            overflow = empty_bucket()
+            for _, item in ranked[12:]:
+                for metric in metrics:
+                    overflow[metric] += item[metric]
+            visible.append(("__other__", overflow))
+        items = [{"value": key,
+                  "label": ("未记录 IP" if key == "unknown" else
+                            "其他" if key == "__other__" else key),
+                  **value} for key, value in visible]
+        timestamps = [self._event_date(event) for event in retained]
+        timestamps = [value for value in timestamps if value is not None]
+        return {
+            "date_from": start.isoformat(), "date_to": end.isoformat(),
+            "group_by": group_by, "calls": len(matched),
+            "failures": sum(not bool(event.get("ok", False)) for event in matched),
+            "tokens": totals["tokens"], "usage_reports": totals["usage_reports"],
+            "ip_reports": sum(bool(event.get("client_ip")) for event in matched),
+            "ip_models": [{"ip": ip, "model": model, **bucket}
+                          for (ip, model), bucket in sorted(ip_models.items(),
+                              key=lambda item: (-item[1]["calls"], item[0]))],
+            "retained_events": len(retained), "max_events": self.maxlen,
+            "available_from": min(timestamps).isoformat() if timestamps else None,
+            "available_to": max(timestamps).isoformat() if timestamps else None,
+            "ips": ip_options, "models": model_options,
+            "daily": list(daily.values()), "breakdown": items,
+        }
+
+    def daily_history(self, days: int = STATS_RETENTION_DAYS) -> dict:
+        """Return bounded daily totals and station/model series for analytics."""
+        days = max(1, min(int(days), STATS_RETENTION_DAYS))
+        today = datetime.now().date()
+        first_day = today - timedelta(days=days - 1)
+        daily = []
+        models = []
+        retained_dates = [date for store in (self.daily, self.daily_totals)
+                          for date in store
+                          if isinstance(date, str) and date >= first_day.strftime("%Y-%m-%d")]
+        available_from = min(retained_dates) if retained_dates else None
+        for offset in range(days):
+            date = (first_day + timedelta(days=offset)).strftime("%Y-%m-%d")
+            stations = self.daily.get(date, {})
+            day_models = self.daily_models.get(date, {})
+            calls = failures = tokens = usage_reports = 0
+            cache_read = cache_input = cache_reports = 0
+            coverage_known = True
+            for name, bucket in stations.items():
+                if not isinstance(bucket, dict):
+                    continue
+                calls += max(0, int(bucket.get("calls", 0) or 0))
+                failures += max(0, int(bucket.get("failures", 0) or 0))
+                usage_reports += max(0, int(bucket.get("usage_reports", 0) or 0))
+                coverage_known = coverage_known and bool(bucket.get("usage_reports_complete", "usage_reports" in bucket))
+                cache_read += max(0, int(bucket.get("cache_read", 0) or 0))
+                cache_input += max(0, int(bucket.get("cache_input", 0) or 0))
+                cache_reports += max(0, int(bucket.get("cache_reports", 0) or 0))
+                model_buckets = day_models.get(name, {})
+                if not isinstance(model_buckets, dict):
+                    model_buckets = {}
+                model_tokens = 0
+                model_calls = model_failures = 0
+                for model, value in model_buckets.items():
+                    model_bucket = value if isinstance(value, dict) else {}
+                    model_tokens += self._model_tokens(value)
+                    model_calls += max(0, int(model_bucket.get("calls", 0) or 0))
+                    model_failures += max(0, int(model_bucket.get("failures", 0) or 0))
+                    models.append({
+                        "date": date,
+                        "station": name,
+                        "model": "其他模型" if model == OTHER_MODEL_KEY else str(model),
+                        "calls": max(0, int(model_bucket.get("calls", 0) or 0)),
+                        "failures": max(0, int(model_bucket.get("failures", 0) or 0)),
+                        "tokens": self._model_tokens(value),
+                        "usage_reports": max(0, int(model_bucket.get("usage_reports", 0) or 0)),
+                    })
+                station_tokens = max(max(0, int(bucket.get("tokens", 0) or 0)), model_tokens)
+                tokens += station_tokens
+                remainder = {"date": date, "station": name, "model": "未归类模型",
+                             "tokens": station_tokens - model_tokens,
+                             "calls": max(0, int(bucket.get("calls", 0) or 0) - model_calls),
+                             "failures": max(0, int(bucket.get("failures", 0) or 0) - model_failures),
+                             "usage_reports": 0}
+                if any(remainder[key] for key in ("tokens", "calls", "failures")):
+                    models.append(remainder)
+            totals = self.daily_totals.get(date, {})
+            daily.append({
+                "date": date,
+                "calls": max(calls, int(totals.get("calls", 0) or 0)),
+                "failures": min(max(calls, int(totals.get("calls", 0) or 0)),
+                                 max(failures, int(totals.get("failures", 0) or 0))),
+                "tokens": tokens,
+                "usage_reports": usage_reports,
+                "token_coverage_known": coverage_known,
+                "cache_read": cache_read,
+                "cache_input": cache_input,
+                "cache_reports": cache_reports,
+            })
+        return {"from": first_day.strftime("%Y-%m-%d"),
+                "to": today.strftime("%Y-%m-%d"), "days": days,
+                "available_from": available_from, "daily": daily, "models": models}
+
+    def _prune_daily(self, retention_days: int = STATS_RETENTION_DAYS) -> None:
         """裁剪所有按天字典：只保留最近 retention_days 天（防无限增长）。"""
         from datetime import datetime, timedelta
         cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y-%m-%d")
@@ -770,26 +1256,41 @@ class EventLog:
                 if stale:
                     print(f"[stats] 已裁剪 {len(stale)} 天历史数据（{attr}，保留 {retention_days} 天）")
 
-    def persist(self) -> None:
+    def persist(self) -> bool:
+        if not self.durable:
+            return False
+        if not self._loaded:
+            if not self.store.path.exists() and not self.path.exists():
+                self._loaded = True
+                for event in self.events:
+                    event.setdefault('event_id', uuid.uuid4().hex)
+                try:
+                    self.store.initialise(self._summary(), self._days(), list(self.events), self.maxlen)
+                except (OSError, ValueError, sqlite3.Error, StaleStatsWriter) as exc:
+                    self._read_only = True
+                    self._storage_error = '统计初始化失败，原文件已保护；请检查磁盘或是否重复启动服务。'
+                    logger.error('Statistics initialisation failed: %s', type(exc).__name__)
+                    return False
+            else:
+                self.load()
+        if self._read_only:
+            return False
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
             self._prune_history()
-            # Keep the on-disk event list bounded even if an embedding mutates
-            # ``events`` or loads data produced by an older version.
-            persisted_events = list(self.events)[-self.maxlen:]
-            tmp.write_text(json.dumps(
-                {"events": persisted_events, "stations": self.station_counters,
-                 "daily": self.daily, "daily_models": self.daily_models,
-                 "daily_totals": self.daily_totals,
-                 "daily_hours": self.daily_hours,
-                 "hourly_cache": self.hourly_cache,
-                 "stats_schema": STATS_SCHEMA_VERSION},
-                ensure_ascii=False, indent=1,
-            ), encoding="utf-8")
-            tmp.replace(self.path)
-        except OSError as e:
-            print(f"[stats] 落盘失败: {e}")
+            for event in self.events:
+                event.setdefault('event_id', uuid.uuid4().hex)
+            self._last_saved = self.store.write(events=list(self.events), days=self._days(),
+                summary=self._summary(), maxlen=self.maxlen, replace=True,
+                runtime=self._runtime, pending=self._pending)
+            self._storage_error = ''
+            self._retry_at = 0.0
+            return True
+        except (OSError, ValueError, sqlite3.Error, StaleStatsWriter) as exc:
+            self._read_only |= isinstance(exc, StaleStatsWriter)
+            self._storage_error = '统计保存失败，原文件未覆盖；新记录暂存内存，请检查磁盘或是否重复启动服务。'
+            self._retry_at = time.time() + 5
+            logger.error('Statistics persistence failed: %s', type(exc).__name__)
+            return False
 
 
 async def persist_loop(eventlog: EventLog, interval: float = 30.0) -> None:
@@ -797,7 +1298,7 @@ async def persist_loop(eventlog: EventLog, interval: float = 30.0) -> None:
     while True:
         try:
             await __import__("asyncio").sleep(interval)
-            eventlog.persist()
+            eventlog.maintenance()
         except __import__("asyncio").CancelledError:
             break
         except Exception as e:  # noqa: BLE001

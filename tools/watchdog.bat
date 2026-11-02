@@ -1,5 +1,5 @@
 @echo off
-sc query ZGateway | findstr /i "RUNNING" >nul
+sc query ModelHarbor | findstr /i "RUNNING" >nul
 if errorlevel 1 (
-  sc start ZGateway >nul 2>&1
+  sc start ModelHarbor >nul 2>&1
 )

@@ -8,14 +8,14 @@ param(
 $ErrorActionPreference = "Stop"
 if (-not $ProjectRoot) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot -ErrorAction Stop).Path
-if (-not $OutputPath) { $OutputPath = Join-Path $ProjectRoot ("ZGateway-migration-{0}.zip" -f (Get-Date -Format "yyyyMMdd")) }
+if (-not $OutputPath) { $OutputPath = Join-Path $ProjectRoot ("ModelHarbor-{0}.zip" -f (Get-Date -Format "yyyyMMdd")) }
 $OutputPath = [IO.Path]::GetFullPath($OutputPath)
 if ((Test-Path -LiteralPath $OutputPath) -and -not $Force) { throw "Output already exists: $OutputPath. Use -Force only after reviewing it." }
-$staging = Join-Path ([IO.Path]::GetTempPath()) ("ZGateway-migration-" + [guid]::NewGuid().ToString("N"))
+$staging = Join-Path ([IO.Path]::GetTempPath()) ("ModelHarbor-package-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 try {
     $copyFiles = @(
-        "gateway.py", "cli.py", "config.example.yaml", "requirements.txt", "README.md",
+        "gateway.py", "cli.py", "config.example.yaml", "requirements.txt", "README.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",
         "Install-ZGateway.ps1", "Uninstall-ZGateway.ps1", "Verify-ZGateway.ps1",
         "tools\Build-ZGatewayPackage.ps1", "tools\install.cmd", "tools\watchdog.bat", "tools\tray.py",
         "tools\zgateway-service.cmd", "tools\nssm-2.24\win64\nssm.exe",
@@ -28,11 +28,23 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath $source -Destination $destination -Force
     }
-    $appDestination = Join-Path $staging "app"
-    Copy-Item -LiteralPath (Join-Path $ProjectRoot "app") -Destination $appDestination -Recurse -Force
-    Get-ChildItem -LiteralPath $appDestination -Directory -Filter "__pycache__" -Recurse -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
+    # Build from reviewed, tracked app files only; ignore all local captures/data.
+    $appFiles = @(& git -C $ProjectRoot ls-files -- app)
+    if ($LASTEXITCODE -ne 0 -or $appFiles.Count -eq 0) { throw 'Build packages from a Git checkout with reviewed app files.' }
+    foreach ($relative in $appFiles) {
+        if ($relative -notmatch '^app/' -or $relative -match '(^|/)\.\.(/|$)') { throw 'Unexpected package path.' }
+        $destination = Join-Path $staging $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $ProjectRoot $relative) -Destination $destination -Force
+    }
+    foreach ($relative in @('docs\native-protocols.md', 'docs\opencode-go.md', 'docs\dashboard-settings-and-statistics.md',
+                            'docs\screenshots\overview.png', 'docs\screenshots\requests.png', 'docs\screenshots\visual-tests.png')) {
+        $destination = Join-Path $staging $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $ProjectRoot $relative) -Destination $destination -Force
+    }
     $readme = @"
-ZGateway Windows migration package
+ModelHarbor Windows deployment package
 ==================================
 
 The package includes the NSSM executable and its public-domain notice.
@@ -44,8 +56,8 @@ Install from an elevated PowerShell window:
   .\Install-ZGateway.ps1
 
 The installer creates .venv, installs requirements.txt, registers the
-ZGateway Windows service, registers the five-minute watchdog, and starts the
-service. Python 3.10+ and package-download access are required unless the
+ModelHarbor Windows service, registers the five-minute watchdog, and starts the
+service. Python 3.11+ and package-download access are required unless the
 requirements are already available through a local package mirror.
 
 Verify without exposing credentials:
@@ -71,5 +83,11 @@ exposed to an untrusted network.
     $size = (Get-Item -LiteralPath $OutputPath).Length
     Write-Host "Created $OutputPath ($size bytes)."
 } finally {
-    if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    $cleanupPath = [IO.Path]::GetFullPath($staging)
+    if (-not $cleanupPath.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        (Split-Path -Leaf $cleanupPath) -notlike 'ModelHarbor-package-*') {
+        throw "Refusing cleanup outside the temporary package directory."
+    }
+    if (Test-Path -LiteralPath $cleanupPath) { Remove-Item -LiteralPath $cleanupPath -Recurse -Force }
 }

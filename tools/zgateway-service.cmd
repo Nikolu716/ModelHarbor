@@ -1,10 +1,10 @@
 @echo off
 rem ============================================
-rem ZGateway 服务管理脚本
+rem ModelHarbor 服务管理脚本
 rem 用法: zgateway-service.cmd [start|stop|restart|status|logs|uninstall]
 rem ============================================
 set NSSM=%~dp0nssm-2.24\win64\nssm.exe
-set SVC=ZGateway
+set SVC=ModelHarbor
 
 if "%1"=="" goto usage
 

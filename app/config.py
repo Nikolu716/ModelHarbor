@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from .access_control import validate_allowed_ips
+
 DEFAULT_CONFIG = "config.yaml"
 
 
@@ -24,7 +26,7 @@ class GatewayConfig:
     round_backoff: float = 1.0  # 轮间基础退避秒数（第 N 轮前等待 round_backoff * 2^(N-1)）
     max_round_backoff: float = 10.0  # 轮间退避上限
     max_retry_seconds: float = 60.0  # 0 表示不限总时长（仅限有限轮次）
-    probe_interval: float = 15.0
+    probe_interval: float = 900.0
     fail_threshold: int = 3
     cool_down: float = 60.0
     connect_timeout: float = 10.0
@@ -42,16 +44,44 @@ class GatewayConfig:
     api_keys: list[str] = field(default_factory=list)
     # 管理接口 key（空 = 管理接口不鉴权；配置后 /admin/* 数据接口需带该 key）
     admin_key: str = ""
+    # Allowed source IPs for all routes, including local clients; [] denies all.
+    allowed_ips: list[str] = field(default_factory=lambda: ["127.0.0.1", "::1"])
+    # Optional stable URL shown to clients; useful when the dashboard is opened via loopback.
+    public_url: str = ""
+    # Token-generating background probes require explicit global and per-station opt-in.
+    generation_probe_enabled: bool = False
+    generation_probe_interval: float = 900.0
     # 流式 SSE 保活间隔（秒，0 = 关闭）：长流定期发注释行防止客户端空闲超时
     sse_keepalive_interval: float = 60.0
     juice_probe_interval: float = 600.0  # 单token指纹巡检间隔（只测使用中站点）
     data_dir: str = "data"
-    data_retention_days: int = 30  # 按天统计/指纹保留天数（自动裁剪，防无限增长）
+    data_retention_days: int = 365  # 按天统计/指纹保留天数（自动裁剪，防无限增长）
 
     @classmethod
     def from_dict(cls, d: dict) -> "GatewayConfig":
         allowed = {f.name for f in dataclasses.fields(cls)}
         cfg = cls(**{k: v for k, v in (d or {}).items() if k in allowed})
+        if isinstance(cfg.port, bool) or not isinstance(cfg.port, int) or not 1 <= cfg.port <= 65535:
+            raise ValueError("gateway.port must be an integer between 1 and 65535")
+        cfg.allowed_ips = validate_allowed_ips(cfg.allowed_ips)
+        if not isinstance(cfg.public_url, str):
+            raise ValueError("gateway.public_url must be a string")
+        cfg.public_url = cfg.public_url.strip().rstrip("/")
+        if cfg.public_url:
+            from urllib.parse import urlsplit
+            parsed_url = urlsplit(cfg.public_url)
+            if (parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc
+                    or parsed_url.username or parsed_url.password or parsed_url.query
+                    or parsed_url.fragment or parsed_url.path not in {"", "/", "/v1"}):
+                raise ValueError("gateway.public_url must be a base http(s) URL")
+            try:
+                explicit_port = parsed_url.port
+            except ValueError as exc:
+                raise ValueError("gateway.public_url contains an invalid port") from exc
+            if explicit_port is not None and not 1 <= explicit_port <= 65535:
+                raise ValueError("gateway.public_url port must be between 1 and 65535")
+            if parsed_url.path == "/v1":
+                cfg.public_url = cfg.public_url[:-3]
         if isinstance(cfg.max_rounds, bool) or not isinstance(cfg.max_rounds, int) \
                 or cfg.max_rounds < 0:
             raise ValueError("gateway.max_rounds must be an integer >= 0")
@@ -61,6 +91,14 @@ class GatewayConfig:
                     or not math.isfinite(value) or value < 0:
                 raise ValueError(f"gateway.{name} must be a finite number >= 0")
             return float(value)
+
+        if not isinstance(cfg.generation_probe_enabled, bool):
+            raise ValueError("gateway.generation_probe_enabled must be a boolean")
+        cfg.generation_probe_interval = non_negative_number(
+            cfg.generation_probe_interval, "generation_probe_interval")
+        if not 300 <= cfg.generation_probe_interval <= 86400:
+            raise ValueError(
+                "gateway.generation_probe_interval must be between 300 and 86400 seconds")
 
         cfg.round_backoff = non_negative_number(cfg.round_backoff, "round_backoff")
         cfg.max_round_backoff = non_negative_number(
@@ -95,15 +133,21 @@ class StationConfig:
     base_url: str
     api_key: str
     models: list[str] = field(default_factory=list)
+    model_routing: str = "catalog"  # catalog: exact known models; passthrough: explicit opt-in.
+    route_models: list[str] = field(default_factory=list)  # Optional exact IDs or trailing-* prefixes.
+    provider: str = "openai"  # openai-compatible or OpenCode's documented native endpoints.
+    opencode_plan: str = "balance"  # balance / go; never fall back between billing sources.
     priority: int = 5
+    priority_auto: bool = False  # Legacy stations keep their manual score bias.
     weight: float = 1.0
     timeout: float = 300.0
     max_concurrency: int = 20
     probe_models: bool = False
     probe_path: str = "/models"
     probe_interval: float | None = None  # None 时使用 gateway.probe_interval
-    probe_chat: bool = False  # 真实生成链路探测（极小成本，至少 60s 一次）
+    probe_chat: bool = False  # Background generation also requires the global opt-in.
     probe_chat_path: str = "/chat/completions"  # 探测端点（responses-only 站用 /responses）
+    probe_chat_model: str = ""  # Empty: first discovered model in upstream order, then configured models.
     probe_balance: bool = True  # 探测余额接口 credit_grants（不支持则静默降级）
     billing: str = "balance"  # 计费模式: balance(余额制) / subscription(订阅制)
     headers: dict[str, str] = field(default_factory=dict)
@@ -123,17 +167,69 @@ class StationConfig:
         兼容用户写成 https://host 或 https://host/v1 两种形式。
         """
         url = self.base_url.rstrip("/")
+        if self.provider == "gemini":
+            return url if url.endswith(("/v1beta", "/v1")) else url + "/v1beta"
+        if self.provider == "opencode":
+            prefix = "go/" if self.opencode_plan == "go" else ""
+            return f"https://opencode.ai/inference/{prefix}openai/v1"
         if not url.endswith("/v1"):
             url += "/v1"
         return url
+
+    @property
+    def models_url(self) -> str:
+        if self.provider == "opencode":
+            prefix = "go/" if self.opencode_plan == "go" else ""
+            return f"https://opencode.ai/inference/{prefix}v1/models"
+        return self.api_base + "/models"
 
     @classmethod
     def from_dict(cls, name: str, d: dict) -> "StationConfig":
         allowed = {f.name for f in dataclasses.fields(cls)} - {"name"}
         kw = {k: v for k, v in (d or {}).items() if k in allowed}
+        if "model_routing" not in kw:
+            # Preserve legacy wildcard stations on reload; new API/UI stations set catalog explicitly.
+            kw["model_routing"] = "catalog" if kw.get("models") or kw.get("probe_models") else "passthrough"
+        if "opencode_plan" not in kw and str(kw.get("base_url", "")).startswith("https://opencode.ai/inference/go/"):
+            kw["opencode_plan"] = "go"
         cfg = cls(name=name, **kw)
+        if cfg.provider not in ("openai", "opencode", "anthropic", "gemini"):
+            raise ValueError("provider 必须是 openai、opencode、anthropic 或 gemini")
+        if cfg.provider in ("anthropic", "gemini"):
+            cfg.probe_balance = False
+            cfg.wire_api = "auto"
+            cfg.probe_chat_path = "/messages" if cfg.provider == "anthropic" else "/generateContent"
+        if cfg.opencode_plan not in ("balance", "go"):
+            raise ValueError("OpenCode 套餐必须是 balance 或 go")
+        if cfg.provider == "opencode":
+            if not isinstance(cfg.base_url, str) or cfg.base_url.strip().rstrip("/") not in {
+                    "https://opencode.ai", "https://opencode.ai/inference",
+                    "https://opencode.ai/inference/v1", "https://opencode.ai/inference/openai/v1",
+                    "https://opencode.ai/inference/go/v1", "https://opencode.ai/inference/go/openai/v1"}:
+                raise ValueError("OpenCode 必须使用官方 inference 地址")
+            cfg.base_url = cfg.api_base
+            cfg.billing = "subscription" if cfg.opencode_plan == "go" else "balance"
+            if cfg.opencode_plan == "go":
+                cfg.probe_chat = False  # No synthetic ping traffic on the coding subscription.
+            cfg.probe_models = True
+            cfg.probe_path = "/models"
+            cfg.probe_balance = False  # No documented credit_grants endpoint.
+            cfg.model_routing = "catalog"
+            cfg.wire_api = "auto"
+        if cfg.model_routing not in ("catalog", "passthrough"):
+            raise ValueError("model_routing 必须是 catalog 或 passthrough")
+        if not isinstance(cfg.route_models, list) or len(cfg.route_models) > 500 or any(
+                not isinstance(model, str) or not model.strip() or len(model) > 200
+                or any(ord(c) < 32 or ord(c) == 127 for c in model) or "*" in model.strip().rstrip("*")
+                or model.count("*") > 1 for model in cfg.route_models):
+            raise ValueError("路由模型须为模型 ID 或末尾带 * 的前缀，最多 500 项")
+        cfg.route_models = list(dict.fromkeys(model.strip() for model in cfg.route_models))
+        if not isinstance(cfg.priority_auto, bool):
+            raise ValueError("priority_auto 必须是布尔值")
         if cfg.billing not in ("balance", "subscription"):
             raise ValueError(f"中转站 [{name}] billing 必须是 balance 或 subscription")
+        if not isinstance(cfg.probe_chat_model, str):
+            raise ValueError(f"中转站 [{name}] probe_chat_model 必须是字符串")
         return cfg
 
 

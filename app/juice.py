@@ -75,9 +75,10 @@ def juice_score(st, fingerprint_flag: str = "") -> int:
     score = 100.0
     if getattr(st, "model_mismatch", 0) > 0:
         score -= 30.0
-    for fam in ("anthropic", "bedrock", "vertex"):
-        if st.upstream_families.get(fam, 0) > 0:
-            score -= 30.0
+    if getattr(getattr(st, "cfg", None), "provider", "openai") == "openai":
+        for fam in ("anthropic", "bedrock", "vertex"):
+            if st.upstream_families.get(fam, 0) > 0:
+                score -= 30.0
     if fingerprint_flag == "mismatch":
         score -= 25.0
     return max(0, min(100, int(round(score))))
@@ -186,6 +187,12 @@ def _iter_json_payloads(content: bytes):
 
 def _extract_text_from_obj(obj: dict) -> str:
     """从单个响应对象提取输出文本（chat/responses 兼容）。"""
+    from .protocols import native_text
+    native = native_text(obj)
+    if native:
+        return native
+    if obj.get("type") == "content_block_delta":
+        return obj.get("delta", {}).get("text", "")
     for choice in obj.get("choices", []) or []:
         if isinstance(choice, dict):
             msg = choice.get("message")

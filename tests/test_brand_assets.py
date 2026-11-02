@@ -16,18 +16,19 @@ from tools.tray import TRAY_ICON, make_icon
 
 
 class BrandAssetTests(unittest.TestCase):
-    def test_png_variants_have_expected_sizes_and_contrast(self) -> None:
+    def test_png_variants_use_the_supplied_gray_logo_crop(self) -> None:
         static = ROOT / "app" / "web" / "static"
+        source_path = static / "brand-logo-source.png"
+        self.assertTrue(source_path.is_file())
+        with Image.open(source_path) as source:
+            expected = source.convert("RGBA").crop((450, 120, 1090, 760))
         for size in (64, 180, 512):
             with Image.open(static / f"brand-mark-{size}.png") as image:
                 self.assertEqual(image.size, (size, size))
                 self.assertEqual(image.mode, "RGBA")
-
-        with Image.open(static / "brand-mark-64.png") as image:
-            self.assertEqual(image.getpixel((0, 0))[3], 0)
-            self.assertGreater(min(image.getpixel((18, 16))[:3]), 230)
-            self.assertGreater(min(image.getpixel((32, 32))[:3]), 230)
-            self.assertLess(max(image.getpixel((47, 32))[:3]), 20)
+                self.assertEqual(image.getpixel((size // 2, size // 2)),
+                                 expected.resize((size, size), Image.Resampling.LANCZOS)
+                                 .getpixel((size // 2, size // 2)))
 
     def test_ico_contains_small_and_large_windows_sizes(self) -> None:
         with Image.open(ROOT / "app" / "web" / "static" / "favicon.ico") as image:

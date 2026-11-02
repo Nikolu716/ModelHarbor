@@ -3,44 +3,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "app" / "web" / "static"
-BLACK = (9, 9, 9, 255)
-WHITE = (245, 245, 247, 255)
+SOURCE = STATIC / "brand-logo-source.png"
+MARK_CROP = (450, 120, 1090, 760)
 
 
 def render_mark(size: int) -> Image.Image:
-    scale = 4
-    canvas = size * scale
-    unit = canvas / 64
-    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-
-    def box(left: float, top: float, right: float, bottom: float):
-        return tuple(round(value * unit) for value in (left, top, right, bottom))
-
-    draw.rounded_rectangle(
-        box(2, 2, 62, 62),
-        radius=round(14 * unit),
-        fill=BLACK,
-        outline=WHITE,
-        width=max(1, round(1.5 * unit)),
-    )
-    draw.rectangle(box(15, 15, 49, 23), fill=WHITE)
-    draw.polygon(
-        [
-            (round(39 * unit), round(15 * unit)),
-            (round(49 * unit), round(15 * unit)),
-            (round(25 * unit), round(49 * unit)),
-            (round(15 * unit), round(49 * unit)),
-        ],
-        fill=WHITE,
-    )
-    draw.rectangle(box(15, 41, 49, 49), fill=WHITE)
-    return image.resize((size, size), Image.Resampling.LANCZOS)
+    with Image.open(SOURCE) as source:
+        mark = source.convert("RGBA").crop(MARK_CROP)
+        return mark.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def main() -> None:

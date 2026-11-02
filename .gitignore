@@ -51,3 +51,17 @@ vscode-shot.png
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Private databases, key material, and deployment archives
+*.sqlite*
+*.db
+*.db-*
+*.pem
+*.key
+*.pfx
+*.p12
+ModelHarbor-*.zip
+
+# Local investigations and disposable UI captures
+app/web/static/dev-screenshot.html
+docs/gateway-probe-compatibility-plan.md

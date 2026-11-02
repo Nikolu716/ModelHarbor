@@ -5,13 +5,18 @@ gateway:
   # Keep loopback for a single-machine deployment. Use 0.0.0.0 only behind trusted network controls.
   host: 127.0.0.1
   port: 8000
+  # Optional client endpoint. Set the real LAN address or reverse-proxy URL; leave empty to configure it in 服务设置.
+  public_url: ""
   max_attempts: 3
   retry_backoff: 0.3
   max_rounds: 3
   round_backoff: 1.0
   max_round_backoff: 30
   max_retry_seconds: 300
-  probe_interval: 15
+  probe_interval: 900
+  # Generation probes are opt-in globally and per station; they may consume upstream tokens.
+  generation_probe_enabled: false
+  generation_probe_interval: 900
   quota_auto_recover: true
   quota_probe_interval: 60
   quota_probe_max_interval: 300
@@ -26,10 +31,14 @@ gateway:
   api_keys: []
   # Set a separate strong random value before enabling remote administration.
   admin_key: ""
+  # Allowed client IPs for ALL routes (API, dashboard, admin, health).
+  # Each account has its own allowlist. Localhost must also be listed; [] denies all access.
+  # Add exact IPv4/IPv6 addresses, without http://, ports or CIDR ranges.
+  allowed_ips: ["127.0.0.1", "::1"]
   sse_keepalive_interval: 60
   webhook_url: ""
   data_dir: data
-  data_retention_days: 30
+  data_retention_days: 365
 
 stations:
   # Replace this mock endpoint and key with a real OpenAI-compatible upstream.
@@ -37,16 +46,43 @@ stations:
   - name: local-mock
     base_url: http://127.0.0.1:9101/v1
     api_key: replace-with-upstream-key
+    provider: openai  # Generic OpenAI-compatible endpoint.
+    model_routing: catalog  # Match discovered + configured exact IDs; passthrough is opt-in.
+    route_models: []  # Optional narrower scope, e.g. ["gpt-*", "deepseek-*"]. Never aliases models.
     models:
       - mock-model
     priority: 1
+    priority_auto: true
     weight: 1.0
     timeout: 300
     max_concurrency: 20
     probe_models: true
     probe_chat: false
+    probe_chat_model: ""  # Auto: first model in upstream order; set a model name to pin it manually.
     billing: balance
     headers: {}
     wire_api: auto
     inject: {}
     enabled: true
+
+  # Optional OpenCode channel: replace the key, then enable it.
+  # Model catalog and inference use different official paths. Native protocols only.
+  # - name: opencode
+  #   provider: opencode
+  #   opencode_plan: balance  # go uses the independent Go subscription, never balance fallback.
+  #   base_url: https://opencode.ai/inference/openai/v1
+  #   api_key: replace-with-opencode-key
+  #   model_routing: catalog
+  #   route_models: []
+  #   priority_auto: true
+  #   probe_models: true
+  #   probe_interval: 3600
+  #   probe_chat: false
+  #   probe_balance: false
+  #   enabled: false
+
+  # Go subscribers: select opencode_plan: go in the example above.
+  # Native base: https://opencode.ai/inference/go/openai/v1
+  # Catalog: https://opencode.ai/inference/go/v1/models
+  # Clients must preserve x-opencode-session or Codex's native session-id per conversation.
+  # Go does not send synthetic ping generation probes. Use real coding requests / visual tests.

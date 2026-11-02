@@ -122,6 +122,11 @@ def classify_error(station: str, status_code: int, payload: bytes | str = "") ->
     message = _extract_message(payload)
     lowered = message.lower()
     quota = _is_quota_error(status_code, lowered)
+    if quota:
+        # Funding/entitlement cannot recover through immediate retries. Other
+        # matching stations may still serve the request, but do not loop rounds.
+        return UpstreamError(station, status_code, message,
+                             retryable=True, quota=True, deterministic=True)
     # 确定性 = 状态码命中且消息不含容量关键词（容量关键词代表瞬时拥挤）
     deterministic = (status_code in DETERMINISTIC_STATUS
                      and not any(k in lowered for k in CAPACITY_KEYWORDS))

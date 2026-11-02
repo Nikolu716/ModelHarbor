@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
+import json
+import math
 import threading
 import time
 from collections import deque
@@ -30,18 +33,21 @@ HISTORY_SLOT_SECONDS = 60
 
 STATUS_UP = "up"
 STATUS_DOWN = "down"
-STATUS_COOLING = "cooling"  # 冷却中，不路由
+STATUS_COOLING = "cooling"  # Compatibility value: cooldown elapsed, awaiting recovery validation.
 
 
 @dataclass
 class StationState:
     cfg: StationConfig
-    enabled: bool = True
+    enabled: bool | None = None
 
     # 健康状态
     status: str = STATUS_UP
     consecutive_failures: int = 0
     down_since: float = 0.0
+    breaker_reason: str = ""
+    breaker_source: str = ""
+    breaker_status_code: int = 0
     ema_latency: float | None = None  # 秒
     ttft_ema: float | None = None  # 首字时间 EMA（秒）
 
@@ -51,10 +57,14 @@ class StationState:
     upstream_families: dict = field(default_factory=dict)
     model_mismatch: int = 0
     last_probe_ok: bool | None = None
+    last_probe_kind: str = ""
     last_probe_latency: float | None = None  # 秒
     last_probe_error: str = ""
     last_probe_at: float = 0.0
     probe_chat_at: float = 0.0  # 真实链路探测时间戳
+    generation_probe_ok: bool | None = None
+    generation_probe_error: str = ""
+    generation_probe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # 资金/配额状态（余额不足、订阅到期）
     # 默认自动探测恢复：/models 成功不视为有额度，需对症探测确认后才清除
@@ -69,9 +79,33 @@ class StationState:
 
     # 429 限流短冷却（到点前不路由该站）
     rate_limit_until: float = 0.0
+    rate_limit_reason: str = ""
+    rate_limit_source: str = ""
+    rate_limit_wait_source: str = ""
 
     # 模型（静态配置 ∪ 探测结果）
     probed_models: set[str] = field(default_factory=set)
+    probed_model_order: list[str] = field(default_factory=list)
+    model_api_paths: dict[str, list[str]] = field(default_factory=dict)
+    model_unavailable: dict[str, str] = field(default_factory=dict)
+    models_discovery_status: str = "pending"
+    models_discovered_at: float = 0.0
+    models_checked_at: float = 0.0
+    models_next_refresh_at: float = 0.0
+    models_retry_after_until: float = 0.0
+    models_discovery_error: str = ""
+    models_discovery_failures: int = 0
+    models_discovery_revision: int = 0
+    models_discovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    go_usage: dict = field(default_factory=dict)
+    go_usage_status: str = "pending"
+    go_usage_error: str = ""
+    go_usage_updated_at: float = 0.0
+    go_usage_checked_at: float = 0.0
+    go_usage_next_at: float = 0.0
+    go_usage_retry_at: float = 0.0
+    go_usage_failures: int = 0
+    go_usage_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     # 调用统计
     calls: int = 0
@@ -83,6 +117,8 @@ class StationState:
 
     # 动态健康评分（0-100，路由排序依据）
     health_score: float = 60.0
+    score_breakdown: dict = field(default_factory=dict)
+    score_refreshed_at: float = 0.0
     window_results: deque = field(
         default_factory=lambda: deque(maxlen=SCORE_WINDOW))
 
@@ -99,15 +135,204 @@ class StationState:
     # 运行时
     semaphore: asyncio.Semaphore | None = None
     client: httpx.AsyncClient | None = None
+    persist_state: object = field(default=None, repr=False, compare=False)
+
+    def connection_signature(self):
+        cfg = self.cfg
+        values = [cfg.api_base, cfg.api_key, cfg.headers, cfg.provider, cfg.opencode_plan, cfg.wire_api]
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+    def durable_view(self):
+        names = ('calls', 'failures', 'switch_in', 'switch_out', 'last_error', 'last_error_at',
+                 'status', 'consecutive_failures', 'down_since', 'breaker_reason', 'breaker_source',
+                 'breaker_status_code', 'ema_latency', 'ttft_ema', 'last_used_at',
+                 'quota_exhausted', 'quota_error', 'quota_at', 'quota_source', 'quota_probe_at',
+                 'quota_probe_error', 'quota_probe_backoff', 'rate_limit_until', 'rate_limit_reason',
+                 'rate_limit_source', 'rate_limit_wait_source', 'go_usage_status', 'go_usage_error',
+                 'go_usage_updated_at', 'go_usage_checked_at', 'go_usage_next_at', 'go_usage_retry_at', 'go_usage_failures')
+        return {'signature': self.connection_signature(), 'saved_at': time.time(),
+                'values': {name: getattr(self, name) for name in names},
+                'window_results': list(self.window_results), 'go_usage': self.go_usage}
+
+    def restore_durable(self, data):
+        if not isinstance(data, dict) or data.get('signature') != self.connection_signature():
+            return
+        values = data.get('values', {})
+        if not isinstance(values, dict):
+            return
+        cached = data.get('go_usage')
+        if isinstance(cached, dict) and cached:
+            from .go_usage import normalize_usage
+            from datetime import datetime, timezone
+            try:
+                self.go_usage = normalize_usage({'usage': {key: {
+                    'percent': item.get('percent'), 'status': item.get('status'),
+                    'resetsAt': datetime.fromtimestamp(item['resets_at'], timezone.utc).isoformat() if item.get('resets_at') is not None else None,
+                } for key, item in cached.items()}})
+            except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                self.go_usage = {}
+        for name in self.durable_view()['values']:
+            value = values.get(name)
+            current = getattr(self, name)
+            if isinstance(current, bool):
+                if isinstance(value, bool): setattr(self, name, value)
+            elif isinstance(current, str):
+                if isinstance(value, str): setattr(self, name, value[:2048])
+            elif isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+                setattr(self, name, value)
+        if self.status not in (STATUS_UP, STATUS_DOWN, STATUS_COOLING):
+            self.status = STATUS_UP
+        self.calls = max(int(self.calls), int(self.failures))
+        # Historical totals remain, but stale performance samples should not bias routing forever.
+        saved_at = data.get('saved_at', 0)
+        age = time.time() - saved_at if isinstance(saved_at, (int, float)) and math.isfinite(saved_at) else float('inf')
+        samples = data.get('window_results', [])
+        if not isinstance(samples, list):
+            samples = []
+        if 0 <= age < 86400:
+            self.window_results.extend(v for v in samples[-SCORE_WINDOW:] if isinstance(v, bool))
+        else:
+            self.ema_latency = self.ttft_ema = None
+        self._update_score()
+
+    def _persist_state(self):
+        if self.persist_state:
+            self.persist_state(self.cfg.name, self.durable_view())
+
+    def __post_init__(self) -> None:
+        if self.enabled is None:
+            self.enabled = self.cfg.enabled
+        self._update_score()
+
+    @property
+    def priority_bias(self) -> float:
+        return 0.0 if self.cfg.priority_auto else max(0, 6 - self.cfg.priority) * 3.0
+
+    def model_discovery_view(self) -> dict:
+        return {
+            "status": self.models_discovery_status if self.cfg.probe_models else "off",
+            "updated_at": self.models_discovered_at,
+            "checked_at": self.models_checked_at,
+            "next_refresh_at": self.models_next_refresh_at,
+            "retry_after_until": self.models_retry_after_until,
+            "error": self.models_discovery_error,
+            "count": len(self.probed_models),
+        }
+
+    def go_usage_view(self):
+        from .go_usage import usage_view
+        return usage_view(self)
 
     @property
     def effective_models(self) -> set[str]:
+        return {model for model in self.known_models if self.supports_model(model)}
+
+    @property
+    def known_models(self) -> set[str]:
         return set(self.cfg.models) | self.probed_models
+
+    def protocol_view(self) -> dict[str, list[str]]:
+        if self.cfg.provider in ("anthropic", "gemini"):
+            path = "/messages" if self.cfg.provider == "anthropic" else "/generateContent"
+            return {model: [path] for model in self.known_models}
+        return dict(self.model_api_paths)
+
+    def model_allowed(self, model: str) -> bool:
+        return not self.cfg.route_models or any(
+            model.startswith(rule[:-1]) if rule.endswith("*") else model == rule
+            for rule in self.cfg.route_models)
+
+    def supports_model(self, model: str, path: str | None = None) -> bool:
+        from .protocols import capability_path, provider_supports
+        if not self.model_allowed(model):
+            return False
+        if self.cfg.provider == "opencode":
+            paths = self.model_api_paths.get(model, [])
+            return bool(paths) and (path is None or capability_path(path) in paths)
+        if not provider_supports(self.cfg.provider, path):
+            return False
+        if path == "/chat/completions" and self.cfg.wire_api == "responses":
+            return False  # There is no Chat-to-Responses request/stream adapter.
+        return self.accepts_any_model or model in self.known_models
+
+    @property
+    def probe_model_candidates(self) -> list[str]:
+        discovered = [m for m in self.probed_model_order if m in self.probed_models]
+        discovered += sorted(self.probed_models - set(discovered))
+        candidates = list(dict.fromkeys((discovered if self.cfg.probe_models else []) + self.cfg.models))
+        return [m for m in candidates if m in self.model_api_paths] if self.cfg.provider == "opencode" else candidates
+
+    def generation_path(self, model: str) -> str:
+        if self.cfg.provider in ("anthropic", "gemini"):
+            return "/messages" if self.cfg.provider == "anthropic" else "/generateContent"
+        paths = self.model_api_paths.get(model, []) if self.cfg.provider == "opencode" else []
+        return paths[0] if paths else self.cfg.probe_chat_path
+
+    @property
+    def selected_probe_model(self) -> str:
+        configured = self.cfg.probe_chat_model.strip()
+        return configured or next(iter(self.probe_model_candidates), "")
+
+    def generation_probe_view(self) -> dict:
+        return {
+            "mode": "manual" if self.cfg.probe_chat_model.strip() else "auto",
+            "model": self.selected_probe_model,
+            "last_at": self.probe_chat_at,
+            "ok": self.generation_probe_ok,
+            "error": self.generation_probe_error,
+        }
+
+    def protection_view(self, gateway: GatewayConfig, now: float) -> dict:
+        until = 0.0
+        source = "gateway"
+        if not self.enabled:
+            kind, reason = "disabled", "管理员已停用，暂停参与路由"
+        elif self.quota_exhausted:
+            kind, reason = "quota", self.quota_error
+            source = self.quota_source
+        elif now < self.rate_limit_until:
+            kind, reason = "rate_limited", self.rate_limit_reason or "上游返回 HTTP 429"
+            source, until = self.rate_limit_source, self.rate_limit_until
+        elif self.status == STATUS_DOWN:
+            until = self.down_since + gateway.cool_down
+            kind = "breaker" if now < until else "recovering"
+            reason = self.breaker_reason or self.last_error or "连续请求失败"
+            source = self.breaker_source
+        else:
+            kind, reason = "normal", "允许参与路由"
+        return {
+            "kind": kind, "reason": reason, "source": source,
+            "until": until, "remaining_seconds": max(0, int(until - now + 0.999)),
+            "failure_count": self.consecutive_failures,
+            "threshold": gateway.fail_threshold,
+            "status_code": self.breaker_status_code if kind in {"breaker", "recovering"} else (429 if kind == "rate_limited" else None),
+            "wait_source": self.rate_limit_wait_source if kind == "rate_limited" else "",
+        }
+
+    def recover_health(self) -> None:
+        self.consecutive_failures = 0
+        self.status = STATUS_UP
+        self.down_since = 0.0
+        self.breaker_reason = self.breaker_source = ""
+        self.breaker_status_code = 0
+
+    def mark_transient_failure(self, err: UpstreamError, gateway: GatewayConfig,
+                               *, source: str = "request") -> None:
+        self.consecutive_failures += 1
+        self.breaker_reason = str(err)
+        self.breaker_source = source
+        self.breaker_status_code = err.status_code
+        now = time.time()
+        if (self.consecutive_failures >= gateway.fail_threshold
+                and (self.status != STATUS_DOWN or now - self.down_since >= gateway.cool_down)):
+            self.status = STATUS_DOWN
+            self.down_since = now
+        self._update_score()
 
     @property
     def accepts_any_model(self) -> bool:
-        """未声明模型列表且未开启探测时，接受所有模型。"""
-        return not self.cfg.models and not self.cfg.probe_models
+        """Only explicitly configured passthrough stations accept unknown model IDs."""
+        return self.cfg.provider != "opencode" and self.cfg.model_routing == "passthrough"
 
     @property
     def success_rate(self) -> float:
@@ -123,33 +348,55 @@ class StationState:
         return sum(self.window_results) / len(self.window_results)
 
     def _update_score(self) -> None:
-        """动态健康评分（0-100）：延迟 + 滑动成功率 + 状态惩罚 + 手动偏好。"""
-        score = 0.0
-        # 延迟分量（0-40 分）：1s 内接近满分，线性衰减，10s 以上为 0
-        if self.ema_latency is not None:
-            score += max(0.0, 40.0 - self.ema_latency * 4.0)
-        else:
-            score += 20.0  # 未测量过延迟，给中等分
-        # 成功率分量（0-30 分）
-        score += self.window_success_rate * 30.0
-        # 状态惩罚
-        if self.status == STATUS_DOWN:
-            score -= 35.0
-        if self.quota_exhausted:
-            score -= 60.0
-        # 手动优先级偏好（1→+15，5→+3）：仍是"偏好"而非硬排序
-        score += max(0, 6 - self.cfg.priority) * 3.0
-        self.health_score = max(0.0, min(100.0, score))
+        """Score business evidence and operational availability separately."""
+        if not self.enabled:
+            self.health_score = 0.0
+            self.score_breakdown = {
+                "latency": 0.0,
+                "business_reliability": 0.0,
+                "priority_bias": 0.0,
+                "failure_streak_penalty": 0.0,
+                "breaker_penalty": 0.0,
+                "quota_penalty": 0.0,
+                "rate_limit_penalty": 0.0,
+                "business_samples": len(self.window_results),
+            }
+            self.score_refreshed_at = time.time()
+            self._persist_state()
+            return
+        latency_points = (20.0 if self.ema_latency is None else
+                          max(0.0, min(40.0, 40.0 - self.ema_latency * 4.0)))
+        sample_count = len(self.window_results)
+        successes = sum(self.window_results)
+        smoothed_success_rate = (successes + 4.0) / (sample_count + 5.0)
+        reliability_points = smoothed_success_rate * 30.0
+        failure_streak_penalty = min(15.0, self.consecutive_failures * 5.0)
+        breaker_penalty = 25.0 if self.status == STATUS_DOWN else 0.0
+        quota_penalty = 60.0 if self.quota_exhausted else 0.0
+        rate_limit_penalty = 35.0 if time.time() < self.rate_limit_until else 0.0
+        self.health_score = max(0.0, min(100.0,
+            latency_points + reliability_points + self.priority_bias
+            - failure_streak_penalty - breaker_penalty
+            - quota_penalty - rate_limit_penalty))
+        self.score_breakdown = {
+            "latency": round(latency_points, 1),
+            "business_reliability": round(reliability_points, 1),
+            "priority_bias": round(self.priority_bias, 1),
+            "failure_streak_penalty": round(failure_streak_penalty, 1),
+            "breaker_penalty": breaker_penalty,
+            "quota_penalty": quota_penalty,
+            "rate_limit_penalty": rate_limit_penalty,
+            "business_samples": sample_count,
+        }
+        self.score_refreshed_at = time.time()
+        self._persist_state()
 
     def record_success(self, latency_s: float, switched: bool = False) -> None:
         self.calls += 1
         if switched:
             self.switch_in += 1
         # 成功即恢复健康
-        self.consecutive_failures = 0
-        if self.status == STATUS_DOWN:
-            self.status = STATUS_UP
-            self.down_since = 0.0
+        self.recover_health()
         # EMA 平滑延迟
         if latency_s is not None:
             self.ema_latency = (
@@ -178,14 +425,14 @@ class StationState:
             self.model_mismatch += 1
 
     def record_probe(self, latency_s: float) -> None:
-        """探测成功：更新延迟/评分，但不计入业务调用统计。"""
+        """Generation success restores availability, without fabricating business samples."""
+        self.recover_health()
         if latency_s is not None:
             self.ema_latency = (
                 latency_s
                 if self.ema_latency is None
                 else EMA_ALPHA * latency_s + (1 - EMA_ALPHA) * self.ema_latency
             )
-        self.window_results.append(True)
         self._record_history(True)
         self._update_score()
 
@@ -249,9 +496,16 @@ class StationState:
         self.last_error_at = self.quota_at
         self._update_score()
 
-    def mark_rate_limited(self, cooldown_s: float) -> None:
+    def mark_rate_limited(self, cooldown_s: float, *, reason: str = "",
+                          source: str = "request", wait_source: str = "gateway") -> None:
         """429 限流：短冷却期内不路由该站。"""
-        self.rate_limit_until = time.time() + max(cooldown_s, 0)
+        until = time.time() + max(cooldown_s, 0)
+        if until >= self.rate_limit_until:
+            self.rate_limit_until = until
+            self.rate_limit_reason = reason or "上游返回 HTTP 429"
+            self.rate_limit_source = source
+            self.rate_limit_wait_source = wait_source
+        self._update_score()
 
     def reset_quota(self) -> None:
         """清除配额耗尽状态（探测确认有额度，或管理员强制重置）。"""
@@ -264,9 +518,8 @@ class StationState:
         self.quota_probe_backoff = 0.0
         self.last_probe_quota = False
         self.rate_limit_until = 0.0
-        self.consecutive_failures = 0
-        self.status = STATUS_UP
-        self.down_since = 0.0
+        self.rate_limit_reason = self.rate_limit_source = self.rate_limit_wait_source = ""
+        self.recover_health()
         self._update_score()
 
 
@@ -284,6 +537,7 @@ class Registry:
         self._activity_revision = 0
         self._active_routes: dict[int, dict] = {}
         self._last_attempt: dict | None = None
+        self.eventlog = None
         self.last_routed: dict = {"station": "", "model": "", "ts": 0.0,
                                   "latency_ms": 0.0}
         # SSE listeners receive coalesced snapshots. A one-item queue keeps a
@@ -339,7 +593,7 @@ class Registry:
         with self._activity_lock:
             self._activity_subscribers.pop(subscriber_id, None)
 
-    def begin_route(self, station: str, model: str) -> int:
+    def begin_route(self, station: str, model: str, client_ip: str | None = None) -> int:
         """登记一次真正发往上游的尝试，返回用于精确结束该尝试的 ID。"""
         now = time.time()
         with self._activity_lock:
@@ -360,6 +614,8 @@ class Registry:
                 "duration_ms": None,
                 "error": "",
             }
+        if self.eventlog:
+            self.eventlog.start_route(route_id, station, model, client_ip)
         self._activity_changed()
         return route_id
 
@@ -395,6 +651,8 @@ class Registry:
                         max(0.0, finished_at - route["started_at"]) * 1000, 1),
                     "error": error,
                 })
+        if self.eventlog:
+            self.eventlog.finish_route(route_id, outcome, error)
         self._activity_changed()
 
     def note_fingerprint(self, st, model: str, text: str) -> None:
@@ -481,10 +739,24 @@ class Registry:
     def get(self, name: str) -> StationState | None:
         return self.states.get(name)
 
+    def bind_statistics(self, eventlog):
+        self.eventlog = eventlog
+        for st in self.states.values():
+            st.restore_durable(eventlog._runtime.get(st.cfg.name))
+            # Recover counters from old JSON when that version did not persist station runtime.
+            if st.cfg.name not in eventlog._runtime:
+                rows = [day.get(st.cfg.name, {}) for day in eventlog.daily.values() if isinstance(day, dict)]
+                st.calls = sum(int(row.get('calls', 0)) for row in rows if isinstance(row, dict))
+                st.failures = sum(int(row.get('failures', 0)) for row in rows if isinstance(row, dict))
+            st.persist_state = eventlog.save_runtime
+            st._update_score()
+
     # ---------- 动态站点管理（运行时增删改，无需重启） ----------
     def add_station(self, cfg: StationConfig) -> StationState:
         """新增站点（运行时立即生效，下次探测/请求即纳入调度）。"""
         st = StationState(cfg=cfg, enabled=cfg.enabled)
+        if self.eventlog:
+            st.persist_state = self.eventlog.save_runtime
         self.ensure_client(st)
         self.ensure_semaphore(st)
         self.states[cfg.name] = st
@@ -493,14 +765,35 @@ class Registry:
     def update_station(self, name: str, changes: dict) -> StationState:
         """更新站点配置；base_url/key/并发等变化时重建客户端与信号量。"""
         st = self.states[name]
+        connection_changed = any(k in changes and changes[k] != getattr(st.cfg, k)
+                                 for k in ("base_url", "api_key", "provider", "opencode_plan"))
         st.cfg = dataclasses.replace(st.cfg, **changes)
+        if connection_changed or "headers" in changes:
+            st.go_usage = {}
+            st.go_usage_status, st.go_usage_error = "pending", ""
+            st.go_usage_updated_at = st.go_usage_checked_at = st.go_usage_next_at = st.go_usage_retry_at = 0.0
+            st.go_usage_failures = 0
+        if connection_changed and st.quota_exhausted:
+            # A rejection from the previous credentials/billing endpoint is not evidence
+            # that the replacement connection has exhausted its quota.
+            st.reset_quota()
         if "enabled" in changes:
             st.enabled = st.cfg.enabled
+            st._update_score()
         if any(k in changes for k in (
-                "base_url", "api_key", "models", "probe_models", "probe_path")):
+                "base_url", "api_key", "headers", "probe_models", "provider", "opencode_plan")):
             st.probed_models.clear()
+            st.probed_model_order.clear()
+            st.model_api_paths.clear()
+            st.model_unavailable.clear()
+            st.models_discovery_revision += 1
+            st.models_discovery_status = "pending"
+            st.models_discovered_at = st.models_checked_at = st.models_next_refresh_at = 0.0
+            st.models_retry_after_until = 0.0
+            st.models_discovery_error = ""
+            st.models_discovery_failures = 0
         if any(k in changes for k in ("base_url", "api_key", "headers",
-                                      "timeout", "max_concurrency")):
+                                      "timeout", "max_concurrency", "provider", "opencode_plan")):
             if st.client is not None:
                 asyncio.create_task(st.client.aclose())
                 st.client = None  # 懒重建：ensure_client 会新建
@@ -548,11 +841,13 @@ class Registry:
     # ---------- 健康/路由 ----------
     def is_routeable(self, state: StationState, now: float | None = None) -> bool:
         """是否可作为路由候选：启用 + 无资金问题 + 未熔断（冷却中除外）。"""
+        now = now or time.time()
+        if state.score_refreshed_at and now - state.score_refreshed_at >= 1.0:
+            state._update_score()
         if not state.enabled:
             return False
         if state.quota_exhausted:
             return False  # 余额不足/订阅到期：等额度恢复探测确认后再加入路由
-        now = now or time.time()
         if now < state.rate_limit_until:
             return False  # 429 短冷却中
         if state.status == STATUS_DOWN:
@@ -561,18 +856,19 @@ class Registry:
                 return False
         return True
 
-    def candidates_for(self, model: str) -> list[StationState]:
+    def candidates_for(self, model: str, path: str | None = None) -> list[StationState]:
         """按 (优先级, 延迟加权) 排序的可路由候选站。"""
         now = time.time()
         cands = []
         for st in self.states.values():
             if not self.is_routeable(st, now):
                 continue
-            if not st.accepts_any_model and model not in st.effective_models:
+            if not st.supports_model(model, path):
                 continue
             cands.append(st)
 
-        cands.sort(key=lambda st: (st.cfg.priority, st.ema_latency or 999.0))
+        cands.sort(key=lambda st: (6 if st.cfg.priority_auto else st.cfg.priority,
+                                   st.ema_latency if st.ema_latency is not None else 999.0))
         return cands
 
     # ---------- 统计快照（仪表盘） ----------
@@ -581,6 +877,8 @@ class Registry:
         route_activity = self.route_activity_snapshot(now)
         stations = []
         for st in self.states.values():
+            if st.score_refreshed_at and now - st.score_refreshed_at >= 1.0:
+                st._update_score()
             status = st.status
             if status == STATUS_DOWN and now - st.down_since >= self.gateway.cool_down:
                 status = STATUS_COOLING
@@ -590,6 +888,7 @@ class Registry:
                     "base_url": st.cfg.base_url,
                     "enabled": st.enabled,
                     "status": status,
+                    "protection": st.protection_view(self.gateway, now),
                     "billing": st.cfg.billing,
                     "quota_exhausted": st.quota_exhausted,
                     "quota_error": st.quota_error,
@@ -600,6 +899,7 @@ class Registry:
                     "quota_probe_backoff": st.quota_probe_backoff,
                     "rate_limit_until": st.rate_limit_until,
                     "health_score": round(st.health_score, 1),
+                    "health_score_breakdown": dict(st.score_breakdown),
                     "ttft_ema": st.ttft_ema,
                     "juice_score": juice.juice_score(st),
                     "window_success_rate": round(st.window_success_rate, 4),
@@ -607,16 +907,32 @@ class Registry:
                     "balance_at": st.balance_at,
                     "history_hour": st.history_hour(),
                     "priority": st.cfg.priority,
+                    "priority_auto": st.cfg.priority_auto,
+                    "priority_bias": st.priority_bias,
                     "weight": st.cfg.weight,
                     "consecutive_failures": st.consecutive_failures,
                     "down_since": st.down_since,
                     "ema_latency": st.ema_latency,
                     "last_probe_ok": st.last_probe_ok,
+                    "last_probe_kind": st.last_probe_kind,
+                    "last_check_at": st.probe_chat_at if st.last_probe_kind == "generation" else st.last_probe_at,
                     "last_probe_latency": st.last_probe_latency,
                     "last_probe_error": st.last_probe_error,
                     "last_probe_at": st.last_probe_at,
                     "models": sorted(st.effective_models),
+                    "detected_models": sorted(st.probed_models),
+                    "model_discovery": st.model_discovery_view(),
+                    "generation_probe": st.generation_probe_view(),
+                    "probe_chat": st.cfg.probe_chat,
                     "accepts_any_model": st.accepts_any_model,
+                    "model_routing": st.cfg.model_routing,
+                    "route_models": list(st.cfg.route_models),
+                    "provider": st.cfg.provider,
+                    "opencode_plan": st.cfg.opencode_plan,
+                    "go_usage": st.go_usage_view(),
+                    "model_api_paths": st.protocol_view(),
+                    "probe_model_candidates": list(st.probe_model_candidates),
+                    "model_unavailable": dict(st.model_unavailable),
                     "calls": st.calls,
                     "failures": st.failures,
                     "success_rate": round(st.success_rate, 4),
@@ -629,8 +945,13 @@ class Registry:
             )
         up = sum(1 for s in stations if s["status"] == STATUS_UP and s["enabled"])
         # 动态排名：按健康评分降序（托管模式下的实际路由顺序）
-        ordered = sorted(stations,
-                         key=lambda s: (s["health_score"], -s["priority"]),
+        for s in stations:
+            s["rank"] = None
+        ordered = sorted((s for s in stations
+                          if self.is_routeable(self.states[s["name"]], now)
+                          and (s["models"] or s["accepts_any_model"])),
+                         key=lambda s: (s["health_score"],
+                                        -(6 if s["priority_auto"] else s["priority"])),
                          reverse=True)
         for i, s in enumerate(ordered):
             s["rank"] = i + 1
@@ -641,8 +962,13 @@ class Registry:
                              "max_round_backoff": self.gateway.max_round_backoff,
                              "max_retry_seconds": self.gateway.max_retry_seconds,
                              "cool_down": self.gateway.cool_down,
+                             "fail_threshold": self.gateway.fail_threshold,
+                             "rate_limit_cooldown": self.gateway.rate_limit_cooldown,
                              "probe_interval": self.gateway.probe_interval,
                              "balance_alert_threshold": self.gateway.balance_alert_threshold,
+                             "public_url": self.gateway.public_url,
+                             "generation_probe_enabled": self.gateway.generation_probe_enabled,
+                             "generation_probe_interval": self.gateway.generation_probe_interval,
                              "quota_auto_recover": self.gateway.quota_auto_recover,
                              "quota_probe_interval": self.gateway.quota_probe_interval,
                              "quota_probe_max_interval": self.gateway.quota_probe_max_interval},

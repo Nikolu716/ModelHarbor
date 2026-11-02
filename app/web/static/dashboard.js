@@ -14,7 +14,8 @@ let statsData = null;
 let currentView = ["list", "card"].includes(localStorage.getItem("zg_view"))
   ? localStorage.getItem("zg_view")
   : "list";
-let currentTab = ["monitor", "stats", "events", "stations", "retry"].includes(localStorage.getItem("zg_tab"))
+const legacyStationSection = ["retry", "probe"].includes(localStorage.getItem("zg_tab")) ? localStorage.getItem("zg_tab") : "";
+let currentTab = legacyStationSection ? "stations" : ["monitor", "stats", "events", "stations", "access"].includes(localStorage.getItem("zg_tab"))
   ? localStorage.getItem("zg_tab")
   : "monitor";
 let refreshTimer = null;
@@ -30,9 +31,23 @@ let retrySettingsUpdatedAt = 0;
 let retrySettingsLoading = false;
 let retrySettingsSaving = false;
 let retrySettingsData = null;
+let probeSettingsUpdatedAt = 0;
+let probeSettingsLoading = false;
+let probeSettingsSaving = false;
+let probeSettingsData = null;
+let endpointData = null;
+let endpointSettingsBusy = false;
+let accessSettingsBusy = false;
+let accessSettingsLoaded = false;
+let serviceSettingsBusy = false;
+let canManageService = false;
+let serviceSettingsLoaded = false;
+let serviceSettingsUpdatedAt = 0;
+let serviceSettingsData = null;
 let eventPage = 1;
-const EVENT_PAGE_SIZE = 20;
+let EVENT_PAGE_SIZE = 20;
 let renderFingerprint = "";
+let stationScope = "enabled";
 let toastTimer = null;
 let authPending = null;
 let authResolve = null;
@@ -66,6 +81,7 @@ function escapeHtml(value) {
 }
 
 function finiteNumber(value, fallback = 0) {
+  if (value == null || typeof value === "string" && value.trim() === "") return fallback;
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
 }
@@ -82,6 +98,24 @@ function applyDataWidths(container) {
 
 function formatCount(value) {
   return numberFormat.format(Math.max(0, finiteNumber(value)));
+}
+
+function scoreBreakdownTitle(breakdown = {}) {
+  const labels = [
+    ["latency", "延迟"],
+    ["business_reliability", "业务可靠性"],
+    ["priority_bias", "手动优先级"],
+    ["failure_streak_penalty", "连续失败扣分"],
+    ["breaker_penalty", "熔断扣分"],
+    ["quota_penalty", "配额扣分"],
+    ["rate_limit_penalty", "限流扣分"],
+  ];
+  const parts = labels.map(([key, label]) =>
+    `${label} ${finiteNumber(breakdown[key]).toFixed(1)}`);
+  if (breakdown.business_samples != null) {
+    parts.push(`业务样本 ${formatCount(breakdown.business_samples)}`);
+  }
+  return `健康评分拆解：${parts.join(" · ")}`;
 }
 
 function formatCompactCount(value) {
@@ -102,8 +136,9 @@ function quotaRecoveryHint(station, gateway = {}) {
   if (!station.quota_exhausted) return "";
   const auto = gateway.quota_auto_recover !== false;
   const error = station.quota_probe_error || station.quota_error || "";
-  if (!auto) {
-    return `配额问题: ${error || "请充值或续费后重置"}`;
+  if (!auto || (!gateway.generation_probe_enabled || !station.probe_chat)
+      && station.quota_source !== "models") {
+    return `配额保护中，后台生成恢复检查已关闭；恢复额度后可手动生成测试。${error}`;
   }
   const lastAt = finiteNumber(station.quota_probe_at) || finiteNumber(station.quota_at);
   const interval = finiteNumber(station.quota_probe_backoff)
@@ -146,7 +181,10 @@ function formatLatency(seconds) {
   return `<span class="latency-value ${className}">${text}</span>`;
 }
 
-function formatBalance(balance, threshold) {
+function formatBalance(balance, threshold, station = {}) {
+  if (station.provider === "opencode" && station.opencode_plan === "go") {
+    return window.ModelHarborGoUsage?.markup(station) || '<span class="subscription-value">Go 订阅 · 读取中</span>';
+  }
   const value = finiteNumber(balance, Number.NaN);
   if (!Number.isFinite(value)) return '<span class="muted">-</span>';
   const limit = finiteNumber(threshold, Number.NaN);
@@ -161,21 +199,59 @@ function scoreState(score) {
   return "is-bad";
 }
 
+function probeResultLabel(station) {
+  if (station.last_probe_ok == null) return "尚未检查";
+  const kind = { catalog: "目录", connection: "连接", generation: "生成" }[station.last_probe_kind] || "检查";
+  return `${kind}${station.last_probe_ok ? (station.last_probe_kind === "catalog" ? "可达" : "成功") : "失败"}`;
+}
+
 function statusInfo(station) {
-  if (!station.enabled) return { className: "unknown", label: "已禁用" };
-  if (station.quota_exhausted) return { className: "quota", label: "配额耗尽" };
-  switch (station.status) {
-    case "up": return { className: "up", label: "在线" };
-    case "down": return { className: "down", label: "熔断" };
-    case "cooling": return { className: "cooling", label: "冷却中" };
-    default: return { className: "unknown", label: "未知" };
+  const protection = station.protection || {};
+  const now = Date.now() / 1000;
+  const until = finiteNumber(protection.until);
+  const remaining = Math.max(0, Math.ceil(until - now));
+  const source = { request: "业务请求", generation_probe: "生成测试", connection_probe: "连接检查" }[protection.source] || "请求";
+  const code = protection.status_code ? `HTTP ${protection.status_code}` : "连接失败 / 超时";
+  if (!station.enabled) return { className: "unknown", label: "已停用", detail: "管理员停用，不参与路由" };
+  if (station.quota_exhausted) return { className: "quota", label: "配额保护", detail: protection.reason || station.quota_error || "上游报告额度不可用" };
+  if (protection.kind === "rate_limited" && remaining > 0 || finiteNumber(station.rate_limit_until) > now) {
+    const wait = remaining || Math.ceil(station.rate_limit_until - now);
+    return { className: "cooling", label: `限流冷却 · ${wait} 秒`,
+      detail: `${source}收到上游 429 · ${protection.wait_source === "upstream" ? "遵守上游等待时间" : "网关暂缓路由"}`,
+      reason: protection.reason };
   }
+  if (protection.kind === "breaker" && remaining > 0 || station.status === "down" && !until) {
+    return { className: "down", label: `熔断${remaining ? ` · ${remaining} 秒` : ""}`,
+      detail: `网关保护 · 连续 ${protection.failure_count ?? station.consecutive_failures ?? 0} 次故障 · 最近 ${code}（${source}）`,
+      reason: protection.reason || station.last_error };
+  }
+  if (["breaker", "recovering"].includes(protection.kind) || ["cooling", "recovering"].includes(station.status)) {
+    return { className: "cooling", label: "待恢复验证", detail: "等待已结束，允许业务请求或手动生成测试验证恢复", reason: protection.reason };
+  }
+  switch (station.status) {
+    case "up": return { className: "up", label: "在线", detail: "允许参与路由" };
+    default: return { className: "unknown", label: "未知", detail: "" };
+  }
+}
+
+function protectionMarkup(station) {
+  const state = statusInfo(station);
+  const title = [state.detail, state.reason].filter(Boolean).join("\n");
+  return `<span class="protection-status" data-protection-name="${escapeHtml(station.name)}" title="${escapeHtml(title)}"><span class="station-state ${state.className}">${escapeHtml(state.label)}</span>${station.enabled && state.className !== "up" ? `<span class="protection-reason">${escapeHtml(state.detail)}</span>` : ""}</span>`;
+}
+
+function updateProtectionDisplays() {
+  const stations = new Map((statusData?.stations || []).map(station => [station.name, station]));
+  document.querySelectorAll("[data-protection-name]").forEach(element => {
+    const station = stations.get(element.dataset.protectionName);
+    if (station) element.outerHTML = protectionMarkup(station);
+  });
 }
 
 function sortedStations(stations) {
   return [...(stations || [])].sort((left, right) => {
-    const leftRank = finiteNumber(left.rank, Number.MAX_SAFE_INTEGER);
-    const rightRank = finiteNumber(right.rank, Number.MAX_SAFE_INTEGER);
+    const leftRank = left.rank == null ? Number.MAX_SAFE_INTEGER : finiteNumber(left.rank, Number.MAX_SAFE_INTEGER);
+    const rightRank = right.rank == null ? Number.MAX_SAFE_INTEGER : finiteNumber(right.rank, Number.MAX_SAFE_INTEGER);
     return leftRank - rightRank || String(left.name).localeCompare(String(right.name), "zh-CN");
   });
 }
@@ -221,6 +297,11 @@ function requestAdminKey() {
 
 async function api(path, method = "GET", allowAuthRetry = true, body = null) {
   const headers = {};
+  const accountContext = window.modelHarborAccount;
+  if (accountContext && path.startsWith("/admin/") && !path.startsWith("/admin/accounts")) {
+    headers["X-ModelHarbor-Account"] = accountContext.id;
+    headers["X-ModelHarbor-Revision"] = accountContext.revision;
+  }
   const key = localStorage.getItem("zg_admin_key");
   if (key) headers.Authorization = `Bearer ${key}`;
   if (body) headers["Content-Type"] = "application/json";
@@ -229,6 +310,11 @@ async function api(path, method = "GET", allowAuthRetry = true, body = null) {
     method, headers, cache: "no-store",
     body: body ? JSON.stringify(body) : undefined,
   });
+  const responseRevision = response.headers?.get?.("X-ModelHarbor-Revision");
+  if (accountContext && !path.startsWith("/admin/accounts") && ((responseRevision && responseRevision !== accountContext.revision) || response.status === 409 && path === "/admin/status")) {
+    window.location.reload();
+    throw new Error("当前网关账号已切换，正在刷新");
+  }
   if (response.status === 401 && path.startsWith("/admin/") && allowAuthRetry) {
     localStorage.removeItem("zg_admin_key");
     if (await requestAdminKey()) return api(path, method, false, body);
@@ -272,6 +358,7 @@ function consumeActivityEvent(block) {
     if (line.startsWith("event:")) eventType = line.slice(6).trim();
     if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
   });
+  if (eventType === "account_changed") { window.location.reload(); return false; }
   if (eventType !== "activity" || !dataLines.length) return false;
   try {
     const payload = JSON.parse(dataLines.join("\n"));
@@ -364,13 +451,208 @@ function mergeStatusActivity(nextStatus) {
   return nextStatus;
 }
 
+
+// Subsections preserve form values and keep navigation within the viewport.
+const viewportPages = { monitor: 1, stations: 1 };
+let viewportLayoutTimer = null;
+function setSectionTab(group, section, { focus = false } = {}) {
+  const nav = document.querySelector('[data-tab-group="' + group + '"]');
+  if (!nav) return;
+  const button = [...nav.querySelectorAll('[role="tab"]')].find(el => el.dataset.section === section);
+  if (!button) return;
+  nav.querySelectorAll('[role="tab"]').forEach(el => {
+    const active = el === button;
+    el.setAttribute("aria-selected", String(active));
+    el.tabIndex = active ? 0 : -1;
+  });
+  document.querySelectorAll('[data-section-panel="' + group + '"]').forEach(el => {
+    el.hidden = el.dataset.section !== section;
+  });
+  if (group === "stations") refreshStationPolicy();
+  if (group === "events") updateEventsLayout();
+  if (focus) button.focus({ preventScroll: true });
+  scheduleViewportLayout();
+}
+function refreshStationPolicy(force = false) {
+  const section = document.querySelector('[data-tab-group="stations"] [aria-selected="true"]')?.dataset.section;
+  if (section === "retry" && (force || Date.now() - retrySettingsUpdatedAt > 30000)) return refreshRetrySettings({ notify: true });
+  if (["probe", "editor"].includes(section) && (force || Date.now() - probeSettingsUpdatedAt > 30000)) return refreshProbeSettings();
+}
+function scheduleViewportLayout() {
+  clearTimeout(viewportLayoutTimer);
+  viewportLayoutTimer = setTimeout(fitViewportContent, 40);
+}
+function paginateElements(key, elements, capacity, pager) {
+  const pages = Math.max(1, Math.ceil(elements.length / capacity));
+  viewportPages[key] = clamp(viewportPages[key], 1, pages);
+  const start = (viewportPages[key] - 1) * capacity;
+  elements.forEach((el, index) => { el.hidden = index < start || index >= start + capacity; });
+  pager.querySelector(".page-info").textContent = "第 " + viewportPages[key] + " / " + pages + " 页 · 共 " + elements.length + " 个站点";
+  pager.querySelector('[data-page-step="-1"]').disabled = viewportPages[key] <= 1;
+  pager.querySelector('[data-page-step="1"]').disabled = viewportPages[key] >= pages;
+}
+function fitViewportContent() {
+  updateEventsLayout();
+  if ($("editor-models").getClientRects().length) renderStationModels();
+  const viewport = $("monitorViewport");
+  if (currentTab === "monitor" && viewport.clientHeight > 0) {
+    const cardMode = currentView === "card";
+    const rows = [...document.querySelectorAll(cardMode ? "#grid .station-card" : "#list-wrap tbody tr:not(:has(.empty-cell))")];
+    rows.forEach(row => { row.hidden = false; });
+    let capacity = 1;
+    if (cardMode) {
+      const columns = getComputedStyle($("grid")).gridTemplateColumns.split(" ").length;
+      capacity = Math.max(1, columns);
+    } else {
+      const head = document.querySelector("#list-wrap thead");
+      const headerHeight = head?.getBoundingClientRect().height || 38;
+      const rowHeight = Math.max(48, ...rows.map(row => row.getBoundingClientRect().height));
+      capacity = Math.max(1, Math.floor((viewport.clientHeight - headerHeight - 18) / rowHeight));
+    }
+    paginateElements("monitor", rows, capacity, $("monitorPagination"));
+  }
+  const shell = $("stationsTableShell");
+  if (currentTab === "stations" && shell.clientHeight > 0) {
+    const rows = [...document.querySelectorAll("#stations-body tr:not(:has(.empty-cell))")];
+    rows.forEach(row => { row.hidden = false; });
+    const headerHeight = $("stations-table").querySelector("thead").getBoundingClientRect().height;
+    const rowHeight = Math.max(48, ...rows.map(row => row.getBoundingClientRect().height));
+    const capacity = Math.max(1, Math.floor((shell.clientHeight - headerHeight - 18) / rowHeight));
+    paginateElements("stations", rows, capacity, $("stationsPagination"));
+  }
+  const eventsShell = document.querySelector(".event-shell");
+  if (currentTab === "events" && eventsShell.clientHeight > 0) {
+    const headerHeight = eventsShell.querySelector("thead").getBoundingClientRect().height || 38;
+    const rowHeight = Math.max(44, ...[...$("log-body").querySelectorAll("tr:not(:has(.empty-cell))")].map(row => row.getBoundingClientRect().height));
+    const size = clamp(Math.floor((eventsShell.clientHeight - headerHeight - 18) / rowHeight), 1, 50);
+    if (size !== EVENT_PAGE_SIZE) {
+      if (eventsRunning) { scheduleViewportLayout(); return; }
+      EVENT_PAGE_SIZE = size;
+      eventPage = 1;
+      refreshEvents(1);
+    }
+  }
+}
+function updateEventsLayout() {
+  const combined = window.innerWidth >= 1100 && window.innerHeight >= 700;
+  const panel = $("events-wrap");
+  const previous = panel.dataset.layout;
+  panel.dataset.layout = combined ? "combined" : "tabs";
+  panel.querySelector(".event-toolbar").hidden = false;
+  const selected = panel.querySelector('[data-tab-group="events"] [aria-selected="true"]').dataset.section;
+  panel.querySelectorAll('[data-section-panel="events"]').forEach(el => {
+    el.hidden = selected === "sources" ? el.dataset.section !== "sources" : combined ? el.dataset.section === "sources" : el.dataset.section !== selected;
+    el.setAttribute("role", combined && selected !== "sources" ? "region" : "tabpanel");
+  });
+  if (combined || previous === "combined") {
+    $("eventFilters").hidden = !combined;
+    $("eventFiltersToggle").setAttribute("aria-expanded", String(combined));
+  }
+}
+function initializeViewportLayout() {
+  $("eventFiltersToggle").addEventListener("click", () => {
+    const expanded = $("eventFilters").hidden;
+    $("eventFilters").hidden = !expanded;
+    $("eventFiltersToggle").setAttribute("aria-expanded", String(expanded));
+    scheduleViewportLayout();
+  });
+  $("cardSections").addEventListener("click", event => {
+    const button = event.target.closest("[data-card-section]");
+    if (!button) return;
+    $("grid").dataset.cardSection = button.dataset.cardSection;
+    $("cardSections").querySelectorAll("button").forEach(el => el.setAttribute("aria-pressed", String(el === button)));
+    scheduleViewportLayout();
+  });
+  document.querySelectorAll("[data-tab-group]").forEach(nav => {
+    nav.addEventListener("click", event => {
+      const button = event.target.closest('[role="tab"]');
+      if (button) setSectionTab(nav.dataset.tabGroup, button.dataset.section);
+    });
+    nav.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      const tabs = [...nav.querySelectorAll('[role="tab"]')];
+      const current = tabs.indexOf(event.target);
+      if (current < 0) return;
+      event.preventDefault();
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+        : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      setSectionTab(nav.dataset.tabGroup, tabs[next].dataset.section, { focus: true });
+    });
+  });
+  for (const [key, id] of [["monitor", "monitorPagination"], ["stations", "stationsPagination"]]) {
+    $(id).addEventListener("click", event => {
+      const button = event.target.closest("[data-page-step]");
+      if (!button || button.disabled) return;
+      viewportPages[key] += Number(button.dataset.pageStep);
+      fitViewportContent();
+    });
+  }
+  $("station-form").addEventListener("invalid", event => {
+    const panel = event.target.closest('[data-section-panel="editor"]');
+    if (panel) {
+      setSectionTab("stations", "editor");
+      setSectionTab("editor", panel.dataset.section);
+    }
+  }, true);
+  // Validation can reveal a field inside an inactive settings subsection.
+  $("retry-form").addEventListener("invalid", event => {
+    const panel = event.target.closest("[data-section-panel]");
+    if (panel) {
+      setSectionTab("stations", "retry");
+      setSectionTab("retry", panel.dataset.section);
+    }
+  }, true);
+  if (window.ResizeObserver) {
+    const observer = new ResizeObserver(scheduleViewportLayout);
+    [$("monitorViewport"), $("stationsTableShell"), document.querySelector(".event-shell")].forEach(el => observer.observe(el));
+  }
+  window.addEventListener("resize", scheduleViewportLayout);
+}
+
+const PAGE_META = {
+  "monitor": [
+    "运行概览",
+    "掌握站点健康、路由动态与服务表现。",
+    "OVERVIEW"
+  ],
+  "stats": [
+    "用量分析",
+    "了解模型用量、缓存命中与每小时调用趋势。",
+    "ANALYTICS"
+  ],
+  "stations": [
+    "站点管理",
+    "管理上游连接、模型与探测，配置站点间的故障切换。",
+    "CONNECTIONS"
+  ],
+  "access": [
+    "IP 白名单",
+    "管理当前账号允许访问的 IP，独立保存并立即生效。",
+    "ACCESS CONTROL"
+  ],
+  "service": ["服务设置", "配置网关监听端口并管理服务进程。", "GATEWAY SERVICE"],
+  "events": [
+    "请求日志",
+    "查看最近调用记录与错误详情。",
+    "ACTIVITY"
+  ]
+};
+
 function applyTab() {
+  const [title, description, eyebrow] = PAGE_META[currentTab];
+  $("pageTitle").textContent = title;
+  $("pageDescription").textContent = description;
+  $("pageEyebrow").textContent = eyebrow;
+  $("breadcrumbCurrent").textContent = $("tab-" + currentTab).textContent.trim();
+  document.title = `${title} · ModelHarbor`;
+  document.querySelector(".page-content").dataset.activeTab = currentTab;
+  $("summaryStrip").hidden = !["monitor", "stats"].includes(currentTab);
+  $("routingPanel").hidden = currentTab !== "monitor";
   const monitorActive = currentTab === "monitor";
   const statsActive = currentTab === "stats";
   const eventsActive = currentTab === "events";
   const stationsActive = currentTab === "stations";
-  const retryActive = currentTab === "retry";
-  ["monitor", "stats", "stations", "retry", "events"].forEach(k => {
+  ["monitor", "stats", "stations", "access", "service", "events"].forEach(k => {
     $("tab-" + k).classList.toggle("is-active", currentTab === k);
     $("tab-" + k).setAttribute("aria-selected", String(currentTab === k));
     $("tab-" + k).setAttribute("tabindex", currentTab === k ? "0" : "-1");
@@ -379,12 +661,16 @@ function applyTab() {
   $("stats-wrap").hidden = !statsActive;
   $("events-wrap").hidden = !eventsActive;
   $("stations-wrap").hidden = !stationsActive;
-  $("retry-wrap").hidden = !retryActive;
+  $("access-wrap").hidden = currentTab !== "access";
+  $("service-wrap").hidden = currentTab !== "service";
   $("viewSwitch").hidden = !monitorActive;
+  scheduleViewportLayout();
 }
 
 function setTab(tab) {
-  if (!["monitor", "stats", "events", "stations", "retry"].includes(tab)) return;
+  if (["retry", "probe"].includes(tab)) { setTab("stations"); setSectionTab("stations", tab); return; }
+  if (!["monitor", "stats", "events", "stations", "access", "service"].includes(tab)) return;
+  if (tab === "service" && !canManageService) return;
   currentTab = tab;
   localStorage.setItem("zg_tab", tab);
   applyTab();
@@ -393,12 +679,14 @@ function setTab(tab) {
   if (tab === "stations" && Date.now() - stationsUpdatedAt > 10000) {
     refreshStations({ notifyError: true });
   }
-  if (tab === "retry" && Date.now() - retrySettingsUpdatedAt > 30000) {
-    refreshRetrySettings({ notify: true });
-  }
+  if (tab === "stations") refreshStationPolicy();
+  if (tab === "access" && !accessSettingsLoaded) refreshAccessSettings();
+  if (tab === "service" && Date.now() - serviceSettingsUpdatedAt > 30000) refreshServiceSettings();
 }
 
 function applyView() {
+  $("detailToggle").hidden = currentView === "card";
+  $("cardSections").hidden = currentView !== "card";
   const listActive = currentView === "list";
   $("btn-list").classList.toggle("is-active", listActive);
   $("btn-card").classList.toggle("is-active", !listActive);
@@ -406,11 +694,13 @@ function applyView() {
   $("btn-card").setAttribute("aria-pressed", String(!listActive));
   $("list-wrap").hidden = !listActive;
   $("grid").hidden = listActive;
+  fitViewportContent();
 }
 
 function setView(view) {
   if (!["list", "card"].includes(view)) return;
   currentView = view;
+  viewportPages.monitor = 1;
   localStorage.setItem("zg_view", view);
   applyView();
 }
@@ -465,7 +755,7 @@ function actionButton(action, station, label, options = {}) {
 function stationActions(station) {
   return [
     actionButton("toggle", station, station.enabled ? "禁用" : "启用", { destructive: station.enabled }),
-    actionButton("probe", station, "探测", { disabled: !station.enabled }),
+    actionButton("probe", station, "连接检查", { disabled: !station.enabled }),
     station.quota_exhausted ? actionButton("reset", station, "立即探测恢复") : "",
   ].join("");
 }
@@ -483,48 +773,89 @@ function renderRouteStatus(data) {
       ? activity.stations
       : (Array.isArray(data.active_stations) ? data.active_stations : []));
 
-  if (!activeStations.length && activeRoutes.length) {
-    const grouped = new Map();
-    activeRoutes.forEach((route) => {
-      const station = String(route.station || route.name || "").trim();
-      if (!station) return;
-      const current = grouped.get(station) || { station, inflight: 0, models: [] };
-      current.inflight += 1;
-      const model = String(route.model || "").trim();
-      if (model && !current.models.includes(model)) current.models.push(model);
-      grouped.set(station, current);
-    });
-    activeStations = [...grouped.values()];
-  }
-
   const inflight = Math.max(0, finiteNumber(
     activity.inflight ?? data.inflight ?? activeRoutes.length,
   ));
-  const stationNames = activeStations
-    .map((station) => String(station.station || station.name || "").trim())
-    .filter(Boolean);
-  const routeModels = activeRoutes.map((route) => String(route.model || "").trim());
-  activeStations.forEach((station) => {
-    const models = Array.isArray(station.models) ? station.models : [];
-    models.forEach((model) => {
-      const name = typeof model === "object" ? model?.model : model;
-      routeModels.push(String(name || "").trim());
+  const routeGroups = new Map();
+  const addRoute = (stationValue, modelValue, phaseValue = "", count = 1) => {
+    const station = String(stationValue || "").trim() || "未知线路";
+    const model = String(modelValue || "").trim() || "未识别模型";
+    const key = `${station}\u0000${model}`;
+    const current = routeGroups.get(key) || { station, model, count: 0, phases: new Set() };
+    current.count += Math.max(1, finiteNumber(count));
+    const phase = String(phaseValue || "").trim();
+    if (phase) current.phases.add(phase);
+    routeGroups.set(key, current);
+  };
+  if (activeRoutes.length) {
+    activeRoutes.forEach((route) => addRoute(
+      route.station || route.name,
+      route.model,
+      route.phase,
+    ));
+  } else {
+    activeStations.forEach((station) => {
+      const stationName = station.station || station.name;
+      (Array.isArray(station.models) ? station.models : []).forEach((entry) => {
+        if (entry && typeof entry === "object") {
+          addRoute(stationName, entry.model, "", entry.inflight);
+        } else {
+          addRoute(stationName, entry);
+        }
+      });
     });
-  });
-  const models = [...new Set(routeModels.filter(Boolean))];
-  const isActive = inflight > 0 || stationNames.length > 0;
+  }
+  const groups = [...routeGroups.values()];
+  const isActive = inflight > 0 || groups.length > 0;
   const routeLive = $("routeLive");
   routeLive.classList.toggle("is-active", isActive);
+  const routeList = $("routeList");
+  routeList.replaceChildren();
+
+  const appendRoute = (station, model, phase, count = 0) => {
+    const item = document.createElement("div");
+    item.className = "route-item";
+    item.setAttribute("role", "listitem");
+    const stationName = document.createElement("span");
+    stationName.className = "route-item-station";
+    stationName.textContent = station;
+    stationName.title = station;
+    const arrow = document.createElement("span");
+    arrow.className = "route-item-arrow";
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "→";
+    const modelName = document.createElement("strong");
+    modelName.className = "route-item-model";
+    modelName.textContent = model;
+    modelName.title = model;
+    const phaseLabel = document.createElement("span");
+    phaseLabel.className = "route-phase";
+    phaseLabel.textContent = phase;
+    const countLabel = document.createElement("span");
+    countLabel.className = "route-count";
+    countLabel.textContent = count > 1 ? `× ${formatCount(count)}` : "";
+    item.append(stationName, arrow, modelName, phaseLabel, countLabel);
+    routeList.append(item);
+  };
+  const appendPlaceholder = (label) => {
+    const placeholder = document.createElement("div");
+    placeholder.className = "route-placeholder";
+    placeholder.setAttribute("role", "listitem");
+    placeholder.textContent = label;
+    routeList.append(placeholder);
+  };
 
   if (isActive) {
-    const visibleStation = stationNames.length > 1
-      ? `${stationNames[0]} +${stationNames.length - 1}`
-      : (stationNames[0] || "路由处理中");
     $("routeLabel").textContent = "正在使用";
-    $("routeStation").textContent = visibleStation;
-    $("routeModel").textContent = models.length === 1 ? `· ${models[0]}` : (models.length > 1 ? `· ${models.length} 个模型` : "");
-    $("routeMeta").textContent = `${formatCount(inflight || activeRoutes.length)} 路进行中`;
-    routeLive.title = [stationNames.join("、"), models.join("、")].filter(Boolean).join(" · ");
+    $("routeMeta").textContent = `${formatCount(inflight || activeRoutes.length)} 个请求 · ${formatCount(groups.length)} 组线路与模型`;
+    groups.forEach((group) => {
+      const phase = group.phases.size === 1
+        ? ({ connecting: "连接中", receiving: "接收中", streaming: "流式响应" }[group.phases.values().next().value] || "处理中")
+        : (group.phases.size > 1 ? "多阶段" : "处理中");
+      appendRoute(group.station, group.model, phase, group.count);
+    });
+    if (!groups.length) appendPlaceholder("请求处理中，线路信息暂不可用");
+    routeLive.title = "";
     return;
   }
 
@@ -533,17 +864,15 @@ function renderRouteStatus(data) {
   const recent = lastSuccess.station ? lastSuccess : lastAttempt;
   if (recent.station) {
     $("routeLabel").textContent = lastSuccess.station ? "最近使用" : "最近尝试";
-    $("routeStation").textContent = String(recent.station);
-    $("routeModel").textContent = recent.model ? `· ${recent.model}` : "";
+    appendRoute(String(recent.station), String(recent.model || "未识别模型"), lastSuccess.station ? "最近成功" : "最近尝试");
     $("routeMeta").textContent = formatAge(recent.finished_at || recent.ts || recent.started_at);
-    routeLive.title = [recent.station, recent.model].filter(Boolean).join(" · ");
+    routeLive.title = "";
     return;
   }
 
   $("routeLabel").textContent = "当前路由";
-  $("routeStation").textContent = "等待首次路由";
-  $("routeModel").textContent = "";
   $("routeMeta").textContent = "";
+  appendPlaceholder("等待首次请求");
   routeLive.removeAttribute("title");
 }
 
@@ -558,13 +887,27 @@ function renderSummary(data) {
   $("s-switch").textContent = formatCount(totalSwitches);
   $("s-rate").textContent = successRate == null ? "-" : `${percentFormat.format(successRate)}%`;
 
-  const interval = finiteNumber(data.gateway?.probe_interval);
-  const rounds = finiteNumber(data.gateway?.max_rounds ?? data.gateway?.max_attempts);
-  const seconds = finiteNumber(data.gateway?.max_retry_seconds);
-  const roundPolicy = rounds === 0 ? "不限轮次" : `最多 ${formatCount(rounds)} 轮`;
-  const timePolicy = seconds === 0 ? "不限总时长" : `最长 ${formatCount(seconds)} 秒`;
-  $("sub").textContent = `自动托管 · ${formatCount(interval)} 秒探测 · ${roundPolicy} · ${timePolicy}`;
+  $("sub").textContent = "自动刷新 · 显示进行中与最近一次调用";
   renderRouteStatus(data);
+}
+
+function filteredMonitorData(data) {
+  const query = $("station-search").value.trim().toLocaleLowerCase();
+  const filter = $("station-filter").value;
+  const all = data.stations || [];
+  const scoped = all.filter(station => Boolean(station.enabled) === (stationScope === "enabled"));
+  $("station-enabled-count").textContent = all.filter(station => station.enabled).length;
+  $("station-disabled-count").textContent = all.filter(station => !station.enabled).length;
+  const stations = scoped.filter((station) => {
+    const searchable = [station.name, ...(station.models || [])].join(" ").toLocaleLowerCase();
+    const state = statusInfo(station);
+    const matchesState = stationScope === "disabled" || filter === "all"
+      || (filter === "up" && station.enabled && state.className === "up")
+      || (filter === "attention" && station.enabled && state.className !== "up");
+    return (!query || searchable.includes(query)) && matchesState;
+  });
+  $("monitor-count").textContent = `${stations.length} / ${scoped.length}`;
+  return { ...data, stations };
 }
 
 function renderCards(data) {
@@ -575,9 +918,8 @@ function renderCards(data) {
     const scoreClass = scoreState(score);
     const rate = clamp(finiteNumber(station.window_success_rate) * 100, 0, 100);
     const billing = station.billing === "subscription" ? "订阅制" : "余额制";
-    const rateLimited = finiteNumber(station.rate_limit_until) > Date.now() / 1000;
     const models = station.accepts_any_model
-      ? ['<span class="model-tag">接受任意模型</span>']
+      ? [`<span class="model-tag">${station.route_models?.length ? '按范围透传' : '接受任意模型'}</span>`]
       : (station.models || []).slice(0, 6).map((model) => `<span class="model-tag" title="${escapeHtml(model)}">${escapeHtml(model)}</span>`);
     if (!station.accepts_any_model && (station.models || []).length > 6) {
       models.push(`<span class="model-tag">+${(station.models || []).length - 6}</span>`);
@@ -586,27 +928,23 @@ function renderCards(data) {
     const alert = recoveryHint
       ? `<p class="card-alert">${escapeHtml(recoveryHint)}</p>`
       : (station.last_error ? `<p class="card-alert">最近错误: ${escapeHtml(station.last_error)}</p>` : "");
-    const probeValue = station.last_probe_ok == null
-      ? "未探测"
-      : (station.last_probe_ok ? "正常" : "失败");
+    const probeValue = probeResultLabel(station);
+    const scoreTitle = scoreBreakdownTitle(station.health_score_breakdown);
 
     return `<article class="station-card ${station.enabled ? "" : "is-disabled"}">
       <header class="card-header">
         <div class="card-title-wrap">
           <div class="card-title"><span class="status-dot ${state.className}" aria-hidden="true"></span><span>${escapeHtml(station.name)}</span></div>
           <div class="card-meta">
-            <span class="status-tag">${state.label}</span>
+            ${protectionMarkup(station)}
             <span class="status-tag">${billing}</span>
-            <span class="status-tag">优先级 ${escapeHtml(station.priority)}</span>
-            ${rateLimited ? '<span class="status-tag is-warn">限流中</span>' : ""}
-            ${station.quota_exhausted ? '<span class="status-tag is-alert">配额耗尽</span>' : ""}
-            ${station.quota_exhausted ? '<span class="status-tag is-warn">自动探测中</span>' : ""}
+            <span class="status-tag">${station.priority_auto ? "自动优先级" : `手动 ${escapeHtml(station.priority)}`}</span>
           </div>
         </div>
         <span class="card-rank">#${escapeHtml(station.rank || "-")}</span>
       </header>
 
-      <div class="health-row">
+      <div class="card-content"><div class="health-row" title="${escapeHtml(scoreTitle)}">
         <span>健康评分</span>
         <div class="health-track" aria-hidden="true"><div class="health-bar ${scoreClass}" data-width="${score}"></div></div>
         <span class="health-number">${score.toFixed(1)}</span>
@@ -618,19 +956,47 @@ function renderCards(data) {
         <div class="card-stat"><span class="card-stat-label">首字 TTFT</span><span class="card-stat-value">${formatLatency(station.ttft_ema)}</span></div>
         <div class="card-stat"><span class="card-stat-label">近 100 次成功率</span><span class="card-stat-value">${percentFormat.format(rate)}%</span></div>
         <div class="card-stat"><span class="card-stat-label">调用 / 失败</span><span class="card-stat-value">${formatCount(station.calls)} / ${formatCount(station.failures)}</span></div>
-        <div class="card-stat"><span class="card-stat-label">额度</span><span class="card-stat-value">${formatBalance(station.balance, threshold)}</span></div>
-        <div class="card-stat"><span class="card-stat-label">最近探测</span><span class="card-stat-value">${probeValue}</span></div>
+        <div class="card-stat"><span class="card-stat-label">额度</span><span class="card-stat-value">${formatBalance(station.balance, threshold, station)}</span></div>
+        <div class="card-stat"><span class="card-stat-label">最近检查</span><span class="card-stat-value">${probeValue}</span></div>
         <div class="card-stat"><span class="card-stat-label">故障切换</span><span class="card-stat-value">${formatCount(station.switch_in)} 入 / ${formatCount(station.switch_out)} 出</span></div>
       </div>
 
       <div class="card-probe">${probeHtml(station.history_hour)}</div>
       <div class="models">${models.join("")}</div>
-      ${alert}
+      ${alert}</div>
       <div class="card-actions">${stationActions(station)}</div>
     </article>`;
-  }).join("") || '<div class="empty-cell">暂无站点</div>';
+  }).join("") || '<div class="empty-cell">没有匹配的站点，请调整搜索或筛选条件</div>';
 
   applyDataWidths($("grid"));
+}
+
+function updateMonitorRows(tbody, markup) {
+  const template = document.createElement("template");
+  template.innerHTML = `<table><tbody>${markup}</tbody></table>`;
+  const nextRows = [...template.content.querySelector("tbody").children];
+  const previous = new Map([...tbody.children].map(row => [row.dataset.monitorStation, row]));
+  const names = new Set(nextRows.map(row => row.dataset.monitorStation));
+  for (const row of [...tbody.children]) if (!names.has(row.dataset.monitorStation)) row.remove();
+  let anchor = tbody.firstElementChild;
+  for (const next of nextRows) {
+    let row = previous.get(next.dataset.monitorStation);
+    if (row && next.dataset.monitorStation != null) {
+      row.className = next.className;
+      for (let i = 0; i < next.cells.length; i++) {
+        // A live sandbox must stay attached: replacing its ancestors reloads it.
+        if (next.cells[i].classList.contains("col-visual")) continue;
+        if (row.cells[i].outerHTML !== next.cells[i].outerHTML) row.cells[i].replaceWith(next.cells[i].cloneNode(true));
+      }
+    } else if (row) {
+      if (row.innerHTML !== next.innerHTML) row.innerHTML = next.innerHTML;
+    } else row = next;
+    if (row !== anchor) {
+      if (row.parentNode === tbody && typeof tbody.moveBefore === "function") tbody.moveBefore(row, anchor);
+      else tbody.insertBefore(row, anchor);
+    }
+    anchor = row.nextElementSibling;
+  }
 }
 
 function renderList(data) {
@@ -640,36 +1006,34 @@ function renderList(data) {
     const score = clamp(station.health_score, 0, 100);
     const rate = clamp(finiteNumber(station.window_success_rate) * 100, 0, 100);
     const billing = station.billing === "subscription" ? "订阅" : "余额";
-    const probeLabel = station.last_probe_ok == null ? "未探测" : (station.last_probe_ok ? "正常" : "失败");
+    const probeLabel = probeResultLabel(station);
     const probeClass = station.last_probe_ok == null ? "muted" : (station.last_probe_ok ? "text-ok" : "text-danger");
     const error = station.last_error || station.last_probe_error || "-";
-    const rateLimited = finiteNumber(station.rate_limit_until) > Date.now() / 1000;
+    const scoreTitle = scoreBreakdownTitle(station.health_score_breakdown);
 
-    return `<tr class="${station.enabled ? "" : "is-disabled"}">
+    return `<tr data-monitor-station="${escapeHtml(station.name)}" class="${station.enabled ? "" : "is-disabled"}">
       <td class="col-rank muted rank-value">#${escapeHtml(station.rank || "-")}</td>
       <td class="col-station">
         <div class="station-name" title="${escapeHtml(station.base_url)}">
           <span class="status-dot ${state.className}" aria-hidden="true"></span>
           <span class="station-name-text">${escapeHtml(station.name)}</span>
         </div>
-        <div class="tag-row">
-          ${station.quota_exhausted ? '<span class="status-tag is-alert">配额耗尽</span>' : ""}
-          ${station.quota_exhausted ? '<span class="status-tag is-warn">自动探测中</span>' : ""}
-          ${rateLimited ? '<span class="status-tag is-warn">限流中</span>' : ""}
-        </div>
+        <div class="tag-row">${protectionMarkup(station)}</div>
       </td>
+      <td class="col-models">${window.ModelHarborVisualTests?.modelMarkup(station) || '<span class="muted">—</span>'}</td>
       <td class="col-billing muted">${billing}</td>
-      <td class="col-score"><span class="score-value ${scoreState(score)}">${score.toFixed(1)}</span></td>
+      <td class="col-score" title="${escapeHtml(scoreTitle)}"><span class="score-value ${scoreState(score)}">${score.toFixed(1)}</span></td>
       <td class="col-latency">${formatLatency(station.ema_latency)}</td>
       <td class="col-ttft">${formatLatency(station.ttft_ema ?? (station.avg_ttft_ms != null ? station.avg_ttft_ms / 1000 : null))}</td>
       <td class="col-cache">${station.cache_hit_rate == null ? '<span class="muted">-</span>' : (station.cache_hit_rate >= 0.8 ? `<span class="ok">${(station.cache_hit_rate * 100).toFixed(1)}%</span>` : `<span class="warn">${(station.cache_hit_rate * 100).toFixed(1)}%</span>`)}</td>
-      <td class="col-juice" title="${juiceDetail(station)}">${station.juice_score == null ? '<span class="muted">-</span>' : (station.juice_score >= 90 ? `<span class="ok">${station.juice_score}</span>` : (station.juice_score >= 60 ? `<span class="warn">${station.juice_score}</span>` : `<span class="bad">${station.juice_score}</span>`))}</td>
+      <td class="col-juice" title="${escapeHtml(juiceDetail(station))}">${station.juice_score == null ? '<span class="muted">-</span>' : (station.juice_score >= 90 ? `<span class="ok">${station.juice_score}</span>` : (station.juice_score >= 60 ? `<span class="warn">${station.juice_score}</span>` : `<span class="bad">${station.juice_score}</span>`))}</td>
       <td class="col-rate number-value">${percentFormat.format(rate)}%</td>
       <td class="col-calls number-value">${formatCount(station.calls)} <span class="text-danger">/ ${formatCount(station.failures)}</span></td>
-      <td class="col-balance">${formatBalance(station.balance, threshold)}</td>
+      <td class="col-balance">${formatBalance(station.balance, threshold, station)}</td>
       <td class="col-probe"><span class="${probeClass}">${probeLabel}</span></td>
-      <td class="col-checked muted">${formatTime(station.last_probe_at)}</td>
+      <td class="col-checked muted">${formatTime(station.last_check_at ?? station.last_probe_at)}</td>
       <td class="col-error error-cell" title="${escapeHtml(error)}">${escapeHtml(error)}</td>
+      <td class="col-visual" data-table-visual="${escapeHtml(station.name)}"><span class="muted">—</span></td>
       <td class="col-actions"><div class="table-actions">${stationActions(station)}</div></td>
     </tr>`;
   }).join("");
@@ -683,19 +1047,22 @@ function renderList(data) {
     </div>`;
   }).join("");
 
-  $("list-wrap").innerHTML = `
+  if (!$("list-wrap").querySelector(".monitor-table")) $("list-wrap").innerHTML = `
     <div class="table-shell monitor-shell">
       <table class="monitor-table">
         <caption class="sr-only">中转站实时状态</caption>
         <thead><tr>
-          <th class="col-rank">排名</th><th class="col-station">站点</th><th class="col-billing">计费</th>
+          <th class="col-rank">排名</th><th class="col-station">站点</th><th class="col-models">支持的模型</th><th class="col-billing">计费</th>
           <th class="col-score">评分</th><th class="col-latency">延迟 EMA</th><th class="col-ttft">首字</th><th class="col-cache">缓存命中</th><th class="col-juice">Juice</th><th class="col-rate">成功率</th>
           <th class="col-calls">调用 / 失败</th><th class="col-balance">额度</th><th class="col-probe">探测</th>
-          <th class="col-checked">最后检查</th><th class="col-error">最近错误</th><th class="col-actions">操作</th>
+          <th class="col-checked">最后检查</th><th class="col-error">最近错误</th><th class="col-visual">智商测试</th><th class="col-actions">操作</th>
         </tr></thead>
-        <tbody>${rows || '<tr><td colspan="13" class="empty-cell">暂无站点</td></tr>'}</tbody>
+        <tbody></tbody>
       </table>
     </div>
+`;
+  updateMonitorRows($("list-wrap").querySelector("tbody"), rows || '<tr><td colspan="17" class="empty-cell">没有匹配的站点，请调整搜索或筛选条件</td></tr>');
+  $("monitor-history").innerHTML = `
     <section class="probe-block" aria-labelledby="probe-heading">
       <div class="probe-header">
         <span class="probe-title" id="probe-heading">60 分钟可用性</span>
@@ -704,6 +1071,7 @@ function renderList(data) {
       <div class="probe-scroll"><div class="probe-rows">${probes}</div></div>
       ${PROBE_LEGEND}
     </section>`;
+  window.ModelHarborVisualTests?.syncTablePreviews();
 }
 
 function juiceDetail(station) {
@@ -730,20 +1098,21 @@ function renderEvents(data) {
   const pages = Math.max(1, finiteNumber(data.pages, 1));
   const page = clamp(data.page || 1, 1, pages);
   eventPage = page;
-  $("eventCount").textContent = `共 ${formatCount(total)} 条 · 最多保留 ${formatCount(data.max_events || 500)} 条`;
+  $("eventCount").textContent = `筛选结果 ${formatCount(total)} 条 · 留存 ${formatCount(data.retained_events ?? total)} / ${formatCount(data.max_events || 500)} 条`;
   $("log-body").innerHTML = events.map((event) => {
     const latency = finiteNumber(event.latency_ms, Number.NaN);
     const detail = event.detail || "-";
     const attempt = finiteNumber(event.attempts, 1);
     return `<tr>
       <td class="event-time muted">${formatTime(event.ts)}</td>
+      <td class="event-ip" title="${escapeHtml(event.client_ip || "此记录未保存客户端地址，无法还原来源")}">${escapeHtml(event.client_ip || "未记录 IP")}</td>
       <td class="event-station">${escapeHtml(event.station || "-")}</td>
       <td class="event-model">${escapeHtml(event.model || "-")}</td>
       <td class="event-result ${event.ok ? "text-ok" : "text-danger"}">${event.ok ? "成功" : "失败"}</td>
       <td class="event-latency">${Number.isFinite(latency) && latency > 0 ? `${(latency / 1000).toFixed(2)}s` : "-"}</td>
       <td class="event-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}${attempt > 1 ? ` <span class="attempt-count">(${attempt} 次尝试)</span>` : ""}</td>
     </tr>`;
-  }).join("") || '<tr><td colspan="6" class="empty-cell">暂无事件</td></tr>';
+  }).join("") || '<tr><td colspan="7" class="empty-cell">暂无事件</td></tr>';
   $("eventPageInfo").textContent = `第 ${formatCount(page)} / ${formatCount(pages)} 页`;
   $("eventPrev").disabled = page <= 1 || eventsRunning;
   $("eventNext").disabled = page >= pages || eventsRunning;
@@ -776,8 +1145,9 @@ function render(force = false) {
   const fingerprint = JSON.stringify([statusData, [...pendingActions].sort()]);
   if (force || fingerprint !== renderFingerprint) {
     const focusTarget = captureActionFocus();
-    renderCards(statusData);
-    renderList(statusData);
+    const monitorData = filteredMonitorData(statusData);
+    renderCards(monitorData);
+    renderList(monitorData);
     renderFingerprint = fingerprint;
     applyView();
     restoreActionFocus(focusTarget);
@@ -1187,6 +1557,7 @@ async function refreshStats() {
   statsRunning = true;
   try {
     statsData = await api("/admin/stats/daily");
+    await window.refreshUsageHistory?.();
     statsUpdatedAt = Date.now();
     renderStats();
   } catch (error) {
@@ -1202,7 +1573,16 @@ async function refreshEvents(page = eventPage) {
   $("eventPrev").disabled = true;
   $("eventNext").disabled = true;
   try {
-    eventsData = await api(`/admin/logs?page=${Math.max(1, finiteNumber(page, 1))}&page_size=${EVENT_PAGE_SIZE}`);
+    const query = new URLSearchParams({
+      page: String(Math.max(1, finiteNumber(page, 1))),
+      page_size: String(EVENT_PAGE_SIZE),
+    });
+    for (const [id, name] of [["eventIpFilter", "ip"], ["eventModelFilter", "model"],
+                              ["eventDateFrom", "date_from"], ["eventDateTo", "date_to"]]) {
+      const value = $(id)?.value;
+      if (value) query.set(name, value);
+    }
+    eventsData = await api(`/admin/logs?${query.toString()}`);
     eventsUpdatedAt = Date.now();
     renderEvents(eventsData);
   } catch (error) {
@@ -1215,6 +1595,7 @@ async function refreshEvents(page = eventPage) {
     if (eventsData) renderEvents(eventsData);
   }
 }
+window.refreshEvents = refreshEvents;
 
 const RETRY_SETTING_KEYS = [
   "max_attempts",
@@ -1397,6 +1778,279 @@ async function saveRetrySettings() {
   }
 }
 
+function setProbeSettingsStatus(message, state = "") {
+  const element = $("probeSettingsStatus");
+  element.textContent = message;
+  element.classList.toggle("is-error", state === "error");
+  element.classList.toggle("is-success", state === "success");
+}
+
+function setProbeSettingsBusy() {
+  const busy = probeSettingsLoading || probeSettingsSaving;
+  $("probe-form").setAttribute("aria-busy", String(busy));
+  $("probe-enabled").disabled = busy;
+  $("probe-interval").disabled = busy;
+  $("probe-save").disabled = busy;
+  $("probe-reload").disabled = busy;
+  $("probe-save").textContent = probeSettingsSaving ? "保存中..." : "保存设置";
+}
+
+function applyProbeSettings(settings) {
+  if (typeof settings?.generation_probe_enabled !== "boolean") {
+    throw new Error("接口未返回有效的生成探测状态");
+  }
+  const interval = finiteNumber(settings.generation_probe_interval, Number.NaN);
+  if (!Number.isFinite(interval) || interval < 300 || interval > 86400) {
+    throw new Error("接口未返回有效的生成探测间隔");
+  }
+  $("probe-enabled").checked = settings.generation_probe_enabled;
+  $("probe-interval").value = String(interval);
+  probeSettingsData = settings;
+  renderEffectiveProbePolicy();
+}
+
+async function refreshProbeSettings() {
+  if (probeSettingsLoading || probeSettingsSaving) return;
+  probeSettingsLoading = true;
+  setProbeSettingsBusy();
+  setProbeSettingsStatus("正在读取设置...");
+  try {
+    const settings = await api("/admin/settings/probe");
+    applyProbeSettings(settings);
+    probeSettingsUpdatedAt = Date.now();
+    setProbeSettingsStatus("");
+  } catch (error) {
+    setProbeSettingsStatus(`读取失败: ${error.message}`, "error");
+  } finally {
+    probeSettingsLoading = false;
+    setProbeSettingsBusy();
+  }
+}
+
+async function saveProbeSettings() {
+  if (probeSettingsLoading || probeSettingsSaving) return;
+  const interval = Number($("probe-interval").value);
+  if (!Number.isInteger(interval) || interval < 300 || interval > 86400) {
+    $("probe-interval").focus({ preventScroll: true });
+    setProbeSettingsStatus("间隔必须是 300 到 86400 秒之间的整数", "error");
+    return;
+  }
+  probeSettingsSaving = true;
+  setProbeSettingsBusy();
+  setProbeSettingsStatus("正在保存设置...");
+  try {
+    const settings = await api("/admin/settings/probe", "PUT", true, {
+      generation_probe_enabled: $("probe-enabled").checked,
+      generation_probe_interval: interval,
+    });
+    applyProbeSettings(settings);
+    probeSettingsUpdatedAt = Date.now();
+    setProbeSettingsStatus("探测设置已保存", "success");
+    showToast("探测设置已保存");
+  } catch (error) {
+    setProbeSettingsStatus(`保存失败: ${error.message}`, "error");
+  } finally {
+    probeSettingsSaving = false;
+    setProbeSettingsBusy();
+  }
+}
+
+function setAccessSettingsStatus(message, failed = false) {
+  const status = $("accessSettingsStatus");
+  status.textContent = message;
+  status.classList.toggle("is-error", failed);
+  status.classList.toggle("is-success", !failed && accessSettingsLoaded);
+}
+
+function setAccessSettingsBusy(busy) {
+  accessSettingsBusy = busy;
+  $("access-form").setAttribute("aria-busy", String(busy));
+  $("access-ips").disabled = busy || !accessSettingsLoaded;
+  $("access-save").disabled = busy || !accessSettingsLoaded;
+  $("access-reload").disabled = busy;
+}
+
+function applyAccessSettings(payload) {
+  if (!Array.isArray(payload?.allowed_ips)
+      || !payload.allowed_ips.every((value) => typeof value === "string")) {
+    throw new Error("接口未返回有效的 IP 白名单");
+  }
+  $("access-ips").value = payload.allowed_ips.join("\n");
+  $("access-client").textContent = `当前访问 IP：${payload.client_ip || "未知"}。保存时需保留当前 IP，避免失去访问权限。`;
+  accessSettingsLoaded = true;
+}
+
+async function refreshAccessSettings() {
+  if (accessSettingsBusy) return;
+  setAccessSettingsBusy(true);
+  setAccessSettingsStatus("正在读取白名单...");
+  try {
+    applyAccessSettings(await api("/admin/settings/access"));
+    setAccessSettingsStatus("已加载最新白名单");
+  } catch (error) {
+    setAccessSettingsStatus(`读取失败: ${error.message}`, true);
+  } finally {
+    setAccessSettingsBusy(false);
+  }
+}
+
+async function saveAccessSettings() {
+  if (accessSettingsBusy || !accessSettingsLoaded) return;
+  const body = {
+    allowed_ips: [...new Set($("access-ips").value.split(/[\s,，]+/).filter(Boolean))],
+  };
+  setAccessSettingsBusy(true);
+  setAccessSettingsStatus("正在保存白名单...");
+  try {
+    applyAccessSettings(await api("/admin/settings/access", "PUT", true, body));
+    setAccessSettingsStatus("白名单已保存，对新请求立即生效");
+    showToast("IP 白名单已保存");
+  } catch (error) {
+    setAccessSettingsStatus(`保存失败: ${error.message}`, true);
+  } finally {
+    setAccessSettingsBusy(false);
+  }
+}
+
+async function refreshCapabilities() {
+  try {
+    const result = await api("/admin/capabilities");
+    canManageService = result.can_manage_service === true;
+  } catch {
+    canManageService = false;
+  }
+  $("tab-service").hidden = !canManageService;
+  if (!canManageService && currentTab === "service") setTab("monitor");
+  else if (canManageService && localStorage.getItem("zg_tab") === "service") setTab("service");
+}
+
+function setServiceSettingsStatus(message, failed = false) {
+  const status = $("serviceSettingsStatus");
+  status.textContent = message;
+  status.classList.toggle("is-error", failed);
+  status.classList.toggle("is-success", !failed && serviceSettingsLoaded);
+}
+
+function setServiceSettingsBusy(busy) {
+  serviceSettingsBusy = busy;
+  $("service-form").setAttribute("aria-busy", String(busy));
+  $("service-port").disabled = busy || !serviceSettingsLoaded;
+  $("service-save").disabled = busy || !serviceSettingsLoaded;
+  $("service-reload").disabled = busy;
+  $("service-restart").disabled = busy || !serviceSettingsLoaded;
+  $("service-restart").setAttribute("aria-busy", String(busy));
+  $("endpoint-public-url").disabled = busy || endpointSettingsBusy;
+  $("endpoint-save").disabled = busy || endpointSettingsBusy;
+}
+
+function applyServiceSettings(payload) {
+  if (!Number.isInteger(payload?.port) || payload.port < 1 || payload.port > 65535
+      || !Number.isInteger(payload?.active_port)) {
+    throw new Error("接口未返回有效的服务端口");
+  }
+  serviceSettingsData = payload;
+  $("service-port").value = String(payload.port);
+  $("service-runtime-state").textContent = `当前监听端口：${payload.active_port}`;
+  const changed = payload.port !== payload.active_port;
+  $("service-port-state").textContent = changed
+    ? `当前运行 ${payload.active_port}，保存值 ${payload.port} 将在重启后生效。`
+    : `当前服务正在监听 ${payload.active_port}。`;
+  serviceSettingsLoaded = true;
+}
+
+async function refreshServiceSettings() {
+  if (!canManageService || serviceSettingsBusy || endpointSettingsBusy) return;
+  setServiceSettingsBusy(true);
+  setServiceSettingsStatus("正在读取服务配置...");
+  try {
+    applyServiceSettings(await api("/admin/settings/service"));
+    applyEndpointSettings(await api("/admin/settings/endpoint"));
+    serviceSettingsUpdatedAt = Date.now();
+    setServiceSettingsStatus("服务配置已加载");
+  } catch (error) {
+    setServiceSettingsStatus(`读取失败: ${error.message}`, true);
+  } finally {
+    setServiceSettingsBusy(false);
+  }
+}
+
+async function saveServiceSettings() {
+  if (serviceSettingsBusy || !serviceSettingsLoaded) return;
+  const port = $("service-port").valueAsNumber;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    setServiceSettingsStatus("端口必须是 1 到 65535 之间的整数", true);
+    return;
+  }
+  setServiceSettingsBusy(true);
+  setServiceSettingsStatus("正在保存端口...");
+  try {
+    const result = await api("/admin/settings/service", "PUT", true, { port });
+    applyServiceSettings(result);
+    serviceSettingsUpdatedAt = Date.now();
+    setServiceSettingsStatus(result.restart_required
+      ? "端口已保存，下次启动或重启服务后生效。"
+      : "端口已保存，当前服务已使用此端口。");
+    showToast(result.restart_required ? "端口已保存，重启后生效" : "端口设置已保存");
+  } catch (error) {
+    setServiceSettingsStatus(`保存失败: ${error.message}`, true);
+  } finally {
+    setServiceSettingsBusy(false);
+  }
+}
+
+function serviceRestartDestination() {
+  const destination = new URL(window.location.href);
+  const currentPort = Number(destination.port || (destination.protocol === "https:" ? 443 : 80));
+  if (currentPort === serviceSettingsData?.active_port && serviceSettingsData?.port) {
+    destination.port = String(serviceSettingsData.port);
+  }
+  destination.pathname = "/dashboard";
+  destination.search = "";
+  destination.hash = "";
+  return destination.href;
+}
+
+async function restartGatewayService() {
+  if (serviceSettingsBusy || !serviceSettingsLoaded) return;
+  const portWillChange = serviceSettingsData.port !== serviceSettingsData.active_port;
+  let destination = "";
+  try {
+    if (portWillChange) {
+      destination = serviceRestartDestination();
+    }
+    setServiceSettingsBusy(true);
+    setServiceSettingsStatus("正在请求服务重启...");
+    await api("/admin/service/restart", "POST");
+    setServiceSettingsStatus(portWillChange
+      ? "重启已触发，将在新端口重新打开管理页。"
+      : "服务正在重启，等待重新上线...");
+    showToast("服务重启已触发");
+    if (portWillChange) {
+      window.setTimeout(() => window.location.assign(destination), 10000);
+      return;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    for (let attempt = 0; attempt < 45; attempt += 1) {
+      try {
+        const response = await fetch("/healthz", { cache: "no-store" });
+        if (response.ok) {
+          setServiceSettingsBusy(false);
+          await refreshServiceSettings();
+          setServiceSettingsStatus("服务已恢复");
+          showToast("服务已恢复");
+          return;
+        }
+      } catch { }
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
+    }
+    setServiceSettingsStatus("尚未检测到服务恢复，请在服务管理器检查进程。", true);
+  } catch (error) {
+    setServiceSettingsStatus(`重启失败: ${error.message}`, true);
+  } finally {
+    if (!portWillChange || !serviceSettingsBusy) setServiceSettingsBusy(false);
+  }
+}
+
 function scheduleRefresh(delay = 3000) {
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(refresh, delay);
@@ -1411,7 +2065,20 @@ async function refresh(force = false) {
   if (!statusData) setSyncState("loading", "正在同步");
   try {
     statusData = mergeStatusActivity(await api("/admin/status"));
+    const storage = statusData.statistics_storage;
+    const warning = $("statisticsStorageWarning");
+    if (warning) {
+      warning.hidden = !storage || storage.ok;
+      warning.textContent = storage && !storage.ok ? "统计保存异常" : "";
+      warning.title = storage?.message || "";
+    }
+    const storageStatus = $("eventRetentionStatus");
+    if (storageStatus && storage) {
+      storageStatus.textContent = storage.message;
+      storageStatus.classList.toggle("text-danger", !storage.ok);
+    }
     render(force);
+    updateProtectionDisplays();
     ensureActivityStream();
     const now = new Date();
     setSyncState("online", `已更新 ${now.toLocaleTimeString("zh-CN", { hour12: false })}`);
@@ -1439,7 +2106,7 @@ async function runStationAction(action, stationName) {
   if (pendingActions.has(key)) return;
   pendingActions.add(key);
   render(true);
-  const labels = { toggle: "站点状态已更新", probe: "探测已完成", reset: "额度探测已完成" };
+  const labels = { toggle: "站点状态已更新", probe: "连接检查已完成（不代表模型能生成）", reset: "额度探测已完成" };
   try {
     const encodedName = encodeURIComponent(stationName);
     const result = await api(`/admin/station/${encodedName}/${action}`, "POST");
@@ -1447,7 +2114,7 @@ async function runStationAction(action, stationName) {
     if (action === "reset") {
       message = result.recovered || !result.quota_exhausted
         ? `${stationName} 额度已恢复`
-        : `${stationName} 仍无额度，将继续自动探测`;
+        : `${stationName} 尚未确认额度恢复：${result.probe_error || "请检查上游额度或测试结果"}`;
     }
     showToast(message, action === "reset" && result.quota_exhausted);
     await refresh(true);
@@ -1564,6 +2231,17 @@ $("eventNext").addEventListener("click", () => {
 });
 
 $("retry-infinite-rounds").addEventListener("change", syncRetryLimitControls);
+$("access-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveAccessSettings();
+});
+$("access-reload").addEventListener("click", refreshAccessSettings);
+$("service-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveServiceSettings();
+});
+$("service-reload").addEventListener("click", refreshServiceSettings);
+$("service-restart").addEventListener("click", restartGatewayService);
 $("retry-unlimited-duration").addEventListener("change", syncRetryLimitControls);
 
 $("retry-form").addEventListener("submit", (event) => {
@@ -1574,6 +2252,11 @@ $("retry-form").addEventListener("submit", (event) => {
 $("retry-reload").addEventListener("click", () => {
   refreshRetrySettings({ notify: true });
 });
+$("probe-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  saveProbeSettings();
+});
+$("probe-reload").addEventListener("click", refreshProbeSettings);
 
 $("usageTabs").addEventListener("keydown", (event) => {
   const current = event.target.closest("button[data-usage-station]");
@@ -1603,11 +2286,12 @@ $("authDialog").addEventListener("cancel", (event) => {
 });
 
 $("tab-monitor").parentElement.addEventListener("keydown", (event) => {
-  if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+  if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
   event.preventDefault();
-  const tabs = ["monitor", "stats", "stations", "retry", "events"];
-  const direction = event.key === "ArrowRight" ? 1 : -1;
-  const nextTab = tabs[(tabs.indexOf(currentTab) + direction + tabs.length) % tabs.length];
+  const tabs = [...document.querySelectorAll('.primary-tabs [data-tab]:not([hidden])')].map(button => button.dataset.tab);
+  const direction = ["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1;
+  const nextTab = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1)
+    : tabs[(tabs.indexOf(currentTab) + direction + tabs.length) % tabs.length];
   setTab(nextTab);
   $(`tab-${nextTab}`).focus();
 });
@@ -1709,7 +2393,249 @@ function refreshStations({ notifyError = false, force = false } = {}) {
   return stationsRequest;
 }
 
+let stationModelsBusy = false;
+let generationTestBusy = false;
+
+function stationProbeModels() {
+  const station = STATIONS.find(item => item.name === editingStation);
+  const candidates = station?.probe_model_candidates || station?.detected_models || [];
+  const manual = $("sf-models").value.split(/[,，]/).map(value => value.trim()).filter(Boolean);
+  const models = [...new Set([...($("sf-probe-models").checked ? candidates : []), ...manual])];
+  return $("sf-provider").value === 'opencode' ? models.filter(model => station?.model_api_paths?.[model]?.length) : models;
+}
+
+function syncModelSelection(selected, model) {
+  $("sf-model-list").querySelectorAll("[data-probe-model]").forEach(button => {
+    const active = button.dataset.probeModel === (selected || model);
+    button.classList.toggle("is-selected", active);
+    button.setAttribute("aria-pressed", String(active));
+    if (!button.disabled) button.title = button.dataset.probeModel + (active ? (selected ? " · 当前探测模型" : " · 自动选择的第一个模型") : " · 点击设为探测模型");
+  });
+}
+
+function renderProbeModels(selected = $("sf-probe-chat-model").value) {
+  const station = STATIONS.find(item => item.name === editingStation);
+  const manual = $("sf-models").value.split(/[,，]/).map(value => value.trim()).filter(Boolean);
+  const models = stationProbeModels();
+  const go = $("sf-provider").value === 'opencode' && $("sf-opencode-plan").value === 'go';
+  const select = $("sf-probe-chat-model");
+  const options = [`<option value="">自动 · ${models[0] ? `第一个：${escapeHtml(models[0])}` : "等待模型列表"}</option>`,
+    ...models.map(model => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`)];
+  if (selected && !models.includes(selected)) options.push(`<option value="${escapeHtml(selected)}">${escapeHtml(selected)}（未在当前列表中）</option>`);
+  select.innerHTML = options.join("");
+  select.value = selected;
+  const model = selected || models[0] || "";
+  $("sf-probe-model-auto").checked = !selected;
+  $("sf-probe-model-auto").disabled = !models.length && !selected;
+  $("sf-probe-mode-label").textContent = selected ? "手动指定" : ($("sf-provider").value === 'opencode' ? "自动 · 第一个可接入模型" : "自动 · 上游返回的第一个");
+  $("sf-probe-current").textContent = model || "等待模型列表";
+  renderEffectiveProbePolicy();
+  $("sf-probe-save-state").textContent = selected !== (station?.probe_chat_model || "")
+    ? "待保存 · 仅修改当前站点" : (station ? "当前站点已保存" : "保存站点后生效");
+  syncModelSelection(selected, model);
+  const unsaved = station && ($("sf-base-url").value.trim() !== station.base_url
+    || $("sf-api-key").value.trim() || selected !== (station.probe_chat_model || "")
+    || $("sf-provider").value !== (station.provider || 'openai')
+    || $("sf-opencode-plan").value !== (station.opencode_plan || 'balance')
+    || $("sf-probe-models").checked !== station.probe_models
+    || JSON.stringify(manual) !== JSON.stringify(station.models || [])
+    || $("sf-enabled").checked !== station.enabled);
+  $("sf-generation-test").disabled = go || generationTestBusy || !station?.enabled || !model || unsaved;
+  $("sf-generation-test").textContent = generationTestBusy ? "正在测试…" : "生成测试一次";
+  const result = station?.generation_probe;
+  $("sf-generation-result").textContent = go ? "Go 不发送通用 ping 探测；请使用智商测试或正常编程请求。"
+    : unsaved ? "请先保存模型或连接修改，再测试。"
+    : !station ? "保存并启用站点后可测试。"
+      : result?.last_at ? `最近生成测试：${result.ok ? "成功" : "未通过"} · ${formatAge(result.last_at)}${result.error ? ` · ${result.error}` : ""}`
+        : "仅执行一次，可能按上游价格计费。";
+}
+
+function updatePriorityMode() {
+  const auto = $("sf-priority-auto").checked;
+  $("sf-priority").disabled = auto;
+  $("sf-priority-note").textContent = auto
+    ? "自动：按健康评分调度，不加手动优先级分；同分段按权重与延迟分流。"
+    : "手动：1 / 2 / 3 / 4 / 5 分别加 15 / 12 / 9 / 6 / 3 分，6 及以上不加分；并非硬排序。";
+}
+
+function renderStationModels() {
+  $("sf-visual-test").disabled = !editingStation;
+  renderProbeModels();
+  const station = STATIONS.find(item => item.name === editingStation);
+  const discovery = station?.model_discovery || {};
+  const changedConnection = station && ($("sf-base-url").value.trim() !== station.base_url
+    || $("sf-api-key").value.trim() || $("sf-provider").value !== (station.provider || 'openai')
+    || $("sf-opencode-plan").value !== (station.opencode_plan || 'balance'));
+  const labels = { pending: "等待发现", loading: "正在读取模型列表", ready: "已发现", off: "自动发现已关闭", error: "读取失败", rate_limited: "限流冷却中", auth_error: "鉴权失败", unsupported: "接口不支持", invalid_response: "返回格式不支持" };
+  let status = !station ? "保存并启用站点后自动发现模型。"
+    : `${labels[discovery.status] || "等待发现"}${discovery.updated_at ? ` · 更新于 ${formatAge(discovery.updated_at)}` : ""}${discovery.error ? ` · ${discovery.error}` : ""}`;
+  if (station && !station.enabled) status += " · 站点已停用，不发送发现请求";
+  if (changedConnection) status = "连接或套餐尚未保存；下方仍为原配置的缓存，保存后重新发现。";
+  const wait = Math.max(0, Math.ceil((discovery.checked_at || 0) + 60 - Date.now() / 1000));
+  const limited = (discovery.status === "rate_limited" && discovery.next_refresh_at > Date.now() / 1000)
+    || discovery.retry_after_until > Date.now() / 1000;
+  const button = $("sf-models-refresh");
+  button.disabled = stationModelsBusy || !station?.enabled || !station?.probe_models || changedConnection || !$("sf-probe-models").checked || wait > 0 || limited;
+  button.textContent = stationModelsBusy ? "读取中…" : (wait > 0 ? `${wait}s 后刷新` : (limited ? "冷却中" : "刷新列表"));
+  $("sf-models-status").textContent = status;
+  const query = $("sf-model-search").value.trim().toLowerCase();
+  const detectedSet = new Set(station?.detected_models || []);
+  const detected = [...new Set([...(station?.probe_model_candidates || []), ...(station?.detected_models || [])])].filter(model => detectedSet.has(model));
+  const allModels = [...new Set([...detected, ...stationProbeModels()])];
+  const models = allModels.filter(model => model.toLowerCase().includes(query));
+  $("sf-model-count").textContent = String(allModels.length);
+  const list = $("sf-model-list");
+  list.innerHTML = models.map(model => {
+    const reason = station?.model_unavailable?.[model];
+    const paths = station?.model_api_paths?.[model];
+    const detail = reason || (paths?.length ? paths.map(p => ({'/responses':'Responses','/chat/completions':'Chat Completions','/messages':'Anthropic Messages','/generateContent':'Gemini GenerateContent'}[p] || p)).join(' / ') : '');
+    return `<button type="button" class="catalog-model" data-probe-model="${escapeHtml(model)}" aria-pressed="false" ${reason ? 'disabled' : ''} title="${escapeHtml(detail)}"><span>${escapeHtml(model)}</span>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</button>`;
+  }).join("")
+    || `<span class="catalog-empty">${query ? "没有匹配模型" : (discovery.status === "ready" ? "上游返回空列表" : "暂无模型列表")}</span>`;
+  syncModelSelection($("sf-probe-chat-model").value, stationProbeModels()[0]);
+  updateModelRouting();
+}
+
+function routeRules() {
+  return $("sf-route-models").value.split(/[,，\n]/).map(value => value.trim()).filter(Boolean);
+}
+function updateModelRouting() {
+  const rules = routeRules();
+  const station = STATIONS.find(item => item.name === editingStation);
+  const known = [...new Set([...(station?.detected_models || []), ...$("sf-models").value.split(/[,，]/).map(v => v.trim()).filter(Boolean)])];
+  const matches = model => !rules.length || rules.some(rule => rule.endsWith('*') ? model.startsWith(rule.slice(0, -1)) : model === rule);
+  const eligible = known.filter(model => matches(model) && ($("sf-provider").value === 'opencode'
+    ? station?.model_api_paths?.[model]?.length : true));
+  const passthrough = $("sf-model-routing").value === 'passthrough';
+  $("sf-routing-note").textContent = (passthrough
+    ? '允许范围内未列出的模型，由上游确认支持情况。'
+    : `只接收目录或手动补充的精确模型 ID；当前 ${eligible.length} / ${known.length} 个模型符合范围。`)
+    + ' 多项用逗号分隔，支持末尾 *。故障切换保持原模型，不替换型号。';
+}
+function updateProvider(changed = false) {
+  const opencode = $("sf-provider").value === 'opencode';
+  const native = ['anthropic', 'gemini'].includes($("sf-provider").value);
+  $("editor-connection").classList.toggle('is-opencode', opencode);
+  $("editor-connection").classList.toggle('has-provider-note', native);
+  if (changed && opencode) $("sf-opencode-plan").value = 'go';
+  const go = opencode && $("sf-opencode-plan").value === 'go';
+  $("sf-provider").querySelector('[value="opencode"]').textContent = opencode && !go ? 'OpenCode · 按量余额' : 'OpenCode Go';
+  $("sf-provider-note").hidden = !opencode && !native;
+  $("sf-opencode-plan-field").hidden = !opencode;
+  $("sf-billing").disabled = opencode;
+  $("sf-probe-chat").disabled = go;
+  if (go) $("sf-probe-chat").checked = false;
+  $("sf-provider-note").textContent = go
+    ? 'Go 订阅使用独立额度，额外付费余额 $0 不代表订阅不可用。需保留编程对话的稳定会话 ID；不发送通用 ping，网关不切换到余额入口。若要避免上游超额扣费，请在 OpenCode 控制台关闭 Extra Usage。'
+    : '按量余额使用余额接口，与 Go 订阅额度独立。模型按官方协议接入，免费专属模型及暂不支持的协议会标明。';
+  if (native) {
+    const anthropic = $("sf-provider").value === 'anthropic';
+    $("sf-provider-note").textContent = anthropic
+      ? '原生 Messages 接口，保留工具调用、图像、缓存与思考参数。客户端使用网关 /v1/messages；上游通过 API Key 鉴权。其他入口仅匹配对应协议的站点。'
+      : '原生 Gemini 接口，保留 functionCall、thoughtSignature 与多模态内容。客户端使用 /v1beta/models/{模型}:generateContent，或现有 /v1/models/{模型}:generateContent；流式请求使用 :streamGenerateContent?alt=sse。';
+    const presetUrls = ['https://api.anthropic.com/v1', 'https://generativelanguage.googleapis.com/v1beta', 'https://opencode.ai/inference/go/openai/v1', 'https://opencode.ai/inference/openai/v1'];
+    if (changed && (!$("sf-base-url").value || presetUrls.includes($("sf-base-url").value))) $("sf-base-url").value = anthropic
+      ? 'https://api.anthropic.com/v1' : 'https://generativelanguage.googleapis.com/v1beta';
+  }
+  $("sf-base-url").readOnly = opencode;
+  $("sf-model-routing").disabled = opencode;
+  $("sf-probe-models").disabled = opencode;
+  $("sf-models").disabled = opencode;
+  $("sf-models").closest('details').hidden = opencode;
+  if (opencode) {
+    $("sf-base-url").value = `https://opencode.ai/inference/${go ? 'go/' : ''}openai/v1`;
+    $("sf-billing").value = go ? 'subscription' : 'balance';
+    $("sf-model-routing").value = 'catalog';
+    $("sf-probe-models").checked = true;
+    if (changed) {
+      if (!$("sf-name").value) $("sf-name").value = 'OpenCode Go';
+      $("sf-probe-chat").checked = false;
+      $("sf-probe-interval").value = '3600';
+    }
+  }
+  updateModelRouting();
+}
+$("sf-provider").addEventListener('change', () => { updateProvider(true); renderStationModels(); });
+$("sf-opencode-plan").addEventListener('change', () => { updateProvider(); renderStationModels(); });
+$("sf-model-routing").addEventListener('change', updateModelRouting);
+$("sf-route-models").addEventListener('input', updateModelRouting);
+
+$("sf-priority-auto").addEventListener("change", updatePriorityMode);
+for (const id of ["sf-model-search", "sf-base-url", "sf-api-key", "sf-probe-models", "sf-models", "sf-enabled"]) {
+  $(id).addEventListener("input", renderStationModels);
+}
+$("sf-probe-chat-model").addEventListener("change", () => renderProbeModels());
+$("sf-probe-model-auto").addEventListener("change", () => {
+  renderProbeModels($("sf-probe-model-auto").checked ? "" : (stationProbeModels()[0] || ""));
+});
+$("sf-model-list").addEventListener("click", event => {
+  const button = event.target.closest("[data-probe-model]");
+  if (button) renderProbeModels(button.dataset.probeModel);
+});
+function renderEffectiveProbePolicy() {
+  const policy = probeSettingsData;
+  const model = $("sf-probe-chat-model").value || stationProbeModels()[0];
+  let text = !policy ? "账号策略尚未读取，暂无法判断是否参与后台测试。"
+    : !$("sf-enabled").checked ? "本站已停用，不执行后台测试。"
+    : !policy.generation_probe_enabled ? "账号总开关已关闭，不执行后台生成测试；仍可手动测试一次。"
+    : !$("sf-probe-chat").checked ? "本站未参与后台生成测试；仍可手动测试一次。"
+    : !model ? "尚无可用测试模型，后台测试会跳过。"
+    : `本站参与后台测试，最小间隔 ${policy.generation_probe_interval} 秒。近期有业务调用、限流或故障冷却时跳过。`;
+  const station = STATIONS.find(item => item.name === editingStation);
+  if ($("sf-provider").value === 'opencode' && $("sf-opencode-plan").value === 'go') text = "Go 订阅不执行通用 ping 生成测试；模型目录仍会按设定间隔刷新。";
+  if (station && ($("sf-probe-chat").checked !== station.probe_chat || $("sf-enabled").checked !== station.enabled)) text = "待保存 · " + text;
+  $("sf-effective-policy").textContent = text;
+  const interval = Math.max(300, Number($("sf-probe-interval").value) || Number(statusData?.gateway?.probe_interval) || 300);
+  $("sf-directory-effective").textContent = $("sf-probe-models").checked ? `目录检查间隔至少 ${interval} 秒，仅读取元数据；限流时延后。` : "自动发现已关闭；不自动读取模型目录。";
+}
+$("sf-probe-chat").addEventListener("change", renderEffectiveProbePolicy);
+$("sf-probe-interval").addEventListener("input", renderEffectiveProbePolicy);
+$("sf-account-policy").addEventListener("click", () => setSectionTab("stations", "probe"));
+$("sf-generation-test").addEventListener("click", async () => {
+  if (!editingStation || generationTestBusy || $("sf-generation-test").disabled) return;
+  const name = editingStation;
+  let message = "";
+  generationTestBusy = true;
+  renderProbeModels();
+  try {
+    const result = await api(`/admin/station/${encodeURIComponent(name)}/generation-probe`, "POST");
+    await refreshStations({ force: true });
+    await refresh(true);
+    message = result.skipped ? `未发送生成请求：${result.error}`
+      : result.ok ? `${name} · ${result.model} 生成成功${result.latency_ms != null ? `，${result.latency_ms} ms` : ""}`
+        : `生成测试失败：${result.error || "上游未返回成功"}`;
+    showToast(message, !result.ok);
+  } catch (error) {
+    message = `生成测试失败：${error.message}`;
+    showToast(message, true);
+  } finally {
+    generationTestBusy = false;
+    $("sf-generation-test").textContent = "生成测试一次";
+    $("sf-generation-test").disabled = false;
+    renderProbeModels();
+    if (editingStation === name) $("sf-generation-result").textContent = message;
+  }
+});
+$("sf-models-refresh").addEventListener("click", async () => {
+  if (!editingStation || stationModelsBusy) return;
+  const name = editingStation;
+  stationModelsBusy = true;
+  renderStationModels();
+  try {
+    await api(`/admin/station/${encodeURIComponent(name)}/models/refresh`, "POST");
+    await refreshStations({ force: true });
+    await refresh(true);
+  } catch (error) {
+    showToast(`模型列表读取失败: ${error.message}`, true);
+  } finally {
+    stationModelsBusy = false;
+    renderStationModels();
+  }
+});
+
 function renderStations() {
+  renderStationModels();
+
   $("stationsCount").textContent = `(${STATIONS.length})`;
   if (stationsLoading && !STATIONS.length) {
     $("stations-body").innerHTML = '<tr><td colspan="7" class="empty-cell">正在读取站点...</td></tr>';
@@ -1723,8 +2649,10 @@ function renderStations() {
   $("stations-body").innerHTML = STATIONS.map((station) => {
     const name = String(station.name || "");
     const state = statusInfo(station);
-    const models = Array.isArray(station.models) ? station.models : [];
-    const modelsLabel = models.length ? models.join(", ") : "任意模型";
+    const models = [...new Set([...(station.models || []), ...(station.detected_models || [])])];
+    const modelsLabel = models.length ? models.join(", ") : (station.accepts_any_model ? '允许未列出的模型' : '模型待配置 / 发现');
+    const routed = station.effective_models?.length ?? models.length;
+    const scopeLabel = station.accepts_any_model ? (station.route_models?.length ? '按范围透传' : '允许未列出模型') : `${routed} 可路由 / ${models.length} 已知`;
     const actions = ["toggle", "probe", "reset", "delete"];
     const rowBusy = actions.some((action) => stationPendingActions.has(`${action}:${name}`));
     const toggleBusy = stationPendingActions.has(`toggle:${name}`);
@@ -1736,21 +2664,23 @@ function renderStations() {
     return `
       <tr class="${station.enabled ? "" : "is-disabled"}" data-station-row="${escapeHtml(name)}">
         <td><span class="managed-station-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
-          ${station.quota_exhausted ? '<span class="station-warning">配额耗尽 · 自动探测中</span>' : ""}</td>
+          ${station.quota_exhausted ? '<span class="station-warning">上游额度不可用</span>' : ""}</td>
         <td class="station-url-cell" title="${escapeHtml(station.base_url || "")}">${escapeHtml(station.base_url || "-")}</td>
-        <td class="station-models-cell" title="${escapeHtml(modelsLabel)}">${escapeHtml(modelsLabel)}</td>
-        <td>${formatCount(station.priority)}</td>
+        <td class="station-models-cell"><button type="button" class="catalog-link" data-manage-action="models" data-station="${escapeHtml(name)}" title="${escapeHtml(modelsLabel)}">${escapeHtml(scopeLabel)}</button></td>
+        <td title="${station.priority_auto ? "按健康评分自动调度，无手动加分" : "数字越小加分越高，并非硬排序"}">${station.priority_auto ? `自动${station.rank ? ` · #${station.rank}` : ""}` : formatCount(station.priority)}</td>
         <td class="muted">${station.billing === "subscription" ? "订阅" : "余额"}</td>
-        <td><span class="managed-status"><span class="status-dot ${state.className}" aria-hidden="true"></span>${escapeHtml(state.label)}</span></td>
+        <td>${protectionMarkup(station)}</td>
         <td><div class="station-manage-actions">
           <button class="button station-action" type="button" data-manage-action="edit" data-station="${escapeHtml(name)}"${disabled}>编辑</button>
           <button class="button station-action" type="button" data-manage-action="toggle" data-station="${escapeHtml(name)}"${disabled}${busy(toggleBusy)}>${toggleBusy ? "处理中..." : (station.enabled ? "停用" : "启用")}</button>
-          <button class="button station-action" type="button" data-manage-action="probe" data-station="${escapeHtml(name)}"${disabled}${busy(probeBusy)}>${probeBusy ? "探测中..." : "探测"}</button>
+          <button class="button station-action" type="button" data-manage-action="probe" data-station="${escapeHtml(name)}"${disabled}${busy(probeBusy)}>${probeBusy ? "检查中..." : "连接检查"}</button>
           ${station.quota_exhausted ? `<button class="button station-action" type="button" data-manage-action="reset" data-station="${escapeHtml(name)}"${disabled}${busy(resetBusy)}>${resetBusy ? "探测中..." : "立即探测"}</button>` : ""}
           <button class="button station-action is-destructive" type="button" data-manage-action="delete" data-station="${escapeHtml(name)}"${disabled}${busy(deleteBusy)}>${deleteBusy ? "删除中..." : "删除"}</button>
         </div></td>
       </tr>`;
   }).join("") || '<tr><td colspan="7" class="empty-cell">暂无站点，点击“添加站点”开始配置</td></tr>';
+  fitViewportContent();
+  document.dispatchEvent(new Event("modelharbor:stations-rendered"));
 }
 
 function fillStationForm(station) {
@@ -1763,16 +2693,28 @@ function fillStationForm(station) {
   $("sf-api-key").required = false;
   $("sf-api-key").placeholder = "已配置，留空保持不变";
   $("sf-models").value = (station.models || []).join(", ");
+  $("sf-provider").value = station.provider || 'openai';
+  $("sf-opencode-plan").value = station.opencode_plan || 'balance';
+  $("sf-model-routing").value = station.model_routing || (station.accepts_any_model ? 'passthrough' : 'catalog');
+  $("sf-route-models").value = (station.route_models || []).join(', ');
   $("sf-priority").value = station.priority;
+  $("sf-priority-auto").checked = Boolean(station.priority_auto);
+  updatePriorityMode();
+  $("sf-model-search").value = "";
   $("sf-billing").value = station.billing;
   $("sf-probe-chat").checked = Boolean(station.probe_chat);
+  renderProbeModels(station.probe_chat_model || "");
+  $("sf-probe-interval").value = station.probe_interval ?? "";
   $("sf-probe-models").checked = Boolean(station.probe_models);
   $("sf-enabled").checked = station.enabled;
+  updateProvider();
+  renderStationModels();
   $("sf-heading").textContent = "编辑站点: " + station.name;
   $("sf-submit").textContent = "保存修改";
   $("sf-cancel").hidden = false;
   setStationFormStatus(`正在编辑 ${station.name}，API Key 留空将保持不变`);
-  $("stations-wrap").scrollIntoView({ behavior: "smooth" });
+  setSectionTab("stations", "editor");
+  setSectionTab("editor", "connection");
   $("sf-base-url").focus({ preventScroll: true });
 }
 
@@ -1785,11 +2727,22 @@ function resetStationForm({ keepStatus = false } = {}) {
   $("sf-api-key").required = true;
   $("sf-api-key").placeholder = "your-upstream-key";
   $("sf-models").value = "";
+  $("sf-provider").value = 'openai';
+  $("sf-opencode-plan").value = 'go';
+  $("sf-model-routing").value = 'catalog';
+  $("sf-route-models").value = '';
   $("sf-priority").value = "5";
+  $("sf-priority-auto").checked = true;
+  updatePriorityMode();
+  $("sf-model-search").value = "";
   $("sf-billing").value = "balance";
   $("sf-probe-chat").checked = false;
-  $("sf-probe-models").checked = false;
+  $("sf-probe-chat-model").value = "";
+  $("sf-probe-interval").value = "";
+  $("sf-probe-models").checked = true;
   $("sf-enabled").checked = true;
+  updateProvider();
+  renderStationModels();
   $("sf-heading").textContent = "添加 / 编辑站点";
   $("sf-submit").textContent = "添加站点";
   $("sf-cancel").hidden = true;
@@ -1820,9 +2773,16 @@ $("station-form").addEventListener("submit", async (event) => {
     base_url: $("sf-base-url").value.trim(),
     api_key: $("sf-api-key").value.trim(),
     models: $("sf-models").value.split(/[,，]/).map(x => x.trim()).filter(Boolean),
+    provider: $("sf-provider").value,
+    opencode_plan: $("sf-opencode-plan").value,
+    model_routing: $("sf-model-routing").value,
+    route_models: routeRules(),
     priority: parseInt($("sf-priority").value) || 5,
+    priority_auto: $("sf-priority-auto").checked,
     billing: $("sf-billing").value,
     probe_chat: $("sf-probe-chat").checked,
+    probe_chat_model: $("sf-probe-chat-model").value.trim(),
+    probe_interval: $("sf-probe-interval").value ? Number($("sf-probe-interval").value) : null,
     probe_models: $("sf-probe-models").checked,
     enabled: $("sf-enabled").checked,
   };
@@ -1857,6 +2817,7 @@ $("station-form").addEventListener("submit", async (event) => {
     resetStationForm({ keepStatus: true });
     setStationFormStatus(finalMessage, !listRefreshed);
     showToast(finalMessage, !listRefreshed);
+    if (listRefreshed) setSectionTab("stations", "list");
     await refresh(true);
   } catch (error) {
     const prefix = wasEditing ? "更新失败" : "添加失败";
@@ -1894,7 +2855,7 @@ async function runManagedStationAction(action, stationName) {
     if (action === "reset") {
       message = result.recovered || !result.quota_exhausted
         ? `${stationName} 额度已恢复`
-        : `${stationName} 仍无额度，将继续自动探测`;
+        : `${stationName} 尚未确认额度恢复：${result.probe_error || "请检查上游额度或测试结果"}`;
       isError = Boolean(result.quota_exhausted);
     }
     if (action === "probe") {
@@ -1925,20 +2886,24 @@ $("stations-body").addEventListener("click", (event) => {
   if (!button || button.disabled) return;
   const action = button.dataset.manageAction;
   const stationName = button.dataset.station;
-  if (action === "edit") {
+  if (action === "edit" || action === "models") {
     const station = STATIONS.find((item) => item.name === stationName);
     if (station) fillStationForm(station);
+    if (station && action === "models") setSectionTab("editor", "models");
     return;
   }
   if (action === "delete"
       && !window.confirm(`确定删除站点 ${stationName}？该操作会立即停止后续路由。`)) return;
+  if (action === "reset"
+      && !window.confirm(`“立即探测”会发送一次生成请求，可能按上游价格计费。只需查看模型列表请使用“模型”页签。仍要继续吗？`)) return;
   runManagedStationAction(action, stationName);
 });
 
 $("stations-add").addEventListener("click", () => {
   if (stationSubmitting) return;
   resetStationForm();
-  $("stations-wrap").scrollIntoView({ behavior: "smooth" });
+  setSectionTab("stations", "editor");
+  setSectionTab("editor", "connection");
   $("sf-name").focus({ preventScroll: true });
 });
 
@@ -1946,10 +2911,123 @@ $("stations-refresh").addEventListener("click", () => {
   refreshStations({ notifyError: true });
 });
 
-$("sf-cancel").addEventListener("click", () => resetStationForm());
+$("sf-cancel").addEventListener("click", () => { resetStationForm(); setSectionTab("stations", "list"); });
 
+$("show-details").addEventListener("change", () => {
+  $("monitor-wrap").classList.toggle("show-details", $("show-details").checked);
+  scheduleViewportLayout();
+});
+if (window.matchMedia) {
+  const mobileNavigation = window.matchMedia("(max-width: 620px)");
+  const updateNavigationOrientation = () => document.querySelector(".primary-tabs")
+    .setAttribute("aria-orientation", mobileNavigation.matches ? "horizontal" : "vertical");
+  mobileNavigation.addEventListener?.("change", updateNavigationOrientation);
+  updateNavigationOrientation();
+}
+$("station-search").addEventListener("input", () => { viewportPages.monitor = 1; render(true); });
+function setStationScope(scope) {
+  if (!["enabled", "disabled"].includes(scope)) return;
+  stationScope = scope;
+  viewportPages.monitor = 1;
+  $("stationScopeTabs").querySelectorAll("[data-station-scope]").forEach(button => {
+    const selected = button.dataset.stationScope === scope;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  });
+  $("monitorViewport").setAttribute("aria-labelledby", "station-scope-" + scope);
+  $("stationHealthFilter").hidden = scope === "disabled";
+  render(true);
+}
+$("stationScopeTabs").addEventListener("click", event => {
+  const button = event.target.closest("[data-station-scope]");
+  if (button) setStationScope(button.dataset.stationScope);
+});
+$("stationScopeTabs").addEventListener("keydown", event => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const scope = event.key === "Home" ? "enabled" : event.key === "End" ? "disabled"
+    : stationScope === "enabled" ? "disabled" : "enabled";
+  setStationScope(scope);
+  $("station-scope-" + scope).focus();
+});
+$("station-filter").addEventListener("change", () => { viewportPages.monitor = 1; render(true); });
+$("refreshDashboard").addEventListener("click", async () => {
+  const button = $("refreshDashboard");
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    if (currentTab === "stats") await refreshStats();
+    else if (currentTab === "events") await refreshEvents();
+    else if (currentTab === "stations") {
+      await refreshStations({ notifyError: true });
+      await refreshStationPolicy(true);
+    }
+    else if (currentTab === "access") await refreshAccessSettings();
+    else if (currentTab === "service") await refreshServiceSettings();
+    else await refresh(true);
+  } finally {
+    button.disabled = false;
+    button.setAttribute("aria-busy", "false");
+  }
+});
+function applyEndpointSettings(data) {
+  endpointData = data;
+  $("endpoint-public-url").value = data.public_url || "";
+  $("endpoint-preview").textContent = data.endpoint || "请配置客户端可访问的 URL";
+  const labels = { configured: "已指定公开地址；协议、端口与路径按保存值使用", request: "自动使用当前访问地址", local_interface: "自动使用本机局域网地址与当前监听端口", needs_configuration: "未能确定唯一的局域网地址，请填写公开访问 URL" };
+  $("endpoint-status").textContent = labels[data.source] || "";
+  if (data.candidates?.length > 1) $("endpoint-status").textContent += `。候选：${data.candidates.join("、")}`;
+}
+$("endpoint-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (!canManageService || serviceSettingsBusy || endpointSettingsBusy) return;
+  const value = $("endpoint-public-url").value.trim();
+  endpointSettingsBusy = true;
+  setServiceSettingsBusy(true);
+  try {
+    applyEndpointSettings(await api("/admin/settings/endpoint", "PUT", true, { public_url: value }));
+    showToast("对外接入地址已保存，立即生效");
+  } catch (error) {
+    $("endpoint-status").textContent = `保存失败：${error.message}`;
+  } finally { endpointSettingsBusy = false; setServiceSettingsBusy(false); }
+});
+function copyEndpointFallback(endpoint) {
+  const field = document.createElement("textarea");
+  field.className = "clipboard-helper";
+  field.value = endpoint;
+  document.body.append(field);
+  field.select();
+  try { if (!document.execCommand("copy")) throw new Error("浏览器不允许写入剪贴板"); }
+  finally { field.remove(); }
+}
+$("copyEndpoint").addEventListener("click", async () => {
+  if ($("copyEndpoint").disabled) return;
+  $("copyEndpoint").disabled = true;
+  let endpoint = "";
+  try {
+    const data = await api("/admin/settings/endpoint");
+    endpointData = data;
+    endpoint = data.endpoint || "";
+    if (!endpoint) throw new Error("请在部署机器的服务设置中配置对外接入地址");
+    const parsed = new URL(endpoint);
+    if (!["http:", "https:"].includes(parsed.protocol) || !parsed.pathname.endsWith("/v1")) throw new Error("接入地址格式无效");
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      try { await navigator.clipboard.writeText(endpoint); } catch { copyEndpointFallback(endpoint); }
+    } else {
+      copyEndpointFallback(endpoint);
+    }
+    showToast(`已复制：${endpoint}`);
+  } catch (error) {
+    showToast(endpoint ? `接入地址：${endpoint}，请手动复制` : error.message, true);
+  } finally { $("copyEndpoint").disabled = false; $("copyEndpoint").focus({ preventScroll: true }); }
+});
+initializeViewportLayout();
 applyTab();
 applyView();
 if (currentTab === "stations") refreshStations({ notifyError: true });
-if (currentTab === "retry") refreshRetrySettings({ notify: true });
+if (legacyStationSection) {
+  localStorage.setItem("zg_tab", "stations");
+  setSectionTab("stations", legacyStationSection);
+}
+if (currentTab === "access") refreshAccessSettings();
 refresh();

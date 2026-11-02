@@ -1,4 +1,4 @@
-"""中转站智能网关 - 启动入口。
+"""ModelHarbor 模型网关 - 启动入口。
 
 用法:
     python gateway.py [--config config.yaml] [--host 0.0.0.0] [--port 8000]
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sqlite3
 import hmac
 import time
 from contextlib import asynccontextmanager
@@ -18,16 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.config import AppConfig, load_config
-from app.gateway_settings import GatewaySettingsStore
-from app.health import HealthMonitor
-from app.juice import JuiceRegistry
-from app.juice_monitor import JuiceMonitor
-from app.notifier import Notifier
-from app.proxy import OpenAIProxy
-from app.state import Registry
-from app.stations import StationStore
-from app.stats import EventLog, persist_loop
-from app.web.admin import create_admin_router
+from app.service_settings import ServiceSettingsStore
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -53,104 +45,46 @@ def _unauthorized(message: str = "Invalid API key provided.",
     )
 
 
-async def _juice_persist(juice_registry, interval: float = 60.0) -> None:
-    """周期保存指纹（采样会随时发生）。"""
-    import asyncio
-    while True:
-        try:
-            await asyncio.sleep(interval)
-            juice_registry.persist(
-                retention_days=cfg.gateway.data_retention_days)
-        except asyncio.CancelledError:
-            juice_registry.persist()
-            break
-        except Exception as e:  # noqa: BLE001
-            print(f"[juice] 保存异常: {e}")
-
-
 def build_app(cfg: AppConfig) -> FastAPI:
-    # Retry policy is editable from the dashboard.  Apply the persisted,
-    # non-secret override before constructing components that share cfg.gateway.
-    settings_store = GatewaySettingsStore(cfg.gateway.data_dir)
-    retry_settings = settings_store.load(cfg.gateway)
-    if retry_settings:
-        for field, value in retry_settings.items():
-            setattr(cfg.gateway, field, value)
+    from app.accounts import AccountManager, RuntimeMiddleware, create_account_router
 
-    # 动态站点：用户配置（data/stations.json）优先，无则用 config.yaml 种子
-    store = StationStore(cfg.gateway.data_dir)
-    user_stations = store.load()
-    stations = user_stations if user_stations is not None else cfg.stations
-    registry = Registry(cfg.gateway, stations)
-    eventlog = EventLog(cfg.gateway.data_dir,
-                          retention_days=cfg.gateway.data_retention_days)
-    eventlog.load()
-    notifier = Notifier(cfg.gateway.webhook_url)
-    monitor = HealthMonitor(registry, cfg.gateway, notifier)
-    juice_registry = JuiceRegistry(
-        persist_path=cfg.gateway.data_dir + "/juice.json")
-    registry.juice_registry = juice_registry
-    juice_monitor = JuiceMonitor(registry, cfg.gateway, juice_registry)
-    proxy = OpenAIProxy(registry, cfg.gateway, eventlog, notifier)
-    admin = create_admin_router(
-        registry,
-        cfg.gateway,
-        monitor,
-        eventlog,
-        notifier,
-        store,
-        settings_store,
-        juice_registry,
-    )
+    manager = AccountManager(cfg)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        tasks = [
-            asyncio.create_task(monitor.run(), name="health-monitor"),
-            # 主动指纹轮询已停用：指纹改由真实请求顺路采集（juice_monitor 保留备用）
-            asyncio.create_task(persist_loop(eventlog), name="stats-persist"),
-            asyncio.create_task(
-                _juice_persist(juice_registry), name="juice-persist"),
-        ]
-        print(f"[gateway] 启动: {len(cfg.stations)} 个中转站 | "
-              f"最大尝试 {cfg.gateway.max_attempts} 次 | "
-              f"探测间隔 {cfg.gateway.probe_interval}s | "
-              f"动态托管 {'开' if len(cfg.stations) > 1 else '单站无需'}"
-              + (f" | webhook告警已启用" if notifier.enabled else ""))
-        yield
-        await monitor.stop()
-        await juice_monitor.stop()
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await notifier.close()
-        await registry.close_clients()
-        eventlog.persist()
-        print("[gateway] 已关闭，统计已落盘")
+        await manager.start()
+        print(f"[ModelHarbor] started | active account: {manager.active.id}")
+        try:
+            yield
+        finally:
+            await manager.stop()
+            print("[ModelHarbor] stopped; account statistics saved")
 
-    app = FastAPI(title="中转站智能网关", lifespan=lifespan)
-    app.include_router(proxy.api)
-    app.include_router(admin)
+    app = FastAPI(title="ModelHarbor", lifespan=lifespan)
+    @app.exception_handler(sqlite3.Error)
+    @app.exception_handler(OSError)
+    async def storage_error(request: Request, exc):
+        return JSONResponse(status_code=503, content={'detail': '账号存储暂不可用，请稍后重试'})
 
-    # ---- 统一 key 鉴权（对外开放）----
-    # /v1/*       对外转发端点：校验 gateway.api_keys（空则不校验，保持向后兼容）
-    # /admin/*    管理数据接口：校验 gateway.admin_key（空则不校验）
-    # /static、/dashboard 页面本身可打开，数据请求带 key 即可
-    @app.middleware("http")
-    async def auth_middleware(request: Request, call_next):
-        path = request.url.path
-        auth = request.headers.get("authorization")
-        if path.startswith("/v1/"):
-            if cfg.gateway.api_keys and not _check_bearer(auth, cfg.gateway.api_keys):
-                return _unauthorized()
-        elif path.startswith("/admin/"):
-            if cfg.gateway.admin_key and not _check_bearer(auth, [cfg.gateway.admin_key]):
-                return _unauthorized("Invalid admin key.", "admin_error", "invalid_admin_key")
-        response = await call_next(request)
-        # 静态资源禁用缓存：避免前端升级后浏览器继续用旧版 CSS/JS
-        if path.startswith("/static/"):
-            response.headers["Cache-Control"] = "no-store"
-        return response
+    app.state.accounts = manager
+    app.state.uvicorn_server = None
+    app.state.restart_scheduled = False
+
+    def schedule_restart() -> bool:
+        server = app.state.uvicorn_server
+        if server is None:
+            return False
+        if not app.state.restart_scheduled:
+            app.state.restart_scheduled = True
+            asyncio.get_running_loop().call_later(
+                0.75, setattr, server, "should_exit", True)
+        return True
+
+    manager.request_restart = schedule_restart
+    app.include_router(create_account_router(manager))
+    # Include the public schema; middleware dispatches to the pinned runtime.
+    app.include_router(manager.active.app.router)
+    app.add_middleware(RuntimeMiddleware, manager=manager, check_bearer=_check_bearer)
 
     static_dir = BASE_DIR / "app" / "web" / "static"
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -180,7 +114,7 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    parser = argparse.ArgumentParser(description="中转站智能网关")
+    parser = argparse.ArgumentParser(description="ModelHarbor 模型网关")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--host", default=None, help="监听地址 (默认取配置)")
     parser.add_argument("--port", type=int, default=None, help="监听端口 (默认取配置)")
@@ -189,11 +123,16 @@ def main():
 
     cfg = load_config(args.config)
     host = args.host or cfg.gateway.host
-    port = args.port or cfg.gateway.port
+    port = args.port if args.port is not None else ServiceSettingsStore(
+        cfg.gateway.data_dir).load_port(cfg.gateway.port)
+    cfg.gateway.port = port
 
     app = build_app(cfg)
-    uvicorn.run(app, host=host, port=port, reload=args.reload,
-                log_level="info")
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=host, port=port, reload=args.reload,
+        log_level="info", proxy_headers=False))
+    app.state.uvicorn_server = server
+    server.run()
 
 
 if __name__ == "__main__":

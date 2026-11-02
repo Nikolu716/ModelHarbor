@@ -9,22 +9,34 @@ import dataclasses
 import json
 import math
 import time
+from datetime import date
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from ..config import GatewayConfig, StationConfig
+from ..access_control import (
+    AccessControlStore, is_ip_allowed, validate_allowed_ips,
+)
 from ..gateway_settings import (
+    MAX_EVENT_RETENTION,
     GatewaySettingsStore,
+    probe_settings_view,
     retry_settings_view,
+    validate_probe_settings,
     validate_retry_settings,
 )
 from ..health import HealthMonitor
 from ..notifier import Notifier
 from ..state import Registry
 from ..stations import StationStore
-from ..stats import EVENT_MAXLEN, EventLog
+from ..visual_tests import VisualTestStore, VisualTestRunner, VisualTestScheduler, create_visual_test_router
+from ..stats import EVENT_PAGE_MAXLEN, EventLog
+from ..service_settings import (
+    PortUnavailableError, ServiceSettingsStore, check_port_available, validate_port,
+    is_deployment_client, endpoint_view, normalize_public_url,
+)
 
 
 def create_admin_router(registry: Registry, gateway: GatewayConfig,
@@ -32,12 +44,38 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                         notifier: Notifier | None = None,
                         store: StationStore | None = None,
                         settings_store: GatewaySettingsStore | None = None,
-                        juice_registry=None) -> APIRouter:
+                        juice_registry=None,
+                        access_store: AccessControlStore | None = None,
+                        inactive=None,
+                        service_store: ServiceSettingsStore | None = None,
+                        restart_service=None, visual_scheduler=None) -> APIRouter:
     api = APIRouter(prefix="/admin", tags=["admin"])
     station_fields = {f.name for f in dataclasses.fields(StationConfig)} - {"name"}
     retry_store = settings_store or (
         GatewaySettingsStore(gateway.data_dir) if gateway is not None else None
     )
+    access_store = access_store or (
+        AccessControlStore(gateway.data_dir) if gateway is not None else None
+    )
+    service_store = service_store or (
+        ServiceSettingsStore(gateway.data_dir) if gateway is not None else None
+    )
+    visual_store = (visual_scheduler.store if visual_scheduler else VisualTestStore(gateway.data_dir)) if gateway is not None else None
+    visual_runner = None
+    if visual_store is not None:
+        visual_runner = visual_scheduler.runner if visual_scheduler else VisualTestRunner(registry, gateway, visual_store)
+        visual_scheduler = visual_scheduler or VisualTestScheduler(registry, visual_runner, visual_store)
+        api.include_router(create_visual_test_router(registry, gateway, visual_store, visual_runner, visual_scheduler))
+
+    def _require_deployment_client(request: Request) -> None:
+        host = request.client.host if request.client else None
+        if not is_deployment_client(host):
+            raise HTTPException(403, "服务设置仅允许从部署机器操作")
+
+    @api.get("/capabilities")
+    async def capabilities(request: Request):
+        return {"can_manage_service": is_deployment_client(
+            request.client.host if request.client else None)}
 
     def _persist(stations: list[StationConfig]) -> bool:
         """Persist the complete station set before reporting success."""
@@ -106,15 +144,20 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                 isinstance(cfg.probe_interval, bool)
                 or not isinstance(cfg.probe_interval, (int, float))
                 or not math.isfinite(cfg.probe_interval)
-                or cfg.probe_interval <= 0):
-            raise HTTPException(400, "探测间隔必须大于 0")
-        for field in ("probe_models", "probe_chat", "probe_balance", "enabled"):
+                or not 300 <= cfg.probe_interval <= 86400):
+            raise HTTPException(400, "站点检查间隔必须在 300 到 86400 秒之间")
+        for field in ("priority_auto", "probe_models", "probe_chat", "probe_balance", "enabled"):
             if not isinstance(getattr(cfg, field), bool):
                 raise HTTPException(400, f"{field} 必须是布尔值")
         for field in ("probe_path", "probe_chat_path"):
             value = getattr(cfg, field)
             if not isinstance(value, str) or not value.strip() or len(value) > 256:
                 raise HTTPException(400, f"{field} 必须是有效路径")
+        if (not isinstance(cfg.probe_chat_model, str)
+                or len(cfg.probe_chat_model) > 200
+                or any(ord(char) < 32 or ord(char) == 127
+                       for char in cfg.probe_chat_model)):
+            raise HTTPException(400, "生成探测模型名称无效")
         if not isinstance(cfg.headers, dict) or len(cfg.headers) > 100 or any(
                 not isinstance(key, str) or not key or len(key) > 256
                 or any(not char.isascii()
@@ -131,6 +174,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             name=normalized_name,
             base_url=base_url,
             api_key=cfg.api_key.strip(),
+            probe_chat_model=cfg.probe_chat_model.strip(),
             models=models,
         )
 
@@ -144,8 +188,25 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             "name": cfg.name,
             "base_url": cfg.base_url,
             "models": list(cfg.models),
+            "model_routing": cfg.model_routing,
+            "route_models": list(cfg.route_models),
+            "provider": cfg.provider,
+            "opencode_plan": cfg.opencode_plan,
+            "go_usage": st.go_usage_view(),
+            "model_api_paths": st.protocol_view(),
+            "model_unavailable": dict(st.model_unavailable),
             "detected_models": sorted(st.probed_models),
+            "probe_model_candidates": st.probe_model_candidates,
+            "generation_probe": st.generation_probe_view(),
+            "effective_models": sorted(st.effective_models),
+            "accepts_any_model": st.accepts_any_model,
+            "model_discovery": st.model_discovery_view(),
             "priority": cfg.priority,
+            "priority_auto": cfg.priority_auto,
+            "priority_bias": st.priority_bias,
+            "health_score": runtime["health_score"],
+            "health_score_breakdown": runtime["health_score_breakdown"],
+            "rank": runtime["rank"],
             "weight": cfg.weight,
             "timeout": cfg.timeout,
             "max_concurrency": cfg.max_concurrency,
@@ -153,11 +214,15 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             "enabled": st.enabled,
             "probe_models": cfg.probe_models,
             "probe_chat": cfg.probe_chat,
+            "probe_chat_model": cfg.probe_chat_model,
+            "probe_interval": cfg.probe_interval,
             "probe_chat_path": cfg.probe_chat_path,
             "has_api_key": bool(cfg.api_key),
             "status": runtime["status"],
+            "protection": runtime["protection"],
             "quota_exhausted": runtime["quota_exhausted"],
             "last_probe_ok": runtime["last_probe_ok"],
+            "last_probe_kind": runtime["last_probe_kind"],
             "last_probe_error": runtime["last_probe_error"],
         }
 
@@ -165,6 +230,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
     async def status():
         # 事件由独立分页接口读取，避免 3 秒状态轮询重复传输日志。
         snap = registry.snapshot()
+        snap["statistics_storage"] = eventlog.storage_view()
         # 合并今日每站缓存命中率（监控列表"缓存命中"列数据源）
         try:
             daily = eventlog.daily_stats()
@@ -195,6 +261,39 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             traceback.print_exc()
         return snap
 
+    def access_settings_view(request: Request) -> dict:
+        return {
+            "allowed_ips": list(gateway.allowed_ips),
+            "always_allowed_ips": [],
+            "client_ip": request.client.host if request.client else None,
+        }
+
+    @api.get("/settings/access")
+    async def get_access_settings(request: Request):
+        if gateway is None:
+            raise HTTPException(503, "网关访问设置暂不可用")
+        return access_settings_view(request)
+
+    @api.put("/settings/access")
+    async def update_access_settings(request: Request, body: dict):
+        if gateway is None or access_store is None:
+            raise HTTPException(503, "网关访问设置暂不可用")
+        if set(body) != {"allowed_ips"}:
+            raise HTTPException(400, "请仅提交 allowed_ips 列表")
+        try:
+            values = validate_allowed_ips(body["allowed_ips"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        host = request.client.host if request.client else None
+        if not is_ip_allowed(host, values):
+            raise HTTPException(400, "请保留当前访问 IP，避免保存后失去访问权限")
+        try:
+            access_store.save(values)
+        except OSError as exc:
+            raise HTTPException(500, "白名单保存失败，请稍后重试") from exc
+        gateway.allowed_ips = values
+        return {**access_settings_view(request), "persisted": True}
+
     @api.get("/settings/retry")
     async def get_retry_settings():
         """Return the live retry policy without gateway keys or other secrets."""
@@ -224,13 +323,135 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             setattr(gateway, field, value)
         return {**values, "persisted": True}
 
+    @api.get("/settings/probe")
+    async def get_probe_settings():
+        if gateway is None:
+            raise HTTPException(503, "网关探测设置暂不可用")
+        return probe_settings_view(gateway)
+
+    @api.put("/settings/probe")
+    async def update_probe_settings(body: dict):
+        if gateway is None or retry_store is None:
+            raise HTTPException(503, "网关探测设置暂不可用")
+        try:
+            values = validate_probe_settings(
+                body,
+                current=probe_settings_view(gateway),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            retry_store.save_probe(values)
+        except OSError as exc:
+            raise HTTPException(500, "探测设置保存失败，请稍后重试") from exc
+        for field, value in values.items():
+            setattr(gateway, field, value)
+        return {**values, "persisted": True}
+
+    @api.get("/settings/logs")
+    async def get_log_settings():
+        if retry_store is None:
+            raise HTTPException(503, "日志设置暂不可用")
+        return {
+            "event_retention": eventlog.maxlen,
+            "min_event_retention": 100,
+            "max_event_retention": MAX_EVENT_RETENTION,
+            "storage": eventlog.storage_view(),
+        }
+
+    @api.put("/settings/logs")
+    async def update_log_settings(body: dict):
+        if retry_store is None:
+            raise HTTPException(503, "日志设置暂不可用")
+        if set(body) != {"event_retention"}:
+            raise HTTPException(400, "请只提供 event_retention 字段")
+        value = body.get("event_retention")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HTTPException(400, "event_retention 必须是整数")
+        if not 100 <= value <= MAX_EVENT_RETENTION:
+            raise HTTPException(400, "保留条数必须在 100 到 10000 之间")
+        try:
+            retry_store.save_logs(value)
+        except OSError as exc:
+            raise HTTPException(500, "日志保留设置保存失败") from exc
+        eventlog.set_limit(value)
+        saved = eventlog.persist()
+        if not saved:
+            raise HTTPException(503, "留存上限已保存，但统计文件暂时不可写；" + eventlog.storage_view()["message"])
+        return {"event_retention": value, "persisted": True, "storage": eventlog.storage_view()}
+
+    @api.get("/settings/endpoint")
+    async def get_endpoint_settings(request: Request):
+        return endpoint_view(gateway, service_store, request)
+
+    @api.put("/settings/endpoint")
+    async def update_endpoint_settings(request: Request, body: dict):
+        _require_deployment_client(request)
+        if service_store is None:
+            raise HTTPException(503, "服务设置暂不可用")
+        if set(body) != {"public_url"}:
+            raise HTTPException(400, "请只提供 public_url 字段")
+        try:
+            service_store.save_public_url(normalize_public_url(body["public_url"]))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(500, "接入地址保存失败") from exc
+        return {**endpoint_view(gateway, service_store, request), "persisted": True}
+
+    @api.get("/settings/service")
+    async def get_service_settings(request: Request):
+        _require_deployment_client(request)
+        if service_store is None:
+            raise HTTPException(503, "服务设置暂不可用")
+        return {
+            "port": service_store.load_port(gateway.port),
+            "active_port": gateway.port,
+        }
+
+    @api.put("/settings/service")
+    async def update_service_settings(request: Request, body: dict):
+        _require_deployment_client(request)
+        if service_store is None:
+            raise HTTPException(503, "服务设置暂不可用")
+        if set(body) != {"port"}:
+            raise HTTPException(400, "请只提供 port 字段")
+        try:
+            port = validate_port(body.get("port"))
+            if port != gateway.port:
+                check_port_available(port, gateway.host)
+            service_store.save_port(port)
+        except PortUnavailableError as exc:
+            raise HTTPException(409, "该端口已被占用或无法绑定，请选择其他端口") from exc
+        except ValueError as exc:
+            raise HTTPException(400, "端口必须是 1 到 65535 之间的整数") from exc
+        except OSError as exc:
+            raise HTTPException(500, "服务端口设置保存失败") from exc
+        return {
+            "port": port,
+            "active_port": gateway.port,
+            "restart_required": port != gateway.port,
+            "persisted": True,
+        }
+
+    @api.post("/service/restart", status_code=202)
+    async def restart_gateway_service(request: Request):
+        _require_deployment_client(request)
+        if restart_service is None or not restart_service():
+            raise HTTPException(503, "当前进程无法通过服务管理器重启")
+        return {"scheduled": True}
+
     @api.get("/activity/stream")
     async def activity_stream(request: Request):
         """Push current route changes immediately; status polling is fallback."""
+        activation_ended = inactive() if callable(inactive) else inactive
         async def events():
             subscriber_id, queue = registry.subscribe_route_activity()
             try:
                 while True:
+                    if activation_ended is not None and activation_ended.is_set():
+                        yield 'event: account_changed\ndata: {}\n\n'
+                        break
                     try:
                         snapshot = await asyncio.wait_for(queue.get(), timeout=15.0)
                     except asyncio.TimeoutError:
@@ -267,6 +488,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         _persist(_configs_with(next_cfg))
         st.cfg = next_cfg
         st.enabled = next_cfg.enabled
+        st._update_score()
         if st.enabled:
             # 重新启用后允许立即探测
             st.last_probe_at = 0.0
@@ -289,6 +511,37 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             "error": st.last_probe_error,
         }
 
+    @api.post("/station/{name}/models/refresh")
+    async def refresh_models(name: str):
+        st = registry.get(name)
+        if st is None:
+            raise HTTPException(404, "站点不存在")
+        if not st.enabled or not st.cfg.probe_models:
+            raise HTTPException(400, "请先启用站点并开启自动发现模型")
+        await monitor.discover_models(st, manual=True)
+        return {"name": name, "detected_models": sorted(st.probed_models),
+                "model_discovery": st.model_discovery_view()}
+
+    @api.post("/station/{name}/go-usage/refresh")
+    async def refresh_go_usage(name: str):
+        st = registry.get(name)
+        if st is None:
+            raise HTTPException(404, "站点不存在")
+        if st.cfg.provider != "opencode" or st.cfg.opencode_plan != "go":
+            raise HTTPException(400, "本站未使用 Go 订阅")
+        if not st.enabled:
+            raise HTTPException(400, "站点已停用，仅显示缓存用量")
+        return await monitor.refresh_go_usage(st, manual=True)
+
+    @api.post("/station/{name}/generation-probe")
+    async def generation_probe(name: str):
+        st = registry.get(name)
+        if st is None:
+            raise HTTPException(404, "站点不存在")
+        if not st.enabled:
+            raise HTTPException(400, "请先启用站点再进行生成测试")
+        return await monitor.test_generation(st)
+
     @api.post("/station/{name}/reset")
     async def reset(name: str):
         """立即探测额度是否恢复；仍无额度则保持排除并继续自动探测。
@@ -303,7 +556,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             st.reset_quota()
             recovered = True
         else:
-            recovered = await monitor.probe_quota_recovery(st)
+            recovered = await monitor.probe_quota_recovery(st, manual=True)
         print(f"[admin] {name} 额度探测: "
               f"{'已恢复' if recovered else '仍无额度，继续自动探测'}")
         if recovered and notifier is not None:
@@ -320,8 +573,12 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
     @api.get("/logs")
     async def logs(
         page: int = Query(1, ge=1),
-        page_size: int = Query(50, ge=1, le=EVENT_MAXLEN),
+        page_size: int = Query(50, ge=1, le=EVENT_PAGE_MAXLEN),
         tail: int | None = Query(None),
+        ip: str | None = Query(None, max_length=64),
+        model: str | None = Query(None, max_length=256),
+        date_from: date | None = Query(None),
+        date_to: date | None = Query(None),
     ):
         """Paginate retained events, newest first.
 
@@ -331,13 +588,37 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         """
         if tail is not None:
             page = 1
-            page_size = max(1, min(tail, EVENT_MAXLEN))
-        return eventlog.paginated(page=page, page_size=page_size)
+            page_size = max(1, min(tail, EVENT_PAGE_MAXLEN))
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(400, "date_from must not be after date_to")
+        return eventlog.paginated(
+            page=page, page_size=page_size, ip=ip, model=model,
+            date_from=date_from, date_to=date_to)
+
+    @api.get("/logs/analytics")
+    async def logs_analytics(
+        date_from: date | None = Query(None),
+        date_to: date | None = Query(None),
+        ip: str | None = Query(None, max_length=64),
+        model: str | None = Query(None, max_length=256),
+        group_by: str = Query("ip"),
+    ):
+        try:
+            return eventlog.log_analytics(
+                date_from=date_from, date_to=date_to, ip=ip,
+                model=model, group_by=group_by)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @api.get("/stats/daily")
     async def stats_daily():
         """今日统计：各站使用占比 + 按小时时间线（甘特图数据源）。"""
         return eventlog.daily_stats()
+
+    @api.get("/stats/history")
+    async def stats_history(days: int = Query(365, ge=1, le=365)):
+        """Bounded daily usage history for charts; no cost is inferred."""
+        return eventlog.daily_history(days)
 
     # ---------------- 动态站点管理（用户自己配置，实时生效） ----------------
     @api.get("/stations")
@@ -346,13 +627,30 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         runtime = {item["name"]: item for item in registry.snapshot()["stations"]}
         states = sorted(
             registry.states.values(),
-            key=lambda item: (item.cfg.priority, item.cfg.name.casefold()),
+            key=lambda item: (
+                runtime[item.cfg.name]["rank"] is None,
+                runtime[item.cfg.name]["rank"] or 100000,
+                item.cfg.name.casefold(),
+            ),
         )
-        return [_station_view(st, runtime[st.cfg.name]) for st in states]
+        visual_results = visual_store.summaries(registry) if visual_store else {}
+        visual_plans = visual_store.schedules() if visual_store else {}
+        return [_station_view(st, runtime[st.cfg.name]) | {"visual_test": visual_results.get(st.cfg.name),
+                "visual_running": bool(visual_runner and st.cfg.name in visual_runner.busy),
+                "visual_job": visual_runner.job(st.cfg.name, summary=True) if visual_runner else None,
+                "visual_model": (visual_runner.job(st.cfg.name) or {}).get("settings", {}).get("model")
+                    if visual_runner and (visual_runner.job(st.cfg.name) or {}).get("state") == "running"
+                    else (visual_plans.get(st.cfg.name, {}).get("settings") or {}).get("model"),
+                "visual_schedule": {key: visual_plans.get(st.cfg.name, {}).get(key) for key in ("enabled", "paused_reason")}}
+                for st in states]
 
     @api.post("/stations", status_code=201)
     async def add_station(body: dict):
         """新增站点（实时生效 + 持久化）。"""
+        body = dict(body)
+        body.setdefault("probe_models", True)
+        body.setdefault("model_routing", "catalog")
+        body.setdefault("priority_auto", "priority" not in body)
         cfg = _validated_station(body.get("name"), _station_body(body))
         name = cfg.name
         if any(existing.casefold() == name.casefold()
@@ -409,7 +707,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                 "unchanged": True,
             }
         transport_fields = {
-            "base_url", "api_key", "headers", "timeout", "max_concurrency",
+            "base_url", "api_key", "headers", "timeout", "max_concurrency", "provider", "opencode_plan",
         }
         if transport_fields.intersection(normalized_changes):
             activity = registry.route_activity_snapshot()
@@ -450,8 +748,11 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         remaining = [cfg for cfg in registry.stations if cfg.name != name]
         persisted = _persist(remaining)
         registry.remove_station(name)
+        if visual_store:
+            visual_store.delete_result(name)
+            visual_store.delete_schedule(name)
         if juice_registry is not None:
-            active = {s.cfg.name for s in registry.stations}
+            active = {s.name for s in registry.stations}
             juice_registry.prune(active_stations=active)
         print(f"[admin] 删除站点: {name}")
         return {

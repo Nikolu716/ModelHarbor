@@ -1,8 +1,8 @@
-"""中转站智能网关 - 系统托盘管理（轻量化 ~30MB）。
+"""ModelHarbor 模型网关 - 系统托盘管理（轻量化 ~30MB）。
 
 功能：托盘图标 + 右键菜单
   - 双击/菜单打开管理面板（仪表盘网页）
-  - 服务状态提示（NSSM 服务 ZGateway + 网关健康）
+  - 服务状态提示（NSSM 服务 ModelHarbor + 网关健康）
   - 服务管理：重启 / 停止 / 启动
   - 开机自启开关（注册表 HKCU Run，随系统启动）
 
@@ -10,6 +10,7 @@
 """
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import winreg
@@ -18,13 +19,44 @@ from pathlib import Path
 import pystray
 from PIL import Image, ImageDraw
 
-DASHBOARD_URL = "http://127.0.0.1:8000/dashboard"
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 NSSM = PROJECT_DIR / "tools" / "nssm-2.24" / "win64" / "nssm.exe"
-SERVICE = "ZGateway"
+SERVICE = "ModelHarbor"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_NAME = "ZGatewayTray"
+RUN_NAME = "ModelHarborTray"
 TRAY_ICON = PROJECT_DIR / "app" / "web" / "static" / "brand-mark-64.png"
+
+
+def service_port() -> int:
+    """Read the configured listener port, including saved service settings."""
+    try:
+        if str(PROJECT_DIR) not in sys.path:
+            sys.path.insert(0, str(PROJECT_DIR))
+        from app.config import load_config
+        from app.service_settings import ServiceSettingsStore
+
+        cfg = load_config(str(PROJECT_DIR / "config.yaml"))
+        data_dir = Path(cfg.gateway.data_dir)
+        if not data_dir.is_absolute():
+            data_dir = PROJECT_DIR / data_dir
+        return ServiceSettingsStore(str(data_dir)).load_port(cfg.gateway.port)
+    except (OSError, ValueError, ImportError):
+        return 8000
+
+
+def dashboard_url() -> str:
+    try:
+        if str(PROJECT_DIR) not in sys.path:
+            sys.path.insert(0, str(PROJECT_DIR))
+        from app.config import load_config
+        from app.service_settings import local_service_url
+
+        cfg = load_config(str(PROJECT_DIR / "config.yaml"))
+        if not Path(cfg.gateway.data_dir).is_absolute():
+            cfg.gateway.data_dir = str(PROJECT_DIR / cfg.gateway.data_dir)
+        return local_service_url(cfg.gateway) + "/dashboard"
+    except (OSError, ValueError, ImportError, sqlite3.Error):
+        return f"http://127.0.0.1:{service_port()}/dashboard"
 
 # 单实例锁：绑定固定端口，第二个实例直接退出
 _LOCK_PORT = 28765
@@ -61,7 +93,8 @@ def service_state() -> str:
 def gateway_ok() -> bool:
     try:
         import urllib.request
-        with urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=3) as r:
+        with urllib.request.urlopen(
+                dashboard_url().removesuffix('/dashboard') + '/healthz', timeout=3) as r:
             return r.status == 200
     except Exception:
         return False
@@ -77,29 +110,30 @@ def nssm(action: str) -> None:
 # 菜单动作
 # ----------------------------------------------------------------------
 def open_dashboard(icon, item=None):
-    os.startfile(DASHBOARD_URL)
+    os.startfile(dashboard_url())
 
 
 def show_status(icon, item=None):
     state = service_state()
     ok = gateway_ok()
+    url = dashboard_url()
     icon.notify(f"服务: {state} | 网关: {'在线' if ok else '离线'}\n"
-                f"管理面板: {DASHBOARD_URL}", "中转站智能网关")
+                f"管理面板: {url}", "ModelHarbor 模型网关")
 
 
 def restart_service(icon, item=None):
     nssm("restart")
-    icon.notify("正在重启服务...", "中转站智能网关")
+    icon.notify("正在重启服务...", "ModelHarbor 模型网关")
 
 
 def stop_service(icon, item=None):
     nssm("stop")
-    icon.notify("正在停止服务...", "中转站智能网关")
+    icon.notify("正在停止服务...", "ModelHarbor 模型网关")
 
 
 def start_service(icon, item=None):
     nssm("start")
-    icon.notify("正在启动服务...", "中转站智能网关")
+    icon.notify("正在启动服务...", "ModelHarbor 模型网关")
 
 
 def _tray_cmd() -> str:
@@ -128,7 +162,7 @@ def set_autostart(on: bool) -> None:
 def toggle_autostart(icon, item=None):
     on = not is_autostart()
     set_autostart(on)
-    icon.notify("开机自启已" + ("开启" if on else "关闭"), "中转站智能网关")
+    icon.notify("开机自启已" + ("开启" if on else "关闭"), "ModelHarbor 模型网关")
 
 
 def quit_tray(icon, item=None):
@@ -177,7 +211,7 @@ def build_menu() -> pystray.Menu:
 def main():
     if not _acquire_lock():
         sys.exit(0)  # 已有托盘在运行
-    icon = pystray.Icon("ZGateway", make_icon(), "中转站智能网关",
+    icon = pystray.Icon("ModelHarbor", make_icon(), "ModelHarbor 模型网关",
                         menu=build_menu())
     icon.run()
 

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import re
 import sys
 import tempfile
 import urllib.request
+from urllib.parse import urlencode, urlsplit
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -55,14 +57,28 @@ def verify_static() -> None:
     assert not parser.inline_handlers, f"inline handlers: {parser.inline_handlers}"
     assert parser.inline_style_blocks == 0, "dashboard CSS must remain external"
     assert parser.inline_script_blocks == 0, "dashboard JS must remain external"
-    assert '/static/dashboard.css?v=11' in html
-    assert '/static/dashboard.js?v=11' in html
-    assert '/static/brand-mark.svg?v=2' in html
-    assert '/static/favicon.ico?v=2' in html
-    assert '/static/brand-mark-180.png?v=2' in html
+    assert '/static/dashboard.css?v=39' in html
+    assert '/static/dashboard.js?v=43' in html
+    assert '/static/visual-tests.js?v=11' in html
+    assert '/static/visual-tests.css?v=8' in html
+    assert '/static/analytics.js?v=8' in html
+    assert '/static/brand-logo-source.png?v=4' in html
+    assert '/static/favicon.ico?v=4' in html
+    assert '/static/brand-mark-180.png?v=4' in html
+    assert '统一模型接入与调度' not in html
+    assert '<picture class="brand-picture">' in html
+    assert 'sidebar-footer' not in html
     assert 'class="table-shell event-shell"' in html
     for required_id in (
-        "brandMark", "routeLive", "routeLabel", "routeStation", "routeModel", "routeMeta",
+        "monitorViewport", "monitorPagination", "monitor-history", "cardSections",
+        "stats-models", "stats-today", "stats-cache", "stats-timeline",
+        "stations-list", "stations-editor", "stationsPagination",
+        "stations-tab-retry", "stations-tab-probe", "sf-probe-model-auto",
+        "sf-probe-current", "sf-effective-policy",
+        "retry-section-switch", "retry-section-rounds", "retry-section-duration",
+        "pageTitle", "summaryStrip", "routingPanel", "station-search", "station-filter",
+        "show-details", "monitor-count", "refreshDashboard", "copyEndpoint",
+        "brandMark", "routeLive", "routeLabel", "routeList", "routeMeta",
         "donut", "donutValue", "donutLabel", "chartInspector",
         "modelBreakdown", "usageTabs", "stationUsageList",
         "cacheWindowTabs", "cacheRankList", "cacheWindowNote", "cache-heading",
@@ -73,9 +89,20 @@ def verify_static() -> None:
         "retry-infinite-rounds", "retry-unlimited-duration", "retry-max-attempts",
         "retry-backoff", "retry-max-rounds", "retry-round-backoff",
         "retry-max-round-backoff", "retry-max-seconds",
+        "access-wrap", "access-form", "access-ips", "access-client",
+        "access-save", "access-reload", "accessSettingsStatus",
+        "service-wrap", "service-form", "service-port", "service-port-state",
+        "serviceSettingsStatus", "service-save", "service-reload", "service-restart",
     ):
         assert required_id in parser.ids, f"missing dashboard id: {required_id}"
 
+    assert 'name="color-scheme" content="light"' in html
+    assert '???' not in html
+    assert "#monitor-wrap:not(.show-details)" in css
+    assert "height:100dvh" in css
+    assert "function fitViewportContent" in js
+    assert "function setSectionTab" in js
+    assert "prefers-reduced-motion" in css
     assert "overflow-x: auto" in css
     assert "repeat(60, minmax" in css
     assert "grid-template-columns: repeat(5, 1fr)" in css
@@ -84,6 +111,10 @@ def verify_static() -> None:
     assert ".usage-tab.is-active" in css
     assert "#events-wrap .event-shell" in css
     assert ".route-live.is-active" in css
+    assert ".route-item-model" in css
+    assert re.search(r"\.route-list\s*\{[^}]*max-height:\s*78px[^}]*overflow:\s*auto", css)
+    assert 'class="event-donut-wrap"><div id="eventBreakdownDonut"' in html
+    assert '<span id="eventDonutCenter" class="event-donut-center"' in html
     assert ".station-table" in css
     assert ".station-manage-actions" in css
     assert ".retry-settings-layout" in css
@@ -110,7 +141,21 @@ def verify_static() -> None:
     assert '$("retry-infinite-rounds").checked' in js
     assert '$("retry-unlimited-duration").checked' in js
     assert "return api(path, method, false, body)" in js
-    assert "page_size=${EVENT_PAGE_SIZE}" in js
+    assert 'new URLSearchParams({' in js
+    assert '/admin/logs?${query.toString()}' in js
+    analytics = (STATIC / "analytics.js").read_text(encoding="utf-8")
+    assert '/admin/logs/analytics?' in analytics
+    assert '/admin/settings/logs' in analytics
+    assert 'id="eventTrendChart"' in html
+    assert '/static/vendor/echarts.min.js?v=5.6.0' in html
+    assert 'id="eventTrendChart" role="img"' in html
+    assert 'type: "line"' in analytics
+    assert 'type: "pie"' in analytics
+    assert "未记录 IP" in analytics and "未记录 IP" in js
+    assert 'id="eventBreakdownDonut"' in html
+    assert 'id="eventIpFilter"' in html
+    assert 'id="eventModelFilter"' in html
+    assert 'id="eventRetentionLimit"' in html
     assert "data-chart-kind" in js
     assert "已统计 Token" in js
     assert "缓存命中率" in js
@@ -184,16 +229,24 @@ def live_json(url: str, key: str) -> dict:
 
 
 def verify_live() -> None:
+    from app.config import GatewayConfig
+    from app.service_settings import local_service_url
+
     config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
     gateway = config.get("gateway", {})
     port = int(gateway.get("port", 8000))
     key = str(gateway.get("admin_key", "") or "")
-    base = f"http://127.0.0.1:{port}"
+    settings = GatewayConfig.from_dict(gateway)
+    data_dir = Path(settings.data_dir)
+    settings.data_dir = str(data_dir if data_dir.is_absolute() else ROOT / data_dir)
+    base = local_service_url(settings)
 
     for asset in (
-        "index.html", "dashboard.css?v=11", "dashboard.js?v=11",
-        "brand-mark.svg?v=2", "brand-mark-64.png?v=1",
-        "brand-mark-180.png?v=2", "favicon.ico?v=2",
+        "index.html", "dashboard.css?v=39", "dashboard.js?v=43", "analytics.js?v=8",
+        "visual-tests.js?v=11", "visual-tests.css?v=8",
+        "vendor/echarts.min.js?v=5.6.0",
+        "brand-logo-source.png?v=4", "brand-mark-180.png?v=4",
+        "brand-mark-512.png?v=4", "favicon.ico?v=4",
     ):
         with urllib.request.urlopen(f"{base}/static/{asset}", timeout=10) as response:
             assert response.status == 200, f"{asset}: {response.status}"
@@ -207,6 +260,29 @@ def verify_live() -> None:
     status = live_json(f"{base}/admin/status", key)
     managed_stations = live_json(f"{base}/admin/stations", key)
     stats = live_json(f"{base}/admin/stats/daily", key)
+    history = live_json(f"{base}/admin/stats/history?days=365", key)
+    log_settings = live_json(f"{base}/admin/settings/logs", key)
+    log_analytics = live_json(f"{base}/admin/logs/analytics?group_by=ip", key)
+    endpoint = live_json(f"{base}/admin/settings/endpoint", key)
+    assert {"public_url", "endpoint", "port", "source", "candidates"} <= set(endpoint)
+    if endpoint["endpoint"]:
+        parsed_endpoint = urlsplit(endpoint["endpoint"])
+        assert parsed_endpoint.scheme in {"http", "https"}
+        assert parsed_endpoint.path.endswith("/v1")
+        assert parsed_endpoint.hostname not in {"localhost", "0.0.0.0", "::"}
+        try:
+            address = ipaddress.ip_address(parsed_endpoint.hostname)
+        except ValueError:
+            pass
+        else:
+            assert not address.is_loopback and not address.is_unspecified
+        if endpoint["source"] == "local_interface":
+            assert parsed_endpoint.port == endpoint["port"]
+    else:
+        assert endpoint["source"] == "needs_configuration"
+    assert len(history["daily"]) == 365
+    assert history["daily"][-1]["date"] == stats["date"]
+    assert isinstance(history["models"], list)
     logs = live_json(f"{base}/admin/logs?page=1&page_size=20", key)
     assert isinstance(status.get("stations"), list)
     assert isinstance(managed_stations, list)
@@ -221,9 +297,35 @@ def verify_live() -> None:
     assert isinstance(stats.get("cache_compare"), dict)
     assert {"hour", "best_hour", "today", "d7", "d31"} <= set(
         (stats.get("cache_compare") or {}).get("windows") or {})
-    assert {"events", "total", "page", "page_size", "pages", "max_events"} <= set(logs)
+    assert {"events", "total", "page", "page_size", "pages", "max_events",
+            "retained_events"} <= set(logs)
     assert logs["page"] == 1 and logs["page_size"] == 20
-    assert len(logs["events"]) <= 20 and logs["max_events"] <= 500
+    assert len(logs["events"]) <= 20
+    assert 100 <= log_settings["event_retention"] <= log_settings["max_event_retention"]
+    assert logs["max_events"] == log_settings["event_retention"]
+    assert log_analytics["retained_events"] == logs["retained_events"]
+    assert log_analytics["max_events"] == log_settings["event_retention"]
+    assert isinstance(log_analytics.get("daily"), list)
+    assert isinstance(log_analytics.get("breakdown"), list)
+    assert isinstance(log_analytics.get("ips"), list)
+    assert isinstance(log_analytics.get("models"), list)
+    assert isinstance(log_analytics.get("ip_models"), list)
+    assert 0 <= log_analytics["ip_reports"] <= log_analytics["calls"]
+    assert 0 <= log_analytics["usage_reports"] <= log_analytics["calls"]
+    for collection in ("daily", "breakdown", "ip_models"):
+        for metric in ("calls", "failures", "tokens", "usage_reports"):
+            assert sum(row[metric] for row in log_analytics[collection]) == log_analytics[metric]
+    for row in log_analytics["ip_models"]:
+        assert {"ip", "model", "calls", "failures", "tokens", "usage_reports"} <= set(row)
+        assert 0 <= row["usage_reports"] <= row["calls"]
+    if log_analytics["ip_models"]:
+        sample = log_analytics["ip_models"][0]
+        query = urlencode({"ip": sample["ip"], "model": sample["model"], "group_by": "model"})
+        filtered = live_json(f"{base}/admin/logs/analytics?{query}", key)
+        assert all(row["ip"] == sample["ip"] and row["model"] == sample["model"]
+                   for row in filtered["ip_models"])
+        assert sum(row["calls"] for row in filtered["ip_models"]) == filtered["calls"]
+    assert all("client_ip" in event for event in logs["events"])
     for station in stats["stations"]:
         assert isinstance(station.get("models"), list)
         assert "tokens" in station and "calls" in station
@@ -232,8 +334,13 @@ def verify_live() -> None:
     for station in managed_stations:
         assert {
             "name", "base_url", "models", "priority", "billing", "enabled",
-            "status", "probe_models", "probe_chat", "has_api_key",
+            "status", "probe_models", "probe_chat", "priority_auto",
+            "priority_bias", "detected_models", "effective_models",
+            "model_discovery", "rank", "has_api_key", "provider", "model_routing",
+            "route_models", "model_api_paths", "model_unavailable",
         } <= set(station)
+        assert isinstance(station["detected_models"], list)
+        assert isinstance(station["model_discovery"], dict)
         assert "api_key" not in station
 
     stream_headers = {"Accept": "text/event-stream"}

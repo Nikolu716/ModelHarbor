@@ -32,3 +32,16 @@ provider responses in a report.
   capture, unencrypted archive, or untrusted HTTP request.
 - Review the upstream provider terms and authorization before forwarding any
   request through the gateway.
+
+## Intended use and isolation
+
+ModelHarbor is intended for personal use and small groups of trusted users.
+Account switching selects the globally active configuration; it is not a
+multi-tenant authorization system. An admin-key holder can manage all accounts.
+Strict permission boundaries and isolated test execution require further
+development and review before use with untrusted tenants or public users.
+
+IP access rules use the TCP peer address, not forwarded headers. A local reverse
+proxy can make remote requests appear local, including to deployment-only service
+settings. Enforce source restrictions and admin access at the proxy itself.
+Preview restrictions do not replace a hardened execution sandbox.

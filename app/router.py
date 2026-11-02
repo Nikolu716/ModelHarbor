@@ -21,16 +21,16 @@ class Router:
         self.registry = registry
         self.gateway = gateway
 
-    def candidates(self, model: str) -> list[StationState]:
+    def candidates(self, model: str, path: str | None = None) -> list[StationState]:
         """返回可路由候选站列表（已过滤不健康/不支持模型的站）。"""
-        return self.registry.candidates_for(model)
+        return self.registry.candidates_for(model, path)
 
-    def pick(self, model: str) -> list[StationState]:
+    def pick(self, model: str, path: str | None = None) -> list[StationState]:
         """按动态健康评分排序，评分相近的站按权重+延迟加权随机。
 
         无需手工配置优先级：系统根据实时健康自动排列（托管模式）。
         """
-        cands = self.candidates(model)
+        cands = self.candidates(model, path)
         if len(cands) <= 1:
             return cands
 
@@ -46,7 +46,8 @@ class Router:
                 ordered.append(group[0])
             else:
                 # 有效权重 = 配置权重 / (1 + 延迟秒数)：同健康度下更快、更重的站靠前
-                lat = {st.cfg.name: (st.ema_latency or 999.0) for st in group}
+                lat = {st.cfg.name: (st.ema_latency if st.ema_latency is not None
+                                    else 999.0) for st in group}
                 w = [st.cfg.weight / (1.0 + lat[st.cfg.name]) for st in group]
                 total = sum(w)
                 ordered.append(_weighted_choice(group, [x / total for x in w]))

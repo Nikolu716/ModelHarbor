@@ -1,93 +1,93 @@
-<!doctype html>
-<html lang="zh-CN">
-<head>
+<!DOCTYPE html><html lang="zh-CN"><head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#090909">
-  <title>中转站智能网关 · 控制台</title>
-  <link rel="icon" href="/static/brand-mark.svg?v=2" type="image/svg+xml">
-  <link rel="icon" href="/static/favicon.ico?v=2" sizes="any">
-  <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=2">
-  <link rel="stylesheet" href="/static/dashboard.css?v=6">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f5f5f7">
+  <title>运行概览 · ModelHarbor</title>
+  <link rel="icon" href="/static/brand-mark-512.png?v=4" type="image/png">
+  <link rel="icon" href="/static/favicon.ico?v=4" sizes="any">
+  <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=4">
+  <link rel="stylesheet" href="/static/dashboard.css?v=39">
+  <link rel="stylesheet" href="/static/visual-tests.css?v=8">
+  <link rel="stylesheet" href="/static/selects.css?v=1">
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳转到主内容</a>
   <div class="app-shell">
-    <header class="topbar">
-      <div class="brand-lockup">
-        <img class="brand-mark" id="brandMark" src="/static/brand-mark.svg?v=2" alt="" width="34" height="34">
-        <div class="brand-copy">
-          <span class="brand-kicker">RELAY CONTROL</span>
-          <h1>中转站智能网关</h1>
-        </div>
-      </div>
-      <div class="sync-state" id="syncState" role="status" aria-live="polite">
-        <span class="sync-dot" aria-hidden="true"></span>
-        <span id="syncText">正在同步</span>
-      </div>
-    </header>
-
-    <div class="system-line">
-      <p class="system-meta" id="sub">正在连接网关</p>
-      <div class="route-live" id="routeLive" role="status" aria-live="polite">
-        <span class="route-dot" aria-hidden="true"></span>
-        <span class="route-label" id="routeLabel">当前路由</span>
-        <strong class="route-station" id="routeStation">等待首次路由</strong>
-        <span class="route-model" id="routeModel"></span>
-        <span class="route-meta" id="routeMeta"></span>
-      </div>
-    </div>
-
-    <section class="summary-strip" aria-label="网关概览">
-      <article class="metric">
-        <span class="metric-label">在线站点</span>
-        <strong class="metric-value" id="s-online">-</strong>
-      </article>
-      <article class="metric">
-        <span class="metric-label">累计调用</span>
-        <strong class="metric-value" id="s-calls">-</strong>
-      </article>
-      <article class="metric">
-        <span class="metric-label">故障切换</span>
-        <strong class="metric-value" id="s-switch">-</strong>
-      </article>
-      <article class="metric">
-        <span class="metric-label">整体成功率</span>
-        <strong class="metric-value" id="s-rate">-</strong>
-      </article>
-    </section>
-
-    <div class="control-row">
-      <nav class="primary-tabs" role="tablist" aria-label="数据范围">
-        <button id="tab-monitor" class="tab-button is-active" type="button" role="tab"
-                aria-selected="true" aria-controls="monitor-wrap" data-tab="monitor">实时监控</button>
-        <button id="tab-stats" class="tab-button" type="button" role="tab"
-                aria-selected="false" aria-controls="stats-wrap" data-tab="stats">今日统计</button>
-        <button id="tab-stations" class="tab-button" type="button" role="tab"
-                aria-selected="false" aria-controls="stations-wrap" data-tab="stations">站点管理</button>
-        <button id="tab-retry" class="tab-button" type="button" role="tab"
-                aria-selected="false" aria-controls="retry-wrap" data-tab="retry">重试设置</button>
-        <button id="tab-events" class="tab-button" type="button" role="tab"
-                aria-selected="false" aria-controls="events-wrap" data-tab="events">最近事件</button>
+    <aside class="sidebar" aria-label="主导航">
+      <a class="brand-lockup" href="/dashboard" aria-label="ModelHarbor 首页"><picture class="brand-picture"><source media="(min-width: 621px) and (max-width: 1000px)" srcset="/static/brand-mark-180.png?v=4"><img class="brand-mark" id="brandMark" src="/static/brand-logo-source.png?v=4" alt="ModelHarbor" width="1536" height="1024"></picture></a>
+      <nav class="primary-tabs" role="tablist" aria-label="网关导航" aria-orientation="vertical">
+        <span class="nav-group-label" aria-hidden="true">工作空间</span><button id="tab-monitor" class="tab-button is-active" type="button" role="tab" aria-selected="true" aria-controls="monitor-wrap" data-tab="monitor" aria-label="运行概览" title="运行概览"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg><span>运行概览</span></button>
+        <button id="tab-stats" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="stats-wrap" data-tab="stats" aria-label="用量分析" title="用量分析"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4v16h16M8 15v-4m5 4V7m5 8V4"></path></svg><span>用量分析</span></button>
+        <button id="tab-stations" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="stations-wrap" data-tab="stations" aria-label="站点管理" title="站点管理"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="7" rx="2"></rect><rect x="3" y="14" width="18" height="7" rx="2"></rect><path d="M7 6.5h.01M7 17.5h.01M11 6.5h6m-6 11h6"></path></svg><span>站点管理</span></button>
+        <button id="tab-events" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="events-wrap" data-tab="events" aria-label="请求日志" title="请求日志"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h10l3 3v15H4V3h3m1 5h8m-8 4h8m-8 4h5"></path></svg><span>请求日志</span></button>
+        <span class="nav-group-label nav-group-settings" aria-hidden="true">管理与配置</span>
+        <button id="tab-access" class="tab-button" type="button" role="tab" aria-selected="false" aria-controls="access-wrap" data-tab="access" aria-label="IP 白名单" title="IP 白名单"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 6v6c0 4 4 7 8 9 4-2 8-5 8-9V6Z"></path><path d="m8.5 12 2.5 2.5 4.5-5"></path></svg><span>IP 白名单</span></button>
+        <button id="tab-service" class="tab-button" hidden type="button" role="tab" aria-selected="false" aria-controls="service-wrap" data-tab="service" aria-label="服务设置" title="服务设置"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 17h16"></path><circle cx="9" cy="7" r="2"></circle><circle cx="15" cy="17" r="2"></circle></svg><span>服务设置</span></button>
       </nav>
-
-      <div class="view-switch" id="viewSwitch" role="group" aria-label="站点展示方式">
-        <button id="btn-list" class="view-button is-active" type="button" aria-pressed="true"
-                data-view="list">列表</button>
-        <button id="btn-card" class="view-button" type="button" aria-pressed="false"
-                data-view="card">卡片</button>
-      </div>
-    </div>
-
-    <main>
+    </aside>
+    <div class="workspace">
+      <header class="topbar"><div class="breadcrumb"><span>控制台</span><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"></path></svg><strong id="breadcrumbCurrent">运行概览</strong></div><div class="topbar-tools"><span id="statisticsStorageWarning" class="text-danger" role="status" hidden></span><div class="sync-state" id="syncState" role="status" aria-live="polite"><span class="sync-dot" aria-hidden="true"></span><span id="syncText">正在连接</span></div><span class="topbar-divider"></span><div class="account-switcher">
+        <button id="accountMenuToggle" class="account-avatar account-trigger" type="button" aria-label="账号菜单" aria-expanded="false" aria-controls="accountMenu" disabled>M</button>
+        <div id="accountMenu" class="account-menu" hidden>
+          <div class="account-menu-identity"><span id="accountMenuAvatar" class="account-avatar" aria-hidden="true">M</span><div><strong id="accountMenuName">读取账号…</strong><span id="accountMenuUsername"></span></div></div>
+          <div class="account-menu-caption">切换账号<span>作用于当前网关</span></div>
+          <div id="accountList" class="account-menu-list" aria-label="可切换的账号"></div>
+          <div class="account-menu-footer"><button id="accountEditCurrent" type="button">账号设置</button><button id="accountAdd" type="button">＋ 新建账号</button></div>
+          <p id="accountMenuStatus" class="account-menu-status" role="status" hidden></p>
+        </div>
+      </div></div></header>
+      <div class="page-content" data-active-tab="monitor">
+        <div class="page-heading"><div><span class="page-eyebrow" id="pageEyebrow">OVERVIEW</span><h1 id="pageTitle">运行概览</h1><p class="page-description" id="pageDescription">掌握站点健康、路由动态与服务表现。</p></div><div class="page-actions"><button class="button secondary" id="refreshDashboard" type="button"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"></path></svg><span>刷新</span></button><button class="button primary" id="copyEndpoint" type="button"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V4H4v12h4"></path></svg><span>复制接入地址</span></button></div></div>
+        <section class="summary-strip" id="summaryStrip" aria-label="网关概览">
+      <article class="metric">
+        <div class="metric-top"><span class="metric-label">在线站点</span><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="7" rx="2"></rect><rect x="3" y="14" width="18" height="7" rx="2"></rect><path d="M7 6.5h.01M7 17.5h.01M11 6.5h6m-6 11h6"></path></svg></div>
+        <strong class="metric-value" id="s-online">-</strong>
+      <span class="metric-note">可用站点 / 全部站点</span></article>
+      <article class="metric">
+        <div class="metric-top"><span class="metric-label">累计调用</span><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"></path></svg></div>
+        <strong class="metric-value" id="s-calls">-</strong>
+      <span class="metric-note">网关累计处理请求</span></article>
+      <article class="metric">
+        <div class="metric-top"><span class="metric-label">故障切换</span><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"></path></svg></div>
+        <strong class="metric-value" id="s-switch">-</strong>
+      <span class="metric-note">自动切换至可用站点</span></article>
+      <article class="metric">
+        <div class="metric-top"><span class="metric-label">整体成功率</span><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 4 4L19 6"></path></svg></div>
+        <strong class="metric-value" id="s-rate">-</strong>
+      <span class="metric-note">基于实际调用统计</span></article>
+    </section>
+        <section class="routing-panel" id="routingPanel" aria-label="实时使用情况">
+          <div class="route-live" id="routeLive" role="status" aria-live="polite">
+            <div class="route-overview-head">
+              <span class="route-headline"><span class="route-dot" aria-hidden="true"></span><strong class="route-label" id="routeLabel">当前线路</strong></span>
+              <span class="route-meta" id="routeMeta"></span>
+            </div>
+            <div class="route-list" id="routeList" role="list" aria-label="正在使用的线路和模型">
+              <div class="route-placeholder" role="listitem">等待首次请求</div>
+            </div>
+          </div>
+          <span class="sr-only" id="sub">自动刷新 · 显示进行中与最近一次调用</span>
+        </section>
+            <main id="main-content" tabindex="-1">
       <section id="monitor-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-monitor">
-        <div class="station-grid" id="grid" hidden></div>
-        <div id="list-wrap"></div>
-      </section>
+        <section id="monitor-visual" class="visual-gallery section-panel" data-section-panel="monitor" data-section="visual" role="tabpanel" aria-labelledby="monitor-tab-visual" hidden>
+          <div class="visual-gallery-toolbar"><div><h2>智商测试</h2><span id="visualGalleryStatus">各渠道最近一次生成 · 默认手动测试</span></div><label class="search-field"><span class="sr-only">搜索测试渠道或模型</span><input id="visualGallerySearch" type="search" placeholder="搜索渠道或模型" autocomplete="off"></label></div>
+          <div id="visualGalleryGrid" class="visual-gallery-grid" aria-live="polite"></div>
+          <div class="viewport-pagination"><span id="visualGalleryPage" class="page-info" role="status"></span><div class="pagination-actions"><button id="visualGalleryPrev" class="button secondary" type="button">上一页</button><button id="visualGalleryNext" class="button secondary" type="button">下一页</button></div></div>
+        </section>
 
-      <section id="stats-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stats" hidden>
-        <div class="stats-overview">
-          <section class="stats-section usage-share" aria-labelledby="share-heading">
+
+
+      <div class="section-tabs" data-tab-group="monitor" role="tablist" aria-label="监控视图"><button id="monitor-tab-stations" type="button" class="section-tab" data-section="stations" role="tab" aria-controls="monitor-stations" aria-selected="true" tabindex="0">站点状态</button><button id="monitor-tab-history" type="button" class="section-tab" data-section="history" role="tab" aria-controls="monitor-history" aria-selected="false" tabindex="-1">60 分钟可用性</button></div><div id="monitor-stations" class="monitor-stations section-panel" data-section-panel="monitor" data-section="stations" role="tabpanel" aria-labelledby="monitor-tab-stations"><div class="monitor-toolbar"><div class="monitor-section-title"><div id="stationScopeTabs" class="station-scope-tabs" role="tablist" aria-label="站点启用状态"><button id="station-scope-enabled" type="button" role="tab" aria-controls="monitorViewport" aria-selected="true" tabindex="0" data-station-scope="enabled">已启用<span id="station-enabled-count" class="scope-count">0</span></button><button id="station-scope-disabled" type="button" role="tab" aria-controls="monitorViewport" aria-selected="false" tabindex="-1" data-station-scope="disabled">已停用<span id="station-disabled-count" class="scope-count">0</span></button></div><span class="sr-only" id="monitor-count" role="status" aria-live="polite">—</span></div><div class="monitor-controls"><label class="search-field"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 5 5"></path></svg><span class="sr-only">搜索站点或模型</span><input id="station-search" type="search" placeholder="搜索站点或模型" autocomplete="off"></label><div id="stationHealthFilter"><label class="sr-only" for="station-filter">站点状态筛选</label><select id="station-filter" class="filter-select"><option value="all">全部状态</option><option value="up">正常</option><option value="attention">需要关注</option></select></div><label class="detail-toggle" id="detailToggle"><input id="show-details" type="checkbox">详细指标</label><div class="card-sections" id="cardSections" role="group" aria-label="卡片信息分类" hidden=""><button type="button" data-card-section="overview" aria-pressed="true">概况</button><button type="button" data-card-section="metrics" aria-pressed="false">性能</button><button type="button" data-card-section="details" aria-pressed="false">详情</button></div><div class="view-switch" id="viewSwitch" role="group" aria-label="站点显示方式"><button id="btn-list" class="view-button is-active" type="button" aria-pressed="true" data-view="list"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"></path></svg>列表</button><button id="btn-card" class="view-button" type="button" aria-pressed="false" data-view="card"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg>卡片</button></div></div></div><div id="monitorViewport" class="monitor-viewport" role="tabpanel" aria-labelledby="station-scope-enabled"><div class="station-grid" id="grid" hidden="" data-card-section="overview"></div><div id="list-wrap"></div></div><div class="viewport-pagination" id="monitorPagination" aria-label="列表分页"><span class="page-info" role="status" aria-live="polite"></span><div class="pagination-actions"><button class="button secondary" type="button" data-page-step="-1" aria-label="上一页">上一页</button><button class="button secondary" type="button" data-page-step="1" aria-label="下一页">下一页</button></div></div></div><div id="monitor-history" class="monitor-history section-panel" data-section-panel="monitor" data-section="history" hidden="" role="tabpanel" aria-labelledby="monitor-tab-history"></div></section>
+
+      <section id="stats-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stats" hidden=""><div class="section-tabs" data-tab-group="stats" role="tablist" aria-label="用量分析维度"><button id="stats-tab-trend" type="button" class="section-tab" data-section="trend" role="tab" aria-controls="stats-trend" aria-selected="true" tabindex="0">趋势分析</button><button id="stats-tab-models" type="button" class="section-tab" data-section="models" role="tab" aria-controls="stats-models" aria-selected="false" tabindex="-1">模型用量</button><button id="stats-tab-today" type="button" class="section-tab" data-section="today" role="tab" aria-controls="stats-today" aria-selected="false" tabindex="-1">今日汇总</button><button id="stats-tab-cache" type="button" class="section-tab" data-section="cache" role="tab" aria-controls="stats-cache" aria-selected="false" tabindex="-1">缓存命中</button><button id="stats-tab-timeline" type="button" class="section-tab" data-section="timeline" role="tab" aria-controls="stats-timeline" aria-selected="false" tabindex="-1">小时分布</button></div><section class="stats-section section-panel viewport-surface trend-section" aria-labelledby="stats-tab-trend" id="stats-trend" data-section-panel="stats" data-section="trend" role="tabpanel">
+            <div class="trend-toolbar"><div class="trend-heading"><span class="section-kicker">USAGE ANALYTICS</span><h2>用量趋势</h2><span id="trend-range-note" class="section-note"></span></div><div class="trend-period-controls"><div class="segmented-control" id="trend-periods" role="group" aria-label="统计时间范围"><button type="button" data-trend-period="1" aria-pressed="false">今天</button><button type="button" data-trend-period="7" aria-pressed="false">7 天</button><button type="button" data-trend-period="30" aria-pressed="true">30 天</button><button type="button" data-trend-period="90" aria-pressed="false">90 天</button><button type="button" data-trend-period="365" aria-pressed="false">1 年</button></div><div class="trend-custom-range"><label><span class="sr-only">起始日期</span><input id="trend-from" type="date"></label><span aria-hidden="true">至</span><label><span class="sr-only">结束日期</span><input id="trend-to" type="date"></label><button id="trend-apply" class="button secondary" type="button">应用</button></div></div></div>
+            <div class="trend-kpis" id="trend-kpis" aria-label="所选时间范围统计"></div>
+            <div class="trend-chart-section"><div class="trend-chart-toolbar"><div class="segmented-control" id="trend-metrics" role="group" aria-label="图表指标"><button type="button" data-trend-metric="tokens" aria-pressed="true">Token</button><button type="button" data-trend-metric="calls" aria-pressed="false">请求</button><button type="button" data-trend-metric="failures" aria-pressed="false">失败</button></div><div class="trend-group-controls"><span>拆分维度</span><div class="segmented-control" id="trend-groups" role="group" aria-label="趋势拆分维度"><button type="button" data-trend-group="model" aria-pressed="true">模型</button><button type="button" data-trend-group="station" aria-pressed="false">站点</button><button type="button" data-trend-group="model_station" aria-pressed="false">模型 · 站点</button></div></div></div>
+              <div class="trend-chart-layout"><div class="trend-canvas-wrap"><canvas id="usageTrendChart" aria-label="每日用量堆叠柱状图" role="img"></canvas><div id="trend-tooltip" class="trend-tooltip" hidden role="status" aria-live="polite"></div><div id="trend-empty" class="trend-empty" hidden>所选时间范围暂无统计数据</div></div><div id="trend-legend" class="trend-legend" aria-label="图表拆分明细"></div></div></div>
+            <div class="trend-heatmap-section"><div class="trend-heatmap-heading"><div><h3>用量热力图</h3><span id="trend-heatmap-caption" class="section-note">最近 365 天 · 日 Token</span></div><span id="trend-heatmap-total" class="section-note"></span></div><div id="usageHeatmap" class="trend-heatmap" role="group" aria-label="最近一年每日用量热力图"></div><div class="trend-heatmap-footer"><span>少</span><i class="heat-cell heat-level-0" aria-hidden="true"></i><i class="heat-cell heat-level-1" aria-hidden="true"></i><i class="heat-cell heat-level-2" aria-hidden="true"></i><i class="heat-cell heat-level-3" aria-hidden="true"></i><i class="heat-cell heat-level-4" aria-hidden="true"></i><span>多</span></div></div>
+          </section><section class="stats-section usage-share section-panel viewport-surface" aria-labelledby="stats-tab-models" id="stats-models" data-section-panel="stats" data-section="models" hidden="" role="tabpanel">
             <div class="section-heading compact">
               <div>
                 <span class="section-kicker">TOKEN DISTRIBUTION</span>
@@ -97,8 +97,7 @@
             <div class="usage-tabs" id="usageTabs" role="tablist" aria-label="选择站点"></div>
             <div class="usage-chart" id="usageChartPanel" role="tabpanel">
               <div class="donut-stage">
-                <svg id="donut" class="donut" viewBox="0 0 180 180" role="group"
-                     aria-label="所选站点的模型 Token 用量"></svg>
+                <svg id="donut" class="donut" viewBox="0 0 180 180" role="group" aria-label="所选站点的模型 Token 用量"></svg>
                 <div class="donut-center" aria-hidden="true">
                   <strong id="donutValue">0</strong>
                   <span id="donutLabel">站点 Token</span>
@@ -106,24 +105,19 @@
               </div>
               <div class="usage-detail">
                 <div class="chart-inspector" id="chartInspector" aria-live="polite"></div>
-                <div class="model-breakdown" id="modelBreakdown" aria-label="选中站点的模型明细" hidden></div>
+                <div class="model-breakdown" id="modelBreakdown" aria-label="选中站点的模型明细" hidden=""></div>
               </div>
             </div>
-          </section>
-
-          <section class="stats-section daily-total" aria-labelledby="daily-heading">
+          </section><section class="stats-section daily-total section-panel viewport-surface" aria-labelledby="stats-tab-today" id="stats-today" data-section-panel="stats" data-section="today" hidden="" role="tabpanel">
             <div class="section-heading compact">
               <div>
                 <span class="section-kicker">TODAY</span>
                 <h2 id="daily-heading">今日汇总</h2>
               </div>
             </div>
-            <div class="daily-metrics" id="stats-summary"></div>
-            <div class="station-usage-list" id="stationUsageList" aria-label="各站点 Token 对比"></div>
-          </section>
-        </div>
 
-        <section class="cache-compare-section" aria-labelledby="cache-heading">
+
+          <div class="daily-scroll"><div class="daily-metrics" id="stats-summary"></div><div class="station-usage-list" id="stationUsageList" aria-label="各站点 Token 对比"></div></div></section><section class="cache-compare-section section-panel viewport-surface" aria-labelledby="stats-tab-cache" id="stats-cache" data-section-panel="stats" data-section="cache" hidden="" role="tabpanel">
           <div class="section-heading compact">
             <div>
               <span class="section-kicker">CACHE HIT</span>
@@ -133,9 +127,7 @@
           </div>
           <div class="cache-window-tabs" id="cacheWindowTabs" role="tablist" aria-label="缓存统计窗口"></div>
           <div class="cache-rank-list" id="cacheRankList" aria-label="各站点缓存命中率对比"></div>
-        </section>
-
-        <section class="timeline-section" aria-labelledby="timeline-heading">
+        </section><section class="timeline-section section-panel viewport-surface" aria-labelledby="stats-tab-timeline" id="stats-timeline" data-section-panel="stats" data-section="timeline" hidden="" role="tabpanel">
           <div class="section-heading compact">
             <div>
               <span class="section-kicker">HOURLY LOAD</span>
@@ -151,37 +143,9 @@
               <div id="gantt"></div>
             </div>
           </div>
-        </section>
-      </section>
+        </section></section>
 
-      <section id="stations-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stations" hidden>
-        <div class="stations-layout">
-          <section class="stats-section station-form-panel" aria-labelledby="sf-heading">
-            <div class="section-heading compact">
-              <div><span class="section-kicker">STATION</span>
-                <h2 id="sf-heading">添加 / 编辑站点</h2></div>
-              <button class="button" type="button" id="sf-cancel" hidden>取消编辑</button>
-            </div>
-            <form id="station-form" class="station-form">
-              <div class="form-grid">
-                <label>名称 <input id="sf-name" required autocomplete="off" placeholder="如 station-a"></label>
-                <label>Base URL <input id="sf-base-url" type="url" required autocomplete="url" placeholder="https://api.xxx.com/v1"></label>
-                <label>API Key <input id="sf-api-key" type="password" required autocomplete="new-password" placeholder="your-upstream-key"></label>
-                <label>模型（逗号分隔）<input id="sf-models" placeholder="gpt-5.5, gpt-4o"></label>
-                <label>优先级 <input id="sf-priority" type="number" value="5" min="1"></label>
-                <label>计费模式
-                  <select id="sf-billing"><option value="balance">余额制</option><option value="subscription">订阅制</option></select></label>
-                <label class="checkbox"><input type="checkbox" id="sf-probe-chat"> 真实链路探测</label>
-                <label class="checkbox"><input type="checkbox" id="sf-probe-models"> 探测模型列表</label>
-                <label class="checkbox"><input type="checkbox" id="sf-enabled" checked> 启用</label>
-              </div>
-              <p class="form-status" id="stationFormStatus" role="status" aria-live="polite"></p>
-              <div class="station-form-actions">
-                <button class="button primary" type="submit" id="sf-submit">添加站点</button>
-              </div>
-            </form>
-          </section>
-          <section class="stats-section" aria-labelledby="sl-heading">
+      <section id="stations-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stations" hidden=""><div class="section-tabs" data-tab-group="stations" role="tablist" aria-label="站点管理视图"><button id="stations-tab-list" type="button" class="section-tab" data-section="list" role="tab" aria-controls="stations-list" aria-selected="true" tabindex="0">站点列表</button><button id="stations-tab-editor" type="button" class="section-tab" data-section="editor" role="tab" aria-controls="stations-editor" aria-selected="false" tabindex="-1">添加 / 编辑</button><button id="stations-tab-retry" type="button" class="section-tab" data-section="retry" role="tab" aria-controls="retry-wrap" aria-selected="false" tabindex="-1">账号重试策略</button><button id="stations-tab-probe" type="button" class="section-tab" data-section="probe" role="tab" aria-controls="probe-wrap" aria-selected="false" tabindex="-1">账号探测策略</button></div><section class="stats-section section-panel" aria-labelledby="stations-tab-list" id="stations-list" data-section-panel="stations" data-section="list" role="tabpanel">
             <div class="section-heading compact">
               <div>
                 <span class="section-kicker">MANAGED</span>
@@ -197,38 +161,96 @@
               <thead><tr><th>名称</th><th>地址</th><th>模型</th><th>优先级</th><th>计费</th><th>状态</th><th class="station-actions-col">操作</th></tr></thead>
               <tbody id="stations-body"></tbody>
             </table></div>
+          <div class="viewport-pagination" id="stationsPagination" aria-label="列表分页"><span class="page-info" role="status" aria-live="polite"></span><div class="pagination-actions"><button class="button secondary" type="button" data-page-step="-1" aria-label="上一页">上一页</button><button class="button secondary" type="button" data-page-step="1" aria-label="下一页">下一页</button></div></div></section><section class="stats-section station-form-panel section-panel viewport-surface" aria-labelledby="stations-tab-editor" id="stations-editor" data-section-panel="stations" data-section="editor" hidden="" role="tabpanel">
+            <div class="section-heading compact">
+              <div><span class="section-kicker">站点配置</span>
+                <h2 id="sf-heading">添加 / 编辑站点</h2></div>
+            </div>
+            <form id="station-form" class="station-form">
+              <div class="section-tabs editor-tabs" data-tab-group="editor" role="tablist" aria-label="站点配置分类">
+                <button id="editor-tab-connection" type="button" class="section-tab" data-section="connection" role="tab" aria-selected="true" aria-controls="editor-connection" tabindex="0">连接信息</button>
+                <button id="editor-tab-models" type="button" class="section-tab" data-section="models" role="tab" aria-selected="false" aria-controls="editor-models" tabindex="-1">模型与测试</button>
+                <button id="editor-tab-routing" type="button" class="section-tab" data-section="routing" role="tab" aria-selected="false" aria-controls="editor-routing" tabindex="-1">路由设置</button>
+              </div>
+              <div class="form-grid section-panel" id="editor-connection" data-section-panel="editor" data-section="connection" role="tabpanel" aria-labelledby="editor-tab-connection">
+                <label class="connection-provider">接口类型 <select id="sf-provider"><option value="openai">OpenAI 兼容接口</option><option value="opencode">OpenCode Go</option><option value="anthropic">Anthropic Messages</option><option value="gemini">Google Gemini</option></select></label>
+                <label class="connection-plan" id="sf-opencode-plan-field" hidden>计费入口 <select id="sf-opencode-plan"><option value="go">Go 订阅</option><option value="balance">按量余额 · 独立计费</option></select></label>
+                <label class="connection-name">名称 <input id="sf-name" required="" autocomplete="off" placeholder="如 station-a"></label>
+                <label class="connection-url">Base URL <input id="sf-base-url" type="url" required="" autocomplete="url" placeholder="https://api.xxx.com/v1"></label>
+                <label class="connection-key">API Key <input id="sf-api-key" type="password" required="" autocomplete="new-password" placeholder="your-upstream-key"></label>
+                <p class="routing-note" id="sf-provider-note" hidden>OpenCode 使用对应套餐的官方模型目录与原生接口。</p>
+              </div>
+              <div class="section-panel model-catalog-panel" id="editor-models" data-section-panel="editor" data-section="models" hidden="" role="tabpanel" aria-labelledby="editor-tab-models">
+                <div class="catalog-workspace">
+                  <section class="catalog-main" aria-labelledby="catalog-heading">
+                    <div class="catalog-heading"><div><h3 id="catalog-heading">模型目录 <span id="sf-model-count" class="catalog-count">0</span></h3><p>点击模型，设为本站的连通性探测模型。</p></div><button id="sf-models-refresh" class="button secondary" type="button" disabled>刷新列表</button></div>
+                    <div class="catalog-discovery"><label class="checkbox"><input type="checkbox" id="sf-probe-models" checked> 自动发现模型</label><span id="sf-models-status" class="catalog-status" role="status" aria-live="polite">保存并启用站点后自动发现模型。</span></div>
+                    <label class="catalog-interval">目录刷新间隔（秒）<input id="sf-probe-interval" type="number" min="300" max="86400" step="60" placeholder="使用账号默认"><small id="sf-directory-effective">只读取元数据，不生成内容；最短 300 秒。</small></label>
+                    <label class="catalog-search"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"></circle><path d="m16 16 5 5"></path></svg><span class="sr-only">搜索模型</span><input id="sf-model-search" type="search" placeholder="搜索模型名称…" autocomplete="off"></label>
+                    <div id="sf-model-list" class="catalog-list" aria-label="发现的模型列表"></div>
+                    <p class="catalog-note">点击模型即可设为本站探测模型。目录只读取模型列表，不会逐个发送生成请求。</p>
+                  </section>
+                  <aside class="catalog-selection" aria-labelledby="catalog-probe-heading">
+                    <span class="catalog-eyebrow">本站探测模型</span><h3 id="catalog-probe-heading">连通性测试</h3>
+                    <label class="settings-toggle catalog-auto-toggle" for="sf-probe-model-auto"><span class="settings-toggle-label">自动使用列表第一个模型</span><input id="sf-probe-model-auto" type="checkbox" checked><span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span></label>
+                    <div class="catalog-current"><span id="sf-probe-mode-label">自动选择</span><strong id="sf-probe-current">等待模型列表</strong><small id="sf-probe-save-state" role="status" aria-live="polite"></small></div>
+                    <select id="sf-probe-chat-model" hidden><option value="">自动</option></select>
+                    <p class="catalog-footnote">选择后点击「保存修改」生效。生成测试可能计费。</p>
+                    <div class="site-test-controls">
+                      <label class="checkbox"><input type="checkbox" id="sf-probe-chat"> 本站参与后台生成测试</label>
+                      <p id="sf-effective-policy" class="effective-policy" role="status">正在读取账号策略…</p>
+                      <button id="sf-account-policy" class="policy-link" type="button">查看账号探测策略 →</button>
+                      <div class="probe-test-row"><button id="sf-generation-test" class="button secondary" type="button" disabled>生成测试一次</button><span id="sf-generation-result" role="status" aria-live="polite"></span></div>
+                      <button id="sf-visual-test" class="button secondary visual-editor-entry" type="button" disabled>智商测试 ↗</button>
+                    </div>
+                  </aside>
+                </div>
+                <details class="catalog-manual-section"><summary>手动补充模型 <span>可选</span></summary><label class="catalog-manual"><span class="sr-only">手动补充，逗号分隔</span><input id="sf-models" placeholder="输入模型 ID，多个用逗号分隔"><small>上游未提供目录或缺少模型时，可在这里补充。</small></label></details>
+              </div>
+              <div class="form-grid section-panel" id="editor-routing" data-section-panel="editor" data-section="routing" hidden="" role="tabpanel" aria-labelledby="editor-tab-routing">
+                <label>模型匹配 <select id="sf-model-routing"><option value="catalog">按目录匹配（推荐）</option><option value="passthrough">允许未列出的模型</option></select></label>
+                <label class="route-scope-field">接收的模型范围 <input id="sf-route-models" autocomplete="off" placeholder="留空接收全部；例如 gpt-*, deepseek-*"></label>
+                <p class="routing-note" id="sf-routing-note" role="status">先匹配模型，再按健康分调度。范围可填精确 ID 或末尾 * 前缀，多个用逗号分隔。</p>
+                <label class="checkbox"><input type="checkbox" id="sf-priority-auto" checked> 自动优先级</label>
+                <label>手动优先级 <input id="sf-priority" type="number" value="5" min="1" max="10000" disabled></label>
+                <label>计费模式 <select id="sf-billing"><option value="balance">余额制</option><option value="subscription">订阅制</option></select></label>
+                <p class="routing-note" id="sf-priority-note">自动：按健康评分调度，不加手动优先级分；同分段按权重与延迟分流。</p>
+                <label class="checkbox"><input type="checkbox" id="sf-enabled" checked> 启用</label>
+              </div>
+              <p class="form-status" id="stationFormStatus" role="status" aria-live="polite"></p>
+              <div class="station-form-actions"><button class="button secondary" type="button" id="sf-cancel" hidden>取消编辑</button>
+                <button class="button primary" type="submit" id="sf-submit">添加站点</button>
+              </div>
+            </form>
           </section>
-        </div>
-      </section>
 
-      <section id="retry-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-retry" hidden>
+      <section id="retry-wrap" class="station-policy-panel section-panel" data-section-panel="stations" data-section="retry" role="tabpanel" aria-labelledby="stations-tab-retry" hidden="">
         <div class="retry-settings-layout">
           <div class="section-heading retry-settings-heading">
             <div>
-              <span class="section-kicker">RETRY POLICY</span>
-              <h2 id="retry-heading">重试设置</h2>
+              <span class="section-kicker">当前账号 · 所有站点</span>
+              <h2 id="retry-heading">故障重试</h2>
             </div>
             <button class="button secondary" id="retry-reload" type="button">重新加载</button>
           </div>
+          <p class="policy-intro">一个站点失败后如何切换与重试。此策略作用于当前账号下的所有站点。</p>
 
-          <form id="retry-form" class="retry-settings-form">
-            <fieldset class="retry-settings-group">
+          <form id="retry-form" class="retry-settings-form"><div class="section-tabs" data-tab-group="retry" role="tablist" aria-label="重试设置分类"><button id="retry-tab-switch" type="button" class="section-tab" data-section="switch" role="tab" aria-controls="retry-section-switch" aria-selected="true" tabindex="0">站点切换</button><button id="retry-tab-rounds" type="button" class="section-tab" data-section="rounds" role="tab" aria-controls="retry-section-rounds" aria-selected="false" tabindex="-1">整体重试</button><button id="retry-tab-duration" type="button" class="section-tab" data-section="duration" role="tab" aria-controls="retry-section-duration" aria-selected="false" tabindex="-1">总时长</button></div>
+            <fieldset class="retry-settings-group section-panel" id="retry-section-switch" data-section-panel="retry" data-section="switch" role="tabpanel" aria-labelledby="retry-tab-switch">
               <legend>站点切换</legend>
               <div class="retry-field-grid">
                 <label class="retry-field" for="retry-max-attempts">
                   <span>单次最多尝试站点</span>
-                  <input id="retry-max-attempts" name="max_attempts" type="number"
-                         min="1" max="100" step="1" required inputmode="numeric">
+                  <input id="retry-max-attempts" name="max_attempts" type="number" min="1" max="100" step="1" required="" inputmode="numeric">
                 </label>
                 <label class="retry-field" for="retry-backoff">
                   <span>站点切换等待（秒）</span>
-                  <input id="retry-backoff" name="retry_backoff" type="number"
-                         min="0" max="60" step="0.1" required inputmode="decimal">
+                  <input id="retry-backoff" name="retry_backoff" type="number" min="0" max="60" step="0.1" required="" inputmode="decimal">
                 </label>
               </div>
             </fieldset>
 
-            <fieldset class="retry-settings-group">
+            <fieldset class="retry-settings-group section-panel" id="retry-section-rounds" data-section-panel="retry" data-section="rounds" hidden="" role="tabpanel" aria-labelledby="retry-tab-rounds">
               <legend>整体重试</legend>
               <label class="settings-toggle" for="retry-infinite-rounds">
                 <input id="retry-infinite-rounds" type="checkbox">
@@ -238,23 +260,20 @@
               <div class="retry-field-grid">
                 <label class="retry-field" id="retry-max-rounds-field" for="retry-max-rounds">
                   <span>最大重试轮次</span>
-                  <input id="retry-max-rounds" name="max_rounds" type="number"
-                         min="1" max="10000" step="1" required inputmode="numeric">
+                  <input id="retry-max-rounds" name="max_rounds" type="number" min="1" max="10000" step="1" required="" inputmode="numeric">
                 </label>
                 <label class="retry-field" for="retry-round-backoff">
                   <span>轮间基础等待（秒）</span>
-                  <input id="retry-round-backoff" name="round_backoff" type="number"
-                         min="0.1" max="300" step="0.1" required inputmode="decimal">
+                  <input id="retry-round-backoff" name="round_backoff" type="number" min="0.1" max="300" step="0.1" required="" inputmode="decimal">
                 </label>
                 <label class="retry-field" for="retry-max-round-backoff">
                   <span>轮间最长等待（秒）</span>
-                  <input id="retry-max-round-backoff" name="max_round_backoff" type="number"
-                         min="0.1" max="600" step="0.1" required inputmode="decimal">
+                  <input id="retry-max-round-backoff" name="max_round_backoff" type="number" min="0.1" max="600" step="0.1" required="" inputmode="decimal">
                 </label>
               </div>
             </fieldset>
 
-            <fieldset class="retry-settings-group">
+            <fieldset class="retry-settings-group section-panel" id="retry-section-duration" data-section-panel="retry" data-section="duration" hidden="" role="tabpanel" aria-labelledby="retry-tab-duration">
               <legend>总时长</legend>
               <label class="settings-toggle" for="retry-unlimited-duration">
                 <input id="retry-unlimited-duration" type="checkbox">
@@ -264,8 +283,7 @@
               <div class="retry-field-grid">
                 <label class="retry-field" id="retry-max-seconds-field" for="retry-max-seconds">
                   <span>总重试时长上限（秒）</span>
-                  <input id="retry-max-seconds" name="max_retry_seconds" type="number"
-                         min="1" max="86400" step="1" required inputmode="decimal">
+                  <input id="retry-max-seconds" name="max_retry_seconds" type="number" min="1" max="86400" step="1" required="" inputmode="decimal">
                 </label>
               </div>
             </fieldset>
@@ -278,48 +296,192 @@
         </div>
       </section>
 
-      <section id="events-wrap" class="tab-panel events-section" role="tabpanel"
-               aria-labelledby="tab-events" hidden>
+
+      <section id="probe-wrap" class="station-policy-panel section-panel" data-section-panel="stations" data-section="probe" role="tabpanel" aria-labelledby="stations-tab-probe" hidden>
+        <div class="retry-settings-layout">
+          <div class="section-heading retry-settings-heading"><div><span class="section-kicker">当前账号 · 所有站点</span><h2>后台生成测试策略</h2></div><button class="button secondary" id="probe-reload" type="button">重新加载</button></div>
+          <p class="policy-intro">这里只设置后台总开关与生成间隔。每个站点分别选择是否参与，以及使用哪个探测模型。</p>
+          <form id="probe-form" class="retry-settings-form">
+            <fieldset class="retry-settings-group">
+              <legend>后台生成测试</legend>
+              <label class="settings-toggle" for="probe-enabled"><input id="probe-enabled" type="checkbox"><span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span><span class="settings-toggle-label">允许后台生成探测</span></label>
+              <div class="retry-field-grid"><label class="retry-field" for="probe-interval"><span>最小探测间隔（秒）</span><input id="probe-interval" type="number" min="300" max="86400" step="60" required inputmode="numeric"></label></div>
+              <p class="access-note">这是当前账号所有站点共用的总开关与最小间隔，只在这里配置一次。各站点在「模型与测试」中选择是否参与和测试模型；自动模式取列表第一个，不代表免费或最便宜。没有模型时跳过。</p>
+              <p class="access-note">生成测试可能计费，近期有成功业务请求时跳过后台测试。额度恢复的生成检查也遵守此开关；关闭时可在站点内手动测试一次。</p>
+              <div class="probe-explanation"><p><strong>日常业务</strong> · 根据实际成功、超时和上游错误更新健康状态，无额外生成请求。</p><p><strong>模型目录 / 余额</strong> · 读取上游元数据，不生成内容；目录可达不代表模型可用，余额接口不支持时显示未知。</p><p><strong>生成测试</strong> · 向选定模型发一次短请求，验证生成链路；成功可解除熔断，失败显示具体原因。</p></div>
+            </fieldset>
+            <div class="retry-settings-footer"><p class="form-status" id="probeSettingsStatus" role="status" aria-live="polite"></p><button class="button primary" id="probe-save" type="submit">保存设置</button></div>
+          </form>
+        </div>
+      </section>
+
+      </section>
+
+      <section id="access-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-access" hidden="">
+        <div class="retry-settings-layout settings-workspace">
+          <div class="section-heading retry-settings-heading">
+            <div>
+              <span class="section-kicker">ACCESS CONTROL</span>
+              <h2>IP 白名单</h2>
+            </div>
+            <button class="button secondary" id="access-reload" type="button">重新加载</button>
+          </div>
+          <div class="settings-columns"><form id="access-form" class="retry-settings-form">
+            <fieldset class="retry-settings-group">
+              <legend>允许访问的客户端</legend>
+              <p class="access-note" id="access-client">正在读取当前访问 IP...</p>
+              <label class="retry-field" for="access-ips">
+                <span>客户端 IP（每行一个，也可用逗号分隔）</span>
+                <textarea id="access-ips" name="allowed_ips" rows="4" spellcheck="false" autocomplete="off" aria-describedby="access-help" disabled=""></textarea>
+              </label>
+              <p class="access-note" id="access-help">仅影响当前账号，保存后对新请求立即生效。当前访问 IP 必须保留。</p>
+            </fieldset>
+            <div class="retry-settings-footer">
+              <p class="form-status" id="accessSettingsStatus" role="status" aria-live="polite"></p>
+              <button class="button primary" id="access-save" type="submit" disabled="">保存白名单</button>
+            </div>
+          </form><aside class="settings-context"><span class="section-kicker">当前账号</span><h3>独立的访问名单</h3><p>切换账号后，网关立即使用目标账号自己的名单。</p><div class="context-rule"><strong>填写客户端 IP</strong><p>每行一个 IPv4 或 IPv6 地址；不填写网址、端口或网段。</p></div><div class="context-rule"><strong>本机也需要加入</strong><p>API、管理页面和健康检查使用同一名单。保存时会检查当前访问 IP，防止误删后失去访问权限。</p></div></aside></div>
+        </div>
+      </section>
+
+      <section id="service-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-service" hidden="">
+        <div class="retry-settings-layout service-settings-layout settings-workspace">
+          <div class="section-heading retry-settings-heading">
+            <div><span class="section-kicker">GATEWAY SERVICE</span><h2>服务设置</h2></div>
+            <button class="button secondary" id="service-reload" type="button">重新加载</button>
+          </div>
+          <div class="settings-columns"><div class="service-primary"><form id="service-form" class="retry-settings-form">
+            <fieldset class="retry-settings-group">
+              <legend>监听端口</legend>
+              <p class="access-note">保存前会检查端口是否可用；保存后下次启动或重启时生效。端口设置与服务重启仅能从部署机器访问。</p>
+              <label class="retry-field service-port-field" for="service-port">
+                <span>HTTP 端口</span>
+                <input id="service-port" name="port" type="number" min="1" max="65535" step="1" required disabled aria-describedby="service-port-state">
+              </label>
+              <p class="access-note" id="service-port-state">正在读取服务配置...</p>
+              <div class="retry-settings-footer">
+                <p class="form-status" id="serviceSettingsStatus" role="status" aria-live="polite"></p>
+                <button class="button primary" id="service-save" type="submit" disabled>保存端口</button>
+              </div>
+            </fieldset>
+          </form>
+          <section class="service-restart-row" aria-labelledby="service-restart-heading">
+            <div><span class="section-kicker">PROCESS</span><h3 id="service-restart-heading">运行中的服务</h3><p class="access-note" id="service-runtime-state">当前监听端口：读取中</p></div>
+            <button class="button secondary" id="service-restart" type="button" disabled>重启服务</button>
+          </section></div><aside class="settings-context"><span class="section-kicker">CLIENT ENDPOINT</span><h3>对外接入地址</h3><p>填写客户端实际访问的地址。域名或反向代理使用这里指定的协议与端口。</p><form id="endpoint-form"><label class="retry-field" for="endpoint-public-url"><span>公开访问 URL</span><input id="endpoint-public-url" type="url" placeholder="http://网关IP:8000" autocomplete="url"></label><p class="access-note">留空时自动选择访问地址或本机网络地址。整个网关共用，切换账号不变。</p><div class="endpoint-preview"><span>将复制</span><code id="endpoint-preview">读取中…</code></div><div class="settings-actions"><button id="endpoint-save" class="button primary" type="submit">保存地址</button></div><p id="endpoint-status" class="form-status" role="status"></p></form></aside></div>
+        </div>
+      </section>
+
+      <section id="events-wrap" class="tab-panel events-section" role="tabpanel" aria-labelledby="tab-events" hidden="">
         <div class="section-heading">
           <div>
             <span class="section-kicker">ACTIVITY</span>
-            <h2 id="events-heading">最近事件</h2>
+            <h2 id="events-heading">请求日志</h2>
           </div>
           <span class="section-note" id="eventCount">0 条记录</span>
         </div>
+        <div class="event-toolbar">
+          <nav class="section-tabs" data-tab-group="events" role="tablist" aria-label="日志视图">
+            <button id="events-tab-records" class="section-tab" type="button" role="tab" aria-selected="true" aria-controls="events-records" data-section="records">调用记录</button>
+            <button id="events-tab-analytics" class="section-tab" type="button" role="tab" aria-selected="false" aria-controls="events-analytics" data-section="analytics" tabindex="-1">统计图表</button>
+            <button id="events-tab-sources" class="section-tab" type="button" role="tab" aria-selected="false" aria-controls="events-sources" data-section="sources" tabindex="-1">IP × 模型用量</button>
+          </nav>
+          <div class="event-toolbar-actions">
+            <button id="eventFiltersToggle" class="button secondary" type="button" aria-expanded="false" aria-controls="eventFilters">筛选</button>
+          </div>
+        </div>
+          <div id="eventFilters" class="event-filter-bar" hidden>
+            <label>起始日期<input id="eventDateFrom" type="date"></label>
+            <label>结束日期<input id="eventDateTo" type="date"></label>
+            <label>来源 IP<select id="eventIpFilter"><option value="">全部 IP</option></select></label>
+            <label>模型<select id="eventModelFilter"><option value="">全部模型</option></select></label>
+            <label>图表维度<select id="eventGroupBy"><option value="ip">按 IP</option><option value="model">按模型</option></select></label>
+            <label>统计指标<select id="eventMetric"><option value="calls">请求次数</option><option value="tokens">已上报 Token</option></select></label>
+            <div class="event-periods" role="group" aria-label="日期范围">
+              <button type="button" data-log-days="7" aria-pressed="true">7 天</button>
+              <button type="button" data-log-days="30" aria-pressed="false">30 天</button>
+              <button type="button" data-log-days="90" aria-pressed="false">90 天</button>
+            </div>
+            <button id="eventAnalyticsApply" class="button secondary" type="button">查询</button>
+          </div>
+        <div id="events-analytics" class="event-analytics section-panel" data-section-panel="events" data-section="analytics" role="tabpanel" aria-labelledby="events-tab-analytics" hidden>
+          <div class="event-chart-grid">
+            <div class="event-trend-block">
+              <div class="event-chart-heading"><h3 id="eventTrendTitle">请求趋势</h3><div class="event-chart-meta"><span id="eventAnalyticsScope"></span><span id="eventTrendKeys"><i class="event-legend-request"></i>请求　<i class="event-legend-failure"></i>失败</span></div></div>
+              <div class="event-trend-chart-wrap"><div id="eventTrendChart" role="img" aria-label="请求日志按日趋势图"></div><div id="eventTrendEmpty" class="trend-empty" hidden>当前范围没有留存记录</div></div>
+            </div>
+            <div class="event-breakdown-block">
+              <div class="event-chart-heading"><h3 id="eventBreakdownTitle">IP 分布</h3><strong id="eventBreakdownTotal">0</strong></div>
+              <div class="event-donut-layout"><div class="event-donut-wrap"><div id="eventBreakdownDonut" class="event-donut" role="img" aria-label="请求日志分布图"></div><span id="eventDonutCenter" class="event-donut-center" aria-hidden="true"></span></div><div id="eventBreakdownLegend" class="event-breakdown-legend"></div></div>
+            </div>
+          </div>
+          <div class="event-retention-row">
+            <label for="eventRetentionLimit">保存最近</label>
+            <input id="eventRetentionLimit" type="number" min="100" max="10000" step="100" value="500">
+            <span>条</span>
+            <button id="eventRetentionSave" class="button secondary" type="button">保存数量</button>
+            <span id="eventRetentionStatus" role="status" aria-live="polite"></span>
+            <span class="event-analytics-note" id="eventAnalyticsCoverage">统计范围与留存日志一致</span>
+          </div>
+        </div>
+        <section id="events-sources" class="event-sources section-panel" data-section-panel="events" data-section="sources" role="tabpanel" aria-labelledby="events-tab-sources" hidden>
+          <div class="source-summary" id="eventSourceSummary"></div>
+          <p class="source-scope" id="eventSourceScope">仅统计当前账号的留存日志，支持上方日期、IP 与模型联合筛选。</p>
+          <div class="table-shell source-table-shell"><table class="event-table source-table"><thead><tr><th>来源 IP</th><th>模型</th><th>请求</th><th>失败</th><th>已上报 Token</th><th>Token 上报覆盖</th></tr></thead><tbody id="eventSourceRows"></tbody></table></div>
+          <div class="event-pagination"><span id="eventSourcePage"></span><div class="pagination-actions"><button id="eventSourcePrev" type="button" class="button secondary">上一页</button><button id="eventSourceNext" type="button" class="button secondary">下一页</button></div></div>
+        </section>
+        <div id="events-records" class="event-records section-panel" data-section-panel="events" data-section="records" role="tabpanel" aria-labelledby="events-tab-records">
         <div class="table-shell event-shell">
           <table class="event-table">
             <caption class="sr-only">网关最近调用事件</caption>
             <colgroup>
-              <col class="event-time-col"><col class="event-station-col"><col class="event-model-col">
+              <col class="event-time-col"><col class="event-ip-col"><col class="event-station-col"><col class="event-model-col">
               <col class="event-result-col"><col class="event-latency-col"><col>
             </colgroup>
             <thead>
-              <tr><th>时间</th><th>站点</th><th>模型</th><th>结果</th><th>延迟</th><th>详情</th></tr>
+              <tr><th>时间</th><th>来源 IP</th><th>站点</th><th>模型</th><th>结果</th><th>延迟</th><th>详情</th></tr>
             </thead>
             <tbody id="log-body">
-              <tr><td colspan="6" class="empty-cell">正在读取事件</td></tr>
+              <tr><td colspan="7" class="empty-cell">正在读取事件</td></tr>
             </tbody>
           </table>
         </div>
         <div class="event-pagination" aria-label="事件分页">
           <span id="eventPageInfo">第 1 / 1 页</span>
           <div class="pagination-actions">
-            <button class="button secondary" id="eventPrev" type="button" disabled>上一页</button>
-            <button class="button secondary" id="eventNext" type="button" disabled>下一页</button>
+            <button class="button secondary" id="eventPrev" type="button" disabled="">上一页</button>
+            <button class="button secondary" id="eventNext" type="button" disabled="">下一页</button>
           </div>
+        </div>
         </div>
       </section>
     </main>
+
+      </div>
+    </div>
   </div>
+  <dialog id="accountEditorDialog" class="account-editor-dialog" aria-labelledby="accountEditorTitle">
+    <div class="account-dialog-heading"><div><span class="section-kicker">账号设置</span><h2 id="accountEditorTitle">新建账号</h2></div><button id="accountEditorClose" class="account-close" type="button" aria-label="关闭账号设置">×</button></div>
+          <form id="accountForm" class="account-form">
+            <div class="account-fields">
+              <label>显示名称<input id="accountDisplay" maxlength="60" required placeholder="例如：研发团队"></label>
+              <label>用户名<input id="accountUsername" minlength="3" maxlength="40" autocomplete="off" required placeholder="team-dev"></label>
+              <label>切换密码<input id="accountPassword" type="password" minlength="8" maxlength="256" autocomplete="new-password" placeholder="至少 8 位；编辑时留空保留"></label>
+              <label class="account-check"><input id="accountRequirePassword" type="checkbox">切换到此账号时验证用户名和密码</label>
+              <label class="account-ip-field">独立 IP 白名单<textarea id="accountIps" rows="4" placeholder="每行一个 IP；留空将禁止访问"></textarea><span id="accountIpHelp">只允许此账号名单中的 IP；不会继承其他账号的地址。</span></label>
+              <p class="account-form-note">新账号从空站点列表开始。切换后可在「站点管理」中配置自己的上游，在「IP 白名单」中调整当前白名单。</p>
+            </div>
+            <div class="account-form-footer"><p id="accountFormStatus" role="status" aria-live="polite"></p><div class="dialog-actions"><button id="accountCancel" type="button" class="button secondary">取消</button><button id="accountSave" type="submit" class="button primary">保存账号</button></div></div>
+          </form>
+  </dialog>
 
   <dialog class="auth-dialog" id="authDialog">
     <form method="dialog" id="authForm">
       <span class="section-kicker">ADMIN ACCESS</span>
-      <h2>连接管理接口</h2>
-      <p>输入 gateway.admin_key 以读取状态并执行站点操作。</p>
+      <h2>连接你的网关</h2>
+      <p>输入管理密钥以查看运行状态和管理站点。</p>
       <label for="adminKeyInput">管理密钥</label>
-      <input id="adminKeyInput" type="password" autocomplete="current-password" required>
+      <input id="adminKeyInput" type="password" autocomplete="current-password" required="">
       <div class="dialog-actions">
         <button class="button secondary" value="cancel" type="button" id="authCancel">取消</button>
         <button class="button primary" value="confirm" type="submit">连接</button>
@@ -327,7 +489,80 @@
     </form>
   </dialog>
 
-  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
-  <script src="/static/dashboard.js?v=2" defer></script>
-</body>
-</html>
+
+  <dialog class="auth-dialog" id="accountSwitchDialog" aria-labelledby="switchAccountTitle">
+    <form id="accountSwitchForm">
+      <span class="section-kicker">SWITCH WORKSPACE</span><h2 id="switchAccountTitle">验证账号</h2>
+      <p id="switchAccountDescription">验证后，全网关的新请求将使用此账号。</p>
+      <label for="switchUsername">用户名</label><input id="switchUsername" autocomplete="username" maxlength="40" required>
+      <label for="switchPassword">密码</label><input id="switchPassword" type="password" autocomplete="current-password" maxlength="256" required>
+      <p id="switchAccountError" role="alert"></p>
+      <div class="dialog-actions"><button id="switchCancel" type="button" class="button secondary">取消</button><button id="switchConfirm" type="submit" class="button primary">验证并切换</button></div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden=""></div>
+  <dialog id="visualTestDialog" class="visual-test-dialog" aria-labelledby="visualTestTitle">
+    <header class="visual-dialog-heading"><div><span class="section-kicker" id="visualTestStation">站点测试</span><h2 id="visualTestTitle">智商测试</h2></div><button id="visualTestClose" class="account-close" type="button" aria-label="关闭测试窗口">×</button></header>
+    <div class="visual-mobile-tabs" role="group" aria-label="测试工作区"><button type="button" data-visual-workspace="config" aria-pressed="true">测试配置</button><button type="button" data-visual-workspace="result" aria-pressed="false">生成结果</button></div>
+    <div class="visual-workspace" id="visualWorkspace" data-view="config">
+      <form id="visualTestForm" class="visual-config" novalidate>
+        <div class="visual-config-tabs" role="group" aria-label="测试设置"><button type="button" data-visual-config="content" aria-pressed="true">模型与提示词</button><button type="button" data-visual-config="options" aria-pressed="false">生成参数</button><button type="button" data-visual-config="schedule" aria-pressed="false">自动计划<span id="visualScheduleDot" hidden></span></button></div>
+        <div class="visual-config-scroll">
+          <div id="visual-config-content">
+          <div class="visual-content-selectors"><div><label for="visualTestModel">测试模型</label><select id="visualTestModel"></select></div><div>
+          <div class="visual-template-heading"><label for="visualTestTemplate">提示词模板</label><button id="visualTemplateNew" class="policy-link" type="button">新建</button></div>
+          <select id="visualTestTemplate"></select></div></div>
+          <label class="sr-only" for="visualTestPrompt">测试提示词</label><textarea id="visualTestPrompt" rows="7" maxlength="12000" required spellcheck="false"></textarea>
+          <p class="visual-prompt-note" id="visualPromptNote">经典题目只要求生成 SVG；可自行修改提示词，不会自动调用模型。</p>
+          <details class="visual-template-library"><summary>保存为自定义模板</summary><div class="visual-template-save"><label class="sr-only" for="visualTemplateName">自定义模板名称</label><input id="visualTemplateName" maxlength="60" placeholder="自定义模板名称" autocomplete="off"><button id="visualTemplateSave" class="button secondary" type="button">另存为</button></div>
+          <div class="visual-template-actions"><button id="visualTemplateUpdate" class="policy-link" type="button" hidden>更新模板</button><button id="visualTemplateDelete" class="policy-link text-danger" type="button" hidden>删除模板</button><span id="visualTemplateStatus" role="status" aria-live="polite"></span></div></details>
+          <p class="visual-cost-note">测试在后台执行，可随时关闭。每站保留最近一次结果；用量可在结果详情查看。</p>
+          </div><div id="visual-config-options" hidden>
+          <div class="visual-run-options"><label>推理深度<select id="visualTestReasoning"><option value="auto">跟随站点配置</option><option value="omit">上游默认 · 不传参数</option><option value="none">None · 不推理</option><option value="minimal">Minimal · 极低</option><option value="low">Low · 低</option><option value="medium">Medium · 中</option><option value="high">High · 高</option><option value="xhigh">XHigh · 更高</option><option value="max">Max · 最高</option></select></label><label>输出 Token 上限<input id="visualTestLimit" type="number" min="1" step="1" value="4096" required></label></div>
+          <p class="visual-prompt-note">推理档位与输出 Token 范围由模型决定。上限由你填写，网关原样发送，超出模型范围时显示上游错误。</p>
+          <div class="visual-compatibility"><label>请求协议<select id="visualTestProtocol"><option value="auto">自动 · 匹配模型协议</option><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option><option value="chat_completions_legacy">Chat · 旧版 max_tokens</option><option value="messages">Anthropic Messages</option><option value="generate_content">Gemini GenerateContent</option></select></label><p class="visual-prompt-note" id="visualProtocolNote">参数不受支持时直接显示错误，不会自动重发。</p></div>
+          <p class="visual-cost-note">生成可能计费，最长等待 120 秒。更高的推理深度与输出上限可能增加用量。</p>
+          </div>
+          <div id="visual-config-schedule" hidden>
+            <div class="visual-schedule-heading"><div><strong>定时生成</strong><p>只在当前使用的账号生效</p></div><label class="visual-switch"><input id="visualScheduleEnabled" type="checkbox" aria-label="开启自动测试"><span aria-hidden="true"></span></label></div>
+            <label for="visualScheduleInterval">间隔（分钟）</label><input id="visualScheduleInterval" type="number" min="5" max="10080" step="1" value="60" required>
+            <p class="visual-prompt-note">5 分钟至 7 天，建议 60 分钟或更长。保存后等待完整间隔；切换回来或重启后重新计时。手动测试后也会延后下一次自动执行。</p>
+            <div class="visual-schedule-summary"><span>已保存的计划</span><p id="visualScheduleSummary">尚未开启</p><p id="visualScheduleStatus" role="status" aria-live="polite">默认仅手动测试</p></div>
+            <button id="visualScheduleSave" class="button secondary" type="button">保存自动计划</button>
+            <p id="visualScheduleFeedback" class="visual-prompt-note" role="status" aria-live="polite"></p>
+            <p class="visual-cost-note">保存会使用「内容与模型」中当前选择的模型、提示词和推理参数。开启后将持续产生测试用量；多站点依次执行，失败延后，鉴权或参数错误及连续三次失败会暂停。暂停后可检查参数并重新保存。</p>
+            <p class="visual-prompt-note">停用站点或账号切换后不会发起新的自动测试；已提交的请求可能已计费。静态预览仅供人工比较，不用于判断模型真伪或自动排名。</p>
+          </div>
+        </div>
+        <footer class="visual-run-footer"><span id="visualTestStatus" role="status" aria-live="polite">尚未发送请求</span><button id="visualTestRun" class="button primary" type="submit">开始测试</button></footer>
+      </form>
+      <section class="visual-result" aria-label="生成结果">
+        <div class="visual-result-toolbar"><div class="visual-result-tabs" role="tablist" aria-label="测试结果视图"><button id="visual-tab-preview" type="button" role="tab" aria-selected="true" aria-controls="visual-panel-preview" data-visual-tab="preview">预览</button><button id="visual-tab-source" type="button" role="tab" aria-selected="false" aria-controls="visual-panel-source" data-visual-tab="source" tabindex="-1">HTML / SVG</button><button id="visual-tab-raw" type="button" role="tab" aria-selected="false" aria-controls="visual-panel-raw" data-visual-tab="raw" tabindex="-1">原始返回</button></div><button id="visualTestCopy" class="button secondary" type="button" disabled>复制代码</button></div>
+        <p id="visualResultContext" class="visual-result-context" hidden></p>
+        <div id="visualResultDiagnosis" class="visual-result-diagnosis" hidden><div><strong id="visualDiagnosisTitle"></strong><p id="visualDiagnosisText"></p><small id="visualDiagnosisEvidence"></small></div><button type="button" id="visualAdjustSettings" class="button secondary">调整测试参数</button></div>
+        <div class="visual-result-content">
+          <div id="visual-panel-preview" class="visual-result-panel" role="tabpanel" aria-labelledby="visual-tab-preview"><div id="visualPreviewEmpty" class="visual-preview-empty"><strong>尚无生成结果</strong><span>选择模型与提示词，完成后在这里查看预览。</span></div><iframe id="visualPreviewFrame" title="生成内容的静态预览" sandbox="" referrerpolicy="no-referrer" hidden></iframe></div>
+          <pre id="visual-panel-source" class="visual-result-panel visual-code" role="tabpanel" aria-labelledby="visual-tab-source" hidden></pre>
+          <pre id="visual-panel-raw" class="visual-result-panel visual-code" role="tabpanel" aria-labelledby="visual-tab-raw" hidden></pre>
+        </div>
+        <div id="visualResultNotice" class="visual-result-notice" role="status" aria-live="polite">静态预览禁用脚本、外部资源和网络请求。</div>
+        <footer class="visual-result-footer"><dl id="visualResultMetrics" class="visual-result-metrics"><div><dt>状态</dt><dd>等待测试</dd></div><div><dt>耗时</dt><dd>—</dd></div><div><dt>Token</dt><dd>—</dd></div></dl><button id="visualTestClear" class="policy-link" type="button" hidden>清除结果</button></footer>
+      </section>
+    </div>
+  </dialog>
+  <dialog id="channelModelsDialog" class="channel-models-dialog" aria-labelledby="channelModelsTitle"><header class="visual-dialog-heading"><div><span class="section-kicker" id="channelModelsStation"></span><h2 id="channelModelsTitle">支持的模型</h2></div><button id="channelModelsClose" class="account-close" type="button" aria-label="关闭模型列表">×</button></header><div class="channel-models-toolbar"><input id="channelModelsSearch" type="search" placeholder="搜索完整模型名称" aria-label="搜索完整模型名称"><span id="channelModelsCount"></span></div><div id="channelModelsList" class="channel-models-list"></div><footer class="channel-models-footer" id="channelModelsNote"></footer></dialog>
+  <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量">×</button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
+  <script src="/static/vendor/echarts.min.js?v=5.6.0" defer=""></script>
+  <script src="/static/dashboard.js?v=43" defer=""></script>
+  <script src="/static/go-usage.js?v=2" defer></script>
+  <script src="/static/analytics.js?v=8" defer></script>
+  <script src="/static/accounts.js?v=17" defer></script>
+  <script src="/static/visual-tests.js?v=11" defer></script>
+  <script src="/static/selects.js?v=1" defer></script>
+
+
+
+
+
+</body></html>
