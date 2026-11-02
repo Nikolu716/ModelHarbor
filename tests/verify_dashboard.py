@@ -57,7 +57,7 @@ def verify_static() -> None:
     assert not parser.inline_handlers, f"inline handlers: {parser.inline_handlers}"
     assert parser.inline_style_blocks == 0, "dashboard CSS must remain external"
     assert parser.inline_script_blocks == 0, "dashboard JS must remain external"
-    assert '/static/dashboard.css?v=39' in html
+    assert '/static/dashboard.css?v=40' in html
     assert '/static/dashboard.js?v=43' in html
     assert '/static/visual-tests.js?v=11' in html
     assert '/static/visual-tests.css?v=8' in html
