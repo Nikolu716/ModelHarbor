@@ -8,16 +8,20 @@
 
 运行：pythonw.exe tools\tray.py（无控制台窗口，最省资源）
 """
+from __future__ import annotations
+
 import os
 import socket
 import sqlite3
 import subprocess
 import sys
-import winreg
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import pystray
 from PIL import Image, ImageDraw
+
+if TYPE_CHECKING:
+    import pystray
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 NSSM = PROJECT_DIR / "tools" / "nssm-2.24" / "win64" / "nssm.exe"
@@ -141,6 +145,8 @@ def _tray_cmd() -> str:
 
 
 def is_autostart() -> bool:
+    import winreg
+
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
             return winreg.QueryValueEx(k, RUN_NAME)[0] == _tray_cmd()
@@ -149,6 +155,8 @@ def is_autostart() -> bool:
 
 
 def set_autostart(on: bool) -> None:
+    import winreg
+
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
         if on:
             winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, _tray_cmd())
@@ -192,6 +200,8 @@ def make_icon() -> Image.Image:
 
 
 def build_menu() -> pystray.Menu:
+    import pystray
+
     return pystray.Menu(
         pystray.MenuItem("🌐 打开管理面板", open_dashboard, default=True),
         pystray.MenuItem("📊 服务状态", show_status),
@@ -211,6 +221,8 @@ def build_menu() -> pystray.Menu:
 def main():
     if not _acquire_lock():
         sys.exit(0)  # 已有托盘在运行
+    import pystray
+
     icon = pystray.Icon("ModelHarbor", make_icon(), "ModelHarbor 模型网关",
                         menu=build_menu())
     icon.run()
