@@ -12,6 +12,7 @@ from pathlib import Path
 import yaml
 
 from .access_control import validate_allowed_ips
+from .scoring import SPEED_WEIGHT, validate_speed_weight
 
 DEFAULT_CONFIG = "config.yaml"
 
@@ -29,6 +30,7 @@ class GatewayConfig:
     probe_interval: float = 900.0
     fail_threshold: int = 3
     cool_down: float = 60.0
+    scoring_speed_weight: float = SPEED_WEIGHT  # 0–1; each account can override at runtime.
     connect_timeout: float = 10.0
     first_byte_timeout: float = 10.0
     first_token_timeout: float = 120.0  # 流式首个内容事件超时（推理型模型可达数十秒）
@@ -64,6 +66,7 @@ class GatewayConfig:
         if isinstance(cfg.port, bool) or not isinstance(cfg.port, int) or not 1 <= cfg.port <= 65535:
             raise ValueError("gateway.port must be an integer between 1 and 65535")
         cfg.allowed_ips = validate_allowed_ips(cfg.allowed_ips)
+        cfg.scoring_speed_weight = validate_speed_weight(cfg.scoring_speed_weight)
         if not isinstance(cfg.public_url, str):
             raise ValueError("gateway.public_url must be a string")
         cfg.public_url = cfg.public_url.strip().rstrip("/")

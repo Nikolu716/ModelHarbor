@@ -119,7 +119,7 @@ class StationState:
     last_error: str = ""
     last_error_at: float = 0.0
 
-    # Reliability only. None means no trustworthy recent business samples.
+    # Reliability-led composite with a bounded speed weight. None = no samples.
     health_score: float | None = None
     score_breakdown: dict = field(default_factory=dict)
     score_refreshed_at: float = 0.0
@@ -142,6 +142,7 @@ class StationState:
     semaphore: asyncio.Semaphore | None = None
     client: httpx.AsyncClient | None = None
     persist_state: object = field(default=None, repr=False, compare=False)
+    gateway: GatewayConfig | None = field(default=None, repr=False, compare=False)
 
     def connection_signature(self):
         cfg = self.cfg
@@ -361,7 +362,8 @@ class StationState:
     def routing_evidence(self, model: str, path: str | None, stream: bool | None = None) -> dict:
         from .protocols import capability_path
         return scoring.summarize(self.health_samples, time.time(), model=model,
-                                 path=capability_path(path) if path else None, stream=stream)
+                                 path=capability_path(path) if path else None, stream=stream,
+                                 speed_weight=self.gateway.scoring_speed_weight if self.gateway else scoring.SPEED_WEIGHT)
 
     def _health_result(self, ok: bool, *, model: str = '', path: str = '',
                        stream: bool = False, latency: float | None = None) -> None:
@@ -375,7 +377,8 @@ class StationState:
         self.health_samples = deque((s for s in self.health_samples
                                      if 0 <= now - s['at'] < scoring.MAX_AGE),
                                     maxlen=scoring.STORED_SAMPLES)
-        view = scoring.summarize(self.health_samples, now)
+        view = scoring.summarize(self.health_samples, now,
+                                 speed_weight=self.gateway.scoring_speed_weight if self.gateway else scoring.SPEED_WEIGHT)
         self.window_results = deque((s['ok'] for s in list(self.health_samples)[-SCORE_WINDOW:]),
                                     maxlen=SCORE_WINDOW)
         self.health_score = view['score'] if self.enabled else 0.0
@@ -532,7 +535,7 @@ class Registry:
     def __init__(self, gateway: GatewayConfig, stations: list[StationConfig]):
         self.gateway = gateway
         self.states: dict[str, StationState] = {
-            s.name: StationState(cfg=s, enabled=s.enabled) for s in stations
+            s.name: StationState(cfg=s, enabled=s.enabled, gateway=gateway) for s in stations
         }
         self._lock = asyncio.Lock()
         self._cleanup_tasks: set[asyncio.Task] = set()
@@ -761,7 +764,7 @@ class Registry:
     # ---------- 动态站点管理（运行时增删改，无需重启） ----------
     def add_station(self, cfg: StationConfig) -> StationState:
         """新增站点（运行时立即生效，下次探测/请求即纳入调度）。"""
-        st = StationState(cfg=cfg, enabled=cfg.enabled)
+        st = StationState(cfg=cfg, enabled=cfg.enabled, gateway=self.gateway)
         if self.eventlog:
             st.persist_state = self.eventlog.save_runtime
         self.ensure_client(st)
@@ -1035,6 +1038,7 @@ class Registry:
                              "max_round_backoff": self.gateway.max_round_backoff,
                              "max_retry_seconds": self.gateway.max_retry_seconds,
                              "cool_down": self.gateway.cool_down,
+                             "scoring_speed_weight": self.gateway.scoring_speed_weight,
                              "fail_threshold": self.gateway.fail_threshold,
                              "rate_limit_cooldown": self.gateway.rate_limit_cooldown,
                              "probe_interval": self.gateway.probe_interval,

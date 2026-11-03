@@ -1,4 +1,4 @@
-"""Health must measure completed reliability, not speed or administrative policy."""
+"""Health combines completed reliability with a bounded, passive speed weight."""
 import io
 import tempfile
 import time
@@ -13,6 +13,7 @@ from app.proxy import OpenAIProxy
 from app.router import Router
 from app.state import Registry, StationState
 from app.stats import EventLog
+from app.scoring import speed_score
 
 
 def station(name='a', **kw):
@@ -39,14 +40,99 @@ class HealthScoringTests(unittest.TestCase):
         self.assertIn('已停用', rendered)
         self.assertIn('健康度', rendered)
 
-    def test_slow_reliable_channel_can_be_green(self):
+    def test_speed_changes_score_but_cannot_overwhelm_reliability(self):
         slow, fast = station('slow'), station('fast')
-        for _ in range(100):
-            slow.record_success(90, model='m', path='/responses')
-            fast.record_success(.1, model='m', path='/responses')
-        self.assertGreater(slow.health_score, 99)
-        self.assertAlmostEqual(slow.health_score, fast.health_score, places=4)
+        with patch('app.state.time.time', return_value=time.time()):
+            for _ in range(100):
+                slow.record_success(90, model='m', path='/responses', stream=True)
+                fast.record_success(.1, model='m', path='/responses', stream=True)
+        self.assertGreater(slow.health_score, 84)
+        self.assertGreater(fast.health_score, 98)
+        self.assertGreater(fast.health_score, slow.health_score)
+        self.assertLess(fast.health_score - slow.health_score, 15)
+        self.assertAlmostEqual(slow.score_breakdown['reliability_score'],
+                               fast.score_breakdown['reliability_score'], places=4)
+        self.assertGreaterEqual(slow.health_score, .85 * slow.score_breakdown['reliability_score'])
+        self.assertLessEqual(fast.health_score, fast.score_breakdown['reliability_score'])
         self.assertEqual(slow.score_breakdown['confidence'], 'high')
+
+    def test_speed_curve_is_monotonic_and_capped_for_each_mode(self):
+        for stream, fast, slow in [(True, 2, 30), (False, 10, 120)]:
+            with self.subTest(stream=stream):
+                self.assertEqual(speed_score(0, stream), 100)
+                self.assertEqual(speed_score(fast, stream), 100)
+                self.assertAlmostEqual(speed_score((fast * slow) ** .5, stream), 50)
+                self.assertEqual(speed_score(slow, stream), 0)
+                self.assertEqual(speed_score(10**9, stream), 0)
+                self.assertGreater(speed_score(fast * 2, stream), speed_score(fast * 3, stream))
+
+    def test_configurable_weight_scales_penalty_and_routes_using_the_same_policy(self):
+        gateway = GatewayConfig(scoring_speed_weight=0)
+        registry = Registry(gateway, [station('fast', model_routing='passthrough').cfg,
+                                      station('slow', model_routing='passthrough').cfg])
+        fast, slow = registry.get('fast'), registry.get('slow')
+        with patch('app.state.time.time', return_value=time.time()):
+            for _ in range(50):
+                fast.record_success(1, model='m', path='/responses', stream=True)
+                slow.record_success(30, model='m', path='/responses', stream=True)
+            for weight in (0, .15, .3, .5, 1):
+                gateway.scoring_speed_weight = weight
+                for st in (fast, slow):
+                    st._update_score()
+                    b = st.routing_evidence('m', '/responses', True)
+                    self.assertAlmostEqual(st.health_score, b['score'])
+                    self.assertAlmostEqual(b['score'], b['reliability_score'] *
+                                           (1 - weight + weight * b['speed_score'] / 100))
+                    self.assertGreaterEqual(b['score'], b['reliability_score'] * (1 - weight))
+                    self.assertLessEqual(b['score'], b['reliability_score'])
+            router = Router(registry, gateway)
+            with patch('app.router.random.random', return_value=.99):
+                self.assertEqual(router.pick('m', '/responses', stream=True)[0].cfg.name, 'fast')
+                gateway.scoring_speed_weight = 0
+                self.assertEqual(router.pick('m', '/responses', stream=True)[0].cfg.name, 'slow')
+
+    def test_one_extreme_latency_is_bounded_before_aggregation(self):
+        capped, extreme = station('capped'), station('extreme')
+        with patch('app.state.time.time', return_value=time.time()):
+            for _ in range(99):
+                capped.record_success(1, stream=True)
+                extreme.record_success(1, stream=True)
+            before = extreme.health_score
+            capped.record_success(30, stream=True)
+            extreme.record_success(10**9, stream=True)
+        self.assertAlmostEqual(capped.health_score, extreme.health_score)
+        self.assertLess(before - extreme.health_score, 1)
+
+    def test_missing_speed_uses_neutral_value_and_respects_request_mode(self):
+        st = station()
+        for _ in range(30):
+            st.record_success(1, model='m', path='/responses', stream=True)
+            st.record_success(120, model='m', path='/responses', stream=False)
+        streaming = st.routing_evidence('m', '/responses', True)
+        nonstream = st.routing_evidence('m', '/responses', False)
+        self.assertAlmostEqual(streaming['reliability_score'], nonstream['reliability_score'], places=4)
+        self.assertGreater(streaming['score'], nonstream['score'])
+        missing = station()
+        missing.record_failure(UpstreamError('a', 503, 'bad'), model='m', path='/responses')
+        evidence = missing.routing_evidence('m', '/responses', True)
+        self.assertIsNone(evidence['speed_score'])
+        self.assertEqual(evidence['speed_samples'], 0)
+        self.assertAlmostEqual(evidence['score'], evidence['reliability_score'] * .925)
+
+    def test_routing_counts_speed_once_and_keeps_manual_weight(self):
+        registry = Registry(GatewayConfig(), [station('a').cfg, station('b').cfg])
+        a, b = registry.get('a'), registry.get('b')
+        for _ in range(50):
+            a.record_success(2, model='m', path='/responses', stream=True)
+            b.record_success(4, model='m', path='/responses', stream=True)
+        router = Router(registry, registry.gateway)
+        with patch('app.router._weighted_choice', return_value=a) as choose:
+            router.pick('m', '/responses', stream=True)
+        self.assertEqual(choose.call_args.args[1], [.5, .5])
+        registry.update_station('a', {'priority_auto': False, 'priority': 1})
+        with patch('app.router._weighted_choice', return_value=a) as choose:
+            router.pick('m', '/responses', stream=True)
+        self.assertEqual(choose.call_args.args[1], [2 / 3, 1 / 3])
 
     def test_unknown_disabled_and_sparse_data_are_distinct(self):
         st = station()
@@ -82,7 +168,8 @@ class HealthScoringTests(unittest.TestCase):
         with patch('app.state.time.time', return_value=now):
             for _ in range(30):
                 st.record_success(30)
-        self.assertGreater(st.health_score, 85)
+        self.assertGreater(st.score_breakdown['reliability_score'], 85)
+        self.assertGreater(st.health_score, 75)
         self.assertGreater(st.health_score, before)
         with patch('app.state.time.time', return_value=now + 25 * 3600):
             st._update_score()
@@ -215,7 +302,7 @@ class StreamingHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.st.calls, 1)
         self.assertEqual(self.st.failures, 0)
         self.assertEqual(self.st.score_breakdown['business_samples'], 1)
-        self.assertGreater(self.st.health_score, 90)
+        self.assertGreater(self.st.health_score, 85)
 
     async def test_stream_error_is_failure_and_cancellation_is_neutral(self):
         response = await self.stream(httpx.ReadError('lost'))

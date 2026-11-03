@@ -85,6 +85,27 @@ class AccountTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.manager.active.eventlog.daily_totals['2026-10-21']['calls'], 17)
         self.assertEqual(self.manager.active.gateway.max_attempts, 6)
 
+    async def test_scoring_policy_is_account_scoped_and_survives_restart(self):
+        self.assertEqual((await self.request('/admin/settings/scoring', 'PUT', {'scoring_speed_weight': .05})).status_code, 200)
+        account_id = await self.create()
+        await self.switch(account_id)
+        self.assertEqual((await self.request('/admin/settings/scoring')).json()['scoring_speed_weight'], .15)
+        await self.request('/admin/settings/scoring', 'PUT', {'scoring_speed_weight': .45})
+        await self.switch('default')
+        self.assertEqual((await self.request('/admin/settings/scoring')).json()['scoring_speed_weight'], .05)
+        # Ignore in-memory values: a fresh app must read each account's saved file.
+        self.cfg.gateway.scoring_speed_weight = .15
+        restored = build_app(self.cfg)
+        try:
+            self.assertEqual((await self.request('/admin/settings/scoring', app=restored)).json()['scoring_speed_weight'], .05)
+            response = await self.request('/admin/accounts/' + account_id + '/switch', 'POST', {}, app=restored)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual((await self.request('/admin/settings/scoring', app=restored)).json()['scoring_speed_weight'], .45)
+        finally:
+            for runtime in restored.state.accounts.runtimes.values():
+                await runtime.registry.close_clients()
+                await runtime.notifier.close()
+
     async def test_discovered_models_and_priority_mode_follow_active_account(self):
         default = self.manager.active
         default.registry.get('legacy').probed_models = {'private-old-model'}

@@ -145,7 +145,7 @@
           </div>
         </section></section>
 
-      <section id="stations-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stations" hidden=""><div class="section-tabs" data-tab-group="stations" role="tablist" aria-label="站点管理视图"><button id="stations-tab-list" type="button" class="section-tab" data-section="list" role="tab" aria-controls="stations-list" aria-selected="true" tabindex="0">站点列表</button><button id="stations-tab-editor" type="button" class="section-tab" data-section="editor" role="tab" aria-controls="stations-editor" aria-selected="false" tabindex="-1">添加 / 编辑</button><button id="stations-tab-retry" type="button" class="section-tab" data-section="retry" role="tab" aria-controls="retry-wrap" aria-selected="false" tabindex="-1">账号重试策略</button><button id="stations-tab-probe" type="button" class="section-tab" data-section="probe" role="tab" aria-controls="probe-wrap" aria-selected="false" tabindex="-1">账号探测策略</button></div><section class="stats-section section-panel" aria-labelledby="stations-tab-list" id="stations-list" data-section-panel="stations" data-section="list" role="tabpanel">
+      <section id="stations-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stations" hidden=""><div class="section-tabs" data-tab-group="stations" role="tablist" aria-label="站点管理视图"><button id="stations-tab-list" type="button" class="section-tab" data-section="list" role="tab" aria-controls="stations-list" aria-selected="true" tabindex="0">站点列表</button><button id="stations-tab-editor" type="button" class="section-tab" data-section="editor" role="tab" aria-controls="stations-editor" aria-selected="false" tabindex="-1">添加 / 编辑</button><button id="stations-tab-scoring" type="button" class="section-tab" data-section="scoring" role="tab" aria-controls="scoring-wrap" aria-selected="false" tabindex="-1">账号评分策略</button><button id="stations-tab-retry" type="button" class="section-tab" data-section="retry" role="tab" aria-controls="retry-wrap" aria-selected="false" tabindex="-1">账号重试策略</button><button id="stations-tab-probe" type="button" class="section-tab" data-section="probe" role="tab" aria-controls="probe-wrap" aria-selected="false" tabindex="-1">账号探测策略</button></div><section class="stats-section section-panel" aria-labelledby="stations-tab-list" id="stations-list" data-section-panel="stations" data-section="list" role="tabpanel">
             <div class="section-heading compact">
               <div>
                 <span class="section-kicker">MANAGED</span>
@@ -214,7 +214,7 @@
                 <label class="checkbox"><input type="checkbox" id="sf-priority-auto" checked> 自动优先级</label>
                 <label>手动优先级 <input id="sf-priority" type="number" value="5" min="1" max="10000" disabled></label>
                 <label>计费模式 <select id="sf-billing"><option value="balance">余额制</option><option value="subscription">订阅制</option></select></label>
-                <p class="routing-note" id="sf-priority-note">自动：按同模型、同协议的可靠性调度；同档位参考响应速度与权重。</p>
+                <p class="routing-note" id="sf-priority-note">自动：按同模型、同协议的综合健康度调度，速度占比采用账号评分策略。</p>
                 <label class="checkbox"><input type="checkbox" id="sf-enabled" checked> 启用</label>
               </div>
               <p class="form-status" id="stationFormStatus" role="status" aria-live="polite"></p>
@@ -223,6 +223,24 @@
               </div>
             </form>
           </section>
+
+      <section id="scoring-wrap" class="station-policy-panel section-panel" data-section-panel="stations" data-section="scoring" role="tabpanel" aria-labelledby="stations-tab-scoring" hidden>
+        <div class="retry-settings-layout">
+          <div class="section-heading retry-settings-heading"><div><span class="section-kicker">当前账号 · 所有站点</span><h2>健康评分</h2></div><button class="button secondary" id="scoring-reload" type="button">重新加载</button></div>
+          <p class="policy-intro">决定响应速度对健康分的影响。当前账号独立保存，评分与自动调度同时生效。</p>
+          <form id="scoring-form" class="retry-settings-form">
+            <fieldset class="retry-settings-group">
+              <legend>速度权重</legend>
+              <div class="retry-field-grid"><label class="retry-field" for="scoring-speed-weight"><span>速度占比（%）</span><input id="scoring-speed-weight" type="number" min="0" max="100" step="any" required inputmode="decimal" aria-describedby="scoring-preview" disabled></label></div>
+              <p class="access-note" id="scoring-preview" aria-live="polite">默认 15%。0% 只看可靠性，100% 完整应用速度系数。</p>
+              <p class="access-note">综合分 = 可靠性 ×（1 − 权重 + 权重 × 速度分 / 100）。流式按首字等待、非流式按完整响应计速，极端延迟逐条封顶。</p>
+              <p class="access-note">保存后用现有业务样本重新计算，无需重启，不增加探测或 Token 消耗。熔断、限流和额度保护仍独立生效。</p>
+              <button class="button secondary" id="scoring-reset" type="button" disabled>恢复默认 15%</button>
+            </fieldset>
+            <div class="retry-settings-footer"><p class="form-status" id="scoringSettingsStatus" role="status" aria-live="polite"></p><button class="button primary" id="scoring-save" type="submit" disabled>保存设置</button></div>
+          </form>
+        </div>
+      </section>
 
       <section id="retry-wrap" class="station-policy-panel section-panel" data-section-panel="stations" data-section="retry" role="tabpanel" aria-labelledby="stations-tab-retry" hidden="">
         <div class="retry-settings-layout">
@@ -555,12 +573,12 @@
     <header class="account-dialog-heading"><div><span id="scoreStationName" class="section-kicker"></span><h2 id="scoreTitle">健康度依据</h2></div><button id="scoreClose" class="account-close" type="button" aria-label="关闭健康度说明"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
     <p id="scoreSummary" class="score-summary"></p>
     <dl id="scoreFacts" class="score-facts"></dl>
-    <div class="score-explanation"><p>健康度看真实业务是否可靠完成。流式结束才记成功；速度、手动优先级不加减健康分。</p><p>近期结果权重更高：每 6 小时、每向前 20 个样本，权重分别减半；使用 2 个、成功率 90% 的先验样本作平滑，避免一次成功就满分。</p><p>客户端取消、参数错误、本地连接池问题、限流与额度不足不计健康失败。熔断、限流和额度保护仍独立控制是否允许路由。</p><p id="scoreMigrationNote" hidden>旧版样本缺少时间和错误归因，已停止用于评分。历史用量和日志保留，新分数随正常业务积累，不额外发送生成请求。</p></div>
+    <div class="score-explanation"><p id="scorePolicyNote"></p><p id="scoreSpeedNote"></p><p>流式正常结束才记成功。每 6 小时、每向前 20 个样本，权重分别减半；可靠性使用 2 个、成功率 90% 的先验样本平滑。</p><p>客户端取消、参数错误、本地连接池问题、限流与额度不足不计健康失败。熔断、限流和额度保护仍独立控制路由。</p><p id="scoreMigrationNote" hidden>旧版样本缺少时间和错误归因，已停止用于评分。历史用量和日志保留，新分数随正常业务积累，不额外发送生成请求。</p></div>
   </dialog>
   <dialog id="channelModelsDialog" class="channel-models-dialog" aria-labelledby="channelModelsTitle"><header class="visual-dialog-heading"><div><span class="section-kicker" id="channelModelsStation"></span><h2 id="channelModelsTitle">支持的模型</h2></div><button id="channelModelsClose" class="account-close" type="button" aria-label="关闭模型列表"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="channel-models-toolbar"><input id="channelModelsSearch" type="search" placeholder="搜索完整模型名称" aria-label="搜索完整模型名称"><span id="channelModelsCount"></span></div><div id="channelModelsList" class="channel-models-list"></div><footer class="channel-models-footer" id="channelModelsNote"></footer></dialog>
   <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
   <script src="/static/vendor/echarts.min.js?v=5.6.0" defer=""></script>
-  <script src="/static/dashboard.js?v=45" defer=""></script>
+  <script src="/static/dashboard.js?v=46" defer=""></script>
   <script src="/static/go-usage.js?v=2" defer></script>
   <script src="/static/analytics.js?v=8" defer></script>
   <script src="/static/accounts.js?v=17" defer></script>

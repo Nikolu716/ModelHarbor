@@ -161,6 +161,8 @@ class AccountRuntime:
             setattr(self.gateway, field, value)
         for field, value in (settings.load_probe(self.gateway) or {}).items():
             setattr(self.gateway, field, value)
+        for field, value in (settings.load_scoring() or {}).items():
+            setattr(self.gateway, field, value)
         stations = StationStore(directory)
         saved = stations.load()
         # A broken saved station file must never reactivate a different account's YAML stations.

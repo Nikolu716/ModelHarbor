@@ -35,6 +35,9 @@ let probeSettingsUpdatedAt = 0;
 let probeSettingsLoading = false;
 let probeSettingsSaving = false;
 let probeSettingsData = null;
+let scoringSettingsUpdatedAt = 0;
+let scoringSettingsBusy = false;
+let scoringSettingsLoaded = false;
 let endpointData = null;
 let endpointSettingsBusy = false;
 let accessSettingsBusy = false;
@@ -100,11 +103,16 @@ function formatCount(value) {
   return numberFormat.format(Math.max(0, finiteNumber(value)));
 }
 
+function scoringWeight(breakdown = {}) {
+  return clamp(finiteNumber(breakdown.speed_weight, finiteNumber(statusData?.gateway?.scoring_speed_weight, .15)), 0, 1);
+}
+
 function scoreBreakdownTitle(breakdown = {}) {
   if (breakdown.disabled) return "已停用 · 健康分 0，不参与路由";
   if (!breakdown.business_samples) return "待评估 · 等待真实业务结果，不会为评分发送生成探测";
   const confidence = { low: "样本较少", medium: "样本一般", high: "样本充足" }[breakdown.confidence] || "";
-  return `近 24 小时最近 ${formatCount(breakdown.business_samples)} 个有效业务结果 · 成功率 ${(finiteNumber(breakdown.success_rate) * 100).toFixed(1)}% · ${confidence}；速度不扣健康分。点击查看依据`;
+  const speed = breakdown.speed_penalty == null ? "" : ` · 速度影响 −${breakdown.speed_penalty.toFixed(1)} 分（权重 ${percentFormat.format(scoringWeight(breakdown) * 100)}%）`;
+  return `近 24 小时最近 ${formatCount(breakdown.business_samples)} 个有效业务结果 · 成功率 ${(finiteNumber(breakdown.success_rate) * 100).toFixed(1)}% · ${confidence}${speed}。点击查看依据`;
 }
 
 function scoreBadge(station) {
@@ -126,12 +134,18 @@ function showScoreDetails(name) {
   const rows = [
     ["当前状态", statusInfo(station).label],
     ["有效业务样本", `${formatCount(b.business_samples)} / 100`],
+    ["业务可靠性", b.reliability_score == null ? "—" : `${b.reliability_score.toFixed(1)} / 100`],
+    ["速度影响", b.speed_penalty == null ? "—" : `−${b.speed_penalty.toFixed(1)} 分 · ${formatCount(b.speed_samples)} 次成功`],
     ["窗口成功率", b.success_rate == null ? "—" : `${(b.success_rate * 100).toFixed(1)}%`],
     ["样本可信度", confidence],
     ["最近业务结果", b.last_sample_at ? formatTime(b.last_sample_at) : "—"],
     ["统计范围", "最近 24 小时，最多 100 个结果"],
   ];
   $("scoreFacts").innerHTML = rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+  const weight = scoringWeight(b);
+  const percent = percentFormat.format(weight * 100);
+  $("scorePolicyNote").textContent = `健康度以真实业务可靠性为基础，当前速度权重 ${percent}%。可在「站点管理 → 账号评分策略」调整，手动优先级不改变分数。`;
+  $("scoreSpeedNote").textContent = weight === 0 ? "当前不按速度扣分，综合分等于可靠性。速度数据继续记录，之后调整权重无需重新积累样本。" : `综合分 = 可靠性 ×（${Number((1 - weight).toFixed(4))} + ${weight} × 速度分 / 100）。流式首字 ≤2 秒、非流式完整响应 ≤10 秒为满速；分别到 30 秒、120 秒后不再扣更多。${b.business_samples && !b.speed_samples ? "缺少对应速度样本时暂用中性速度分 50。" : "逐条封顶、按近期权重平均，用 2 个中性样本平滑。"}`;
   $("scoreMigrationNote").hidden = !(b.legacy_samples_ignored && !b.business_samples);
   $("healthScoreDialog").showModal();
 }
@@ -494,6 +508,7 @@ function setSectionTab(group, section, { focus = false } = {}) {
 function refreshStationPolicy(force = false) {
   const section = document.querySelector('[data-tab-group="stations"] [aria-selected="true"]')?.dataset.section;
   if (section === "retry" && (force || Date.now() - retrySettingsUpdatedAt > 30000)) return refreshRetrySettings({ notify: true });
+  if (section === "scoring" && (force || Date.now() - scoringSettingsUpdatedAt > 30000)) return refreshScoringSettings();
   if (["probe", "editor"].includes(section) && (force || Date.now() - probeSettingsUpdatedAt > 30000)) return refreshProbeSettings();
 }
 function scheduleViewportLayout() {
@@ -1806,6 +1821,82 @@ async function saveRetrySettings() {
   }
 }
 
+function setScoringSettingsStatus(message, state = "") {
+  const element = $("scoringSettingsStatus");
+  element.textContent = message;
+  element.classList.toggle("is-error", state === "error");
+  element.classList.toggle("is-success", state === "success");
+}
+
+function setScoringSettingsBusy() {
+  $("scoring-form").setAttribute("aria-busy", String(scoringSettingsBusy));
+  $("scoring-speed-weight").disabled = scoringSettingsBusy || !scoringSettingsLoaded;
+  $("scoring-save").disabled = scoringSettingsBusy || !scoringSettingsLoaded;
+  $("scoring-reset").disabled = scoringSettingsBusy || !scoringSettingsLoaded;
+  $("scoring-reload").disabled = scoringSettingsBusy;
+}
+
+function updateScoringPreview() {
+  const raw = $("scoring-speed-weight").value.trim();
+  const percent = Number(raw);
+  $("scoring-preview").textContent = !raw || !Number.isFinite(percent) || percent < 0 || percent > 100
+    ? "请输入 0–100 之间的百分比。"
+    : percent === 0 ? "只按可靠性评分，速度不扣分。"
+    : `速度最多降低可靠性得分的 ${percentFormat.format(percent)}%。例如可靠性为 100，综合分范围为 ${percentFormat.format(100 - percent)}–100。`;
+}
+
+function applyScoringSettings(settings) {
+  const weight = settings?.scoring_speed_weight;
+  if (typeof weight !== "number" || !Number.isFinite(weight) || weight < 0 || weight > 1) throw new Error("接口未返回有效的速度权重");
+  $("scoring-speed-weight").value = String(Number((weight * 100).toFixed(4)));
+  scoringSettingsLoaded = true;
+  scoringSettingsUpdatedAt = Date.now();
+  if (statusData?.gateway) statusData.gateway.scoring_speed_weight = weight;
+  updateScoringPreview();
+  updatePriorityMode();
+}
+
+async function refreshScoringSettings() {
+  if (scoringSettingsBusy) return;
+  scoringSettingsBusy = true;
+  setScoringSettingsBusy();
+  setScoringSettingsStatus("正在读取设置...");
+  try {
+    applyScoringSettings(await api("/admin/settings/scoring"));
+    setScoringSettingsStatus("");
+  } catch (error) {
+    scoringSettingsLoaded = false;
+    setScoringSettingsStatus(`读取失败: ${error.message}`, "error");
+  } finally {
+    scoringSettingsBusy = false;
+    setScoringSettingsBusy();
+  }
+}
+
+async function saveScoringSettings() {
+  if (scoringSettingsBusy || !scoringSettingsLoaded) return;
+  const raw = $("scoring-speed-weight").value.trim();
+  const percent = Number(raw);
+  if (!raw || !Number.isFinite(percent) || percent < 0 || percent > 100) {
+    setScoringSettingsStatus("速度权重必须在 0–100% 之间", "error");
+    return;
+  }
+  scoringSettingsBusy = true;
+  setScoringSettingsBusy();
+  setScoringSettingsStatus("正在保存设置...");
+  try {
+    applyScoringSettings(await api("/admin/settings/scoring", "PUT", true, { scoring_speed_weight: percent / 100 }));
+    setScoringSettingsStatus("已保存，评分与路由即时生效", "success");
+    await refresh(true);
+    if ($("healthScoreDialog").open) showScoreDetails($("scoreStationName").textContent);
+  } catch (error) {
+    setScoringSettingsStatus(`保存失败: ${error.message}`, "error");
+  } finally {
+    scoringSettingsBusy = false;
+    setScoringSettingsBusy();
+  }
+}
+
 function setProbeSettingsStatus(message, state = "") {
   const element = $("probeSettingsStatus");
   element.textContent = message;
@@ -2308,6 +2399,10 @@ $("probe-form").addEventListener("submit", (event) => {
   saveProbeSettings();
 });
 $("probe-reload").addEventListener("click", refreshProbeSettings);
+$("scoring-form").addEventListener("submit", event => { event.preventDefault(); saveScoringSettings(); });
+$("scoring-reload").addEventListener("click", refreshScoringSettings);
+$("scoring-speed-weight").addEventListener("input", updateScoringPreview);
+$("scoring-reset").addEventListener("click", () => { $("scoring-speed-weight").value = "15"; updateScoringPreview(); });
 
 $("usageTabs").addEventListener("keydown", (event) => {
   const current = event.target.closest("button[data-usage-station]");
@@ -2505,8 +2600,8 @@ function updatePriorityMode() {
   const auto = $("sf-priority-auto").checked;
   $("sf-priority").disabled = auto;
   $("sf-priority-note").textContent = auto
-    ? "自动：按同模型、同协议的可靠性调度；同档位参考响应速度与权重。"
-    : "手动：1–5 在同可靠性档位内分别给予 2 / 1.8 / 1.6 / 1.4 / 1.2 倍分流权重；6 及以上为 1 倍，不改变健康分。";
+    ? `自动：按同模型、同协议的综合健康度调度，当前速度权重 ${percentFormat.format(scoringWeight() * 100)}%；同档位按配置权重分流。`
+    : "手动：1–5 在同健康度档位内分别给予 2 / 1.8 / 1.6 / 1.4 / 1.2 倍分流权重；6 及以上为 1 倍，不改变健康分。";
 }
 
 function renderStationModels() {
@@ -2718,7 +2813,7 @@ function renderStations() {
           ${station.quota_exhausted ? '<span class="station-warning">上游额度不可用</span>' : ""}</td>
         <td class="station-url-cell" title="${escapeHtml(station.base_url || "")}">${escapeHtml(station.base_url || "-")}</td>
         <td class="station-models-cell"><button type="button" class="catalog-link" data-manage-action="models" data-station="${escapeHtml(name)}" title="${escapeHtml(modelsLabel)}">${escapeHtml(scopeLabel)}</button></td>
-        <td title="${station.priority_auto ? "按同模型、同协议的可靠性自动调度" : "同可靠性档位内优先分流，不改变健康分"}">${station.priority_auto ? `自动${station.rank ? ` · #${station.rank}` : ""}` : formatCount(station.priority)}</td>
+        <td title="${station.priority_auto ? "按同模型、同协议的综合健康度自动调度；速度占比采用账号评分策略" : "同健康度档位内优先分流，不改变健康分"}">${station.priority_auto ? `自动${station.rank ? ` · #${station.rank}` : ""}` : formatCount(station.priority)}</td>
         <td class="muted">${station.billing === "subscription" ? "订阅" : "余额"}</td>
         <td>${protectionMarkup(station)}</td>
         <td><div class="station-manage-actions">

@@ -1,7 +1,7 @@
 """路由与故障转移。
 
 根据模型名选出候选站（启用 + 健康 + 支持该模型），按**动态健康评分**
-排序。健康分只反映可靠性；同模型、同协议、同流式模式的速度独立参与分流。
+排序。可靠性为基础，速度占比由账号配置；同档位按配置权重和手动偏好分流。
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class Router:
         return self.registry.candidates_for(model, path)
 
     def pick(self, model: str, path: str | None = None, *, stream: bool | None = None) -> list[StationState]:
-        """Reliability bands first, bounded speed/manual preference inside a band."""
+        """Composite score bands first; never count the speed penalty twice."""
         cands = self.candidates(model, path)
         if len(cands) <= 1:
             return cands
@@ -53,14 +53,7 @@ class Router:
             if len(group) == 1:
                 ordered.append(group[0])
             else:
-                measured = sorted(evidence[st.cfg.name]['latency'] for st in group
-                                  if evidence[st.cfg.name]['latency'] is not None)
-                neutral = measured[len(measured) // 2] if measured else 10.0
-                lat = {st.cfg.name: evidence[st.cfg.name]['latency']
-                       if evidence[st.cfg.name]['latency'] is not None else neutral for st in group}
-                # Never let speed drown out reliability; no cross-model latency fallback.
-                w = [st.cfg.weight * (1 + st.priority_bias / 15.0)
-                     / (1 + min(30.0, lat[st.cfg.name]) / 10.0) for st in group]
+                w = [st.cfg.weight * (1 + st.priority_bias / 15.0) for st in group]
                 total = sum(w)
                 ordered.append(_weighted_choice(group, [x / total for x in w]))
                 ordered.extend(st for st in group if st not in ordered)

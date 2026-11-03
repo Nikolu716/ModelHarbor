@@ -80,6 +80,25 @@ with tempfile.TemporaryDirectory() as directory:
             page.on('request', inspect_request)
             page.goto(f'http://127.0.0.1:{port}/dashboard')
             page.locator('[data-channel-models="Visual QA"]').first.wait_for()
+            page.locator('#tab-stations').click()
+            page.locator('#stations-tab-scoring').click()
+            page.wait_for_function('!document.querySelector("#scoring-speed-weight").disabled')
+            assert page.locator('#scoring-speed-weight').input_value() == '15'
+            page.locator('#scoring-speed-weight').fill('35')
+            assert '65–100' in page.locator('#scoring-preview').inner_text()
+            page.locator('#scoring-save').click()
+            page.wait_for_function('document.querySelector("#scoringSettingsStatus").textContent.includes("即时生效")')
+            assert runtime.gateway.scoring_speed_weight == .35
+            page.reload()
+            page.locator('#stations-tab-scoring').click()
+            page.wait_for_function('!document.querySelector("#scoring-speed-weight").disabled')
+            assert page.locator('#scoring-speed-weight').input_value() == '35'
+            page.locator('#scoring-reset').click()
+            page.locator('#scoring-save').click()
+            page.wait_for_function('document.querySelector("#scoringSettingsStatus").textContent.includes("即时生效")')
+            assert runtime.gateway.scoring_speed_weight == .15
+            assert len(calls) == 0
+            page.locator('#tab-monitor').click()
             assert page.locator('#monitor-tab-visual').inner_text() == '智商测试'
             assert page.locator('#list-wrap th.col-visual').inner_text() == '智商测试'
             page.locator('#station-search').fill('Atlas')
@@ -236,6 +255,16 @@ with tempfile.TemporaryDirectory() as directory:
             for width, height in [(1920, 1080), (1366, 768), (1280, 720), (1024, 768), (768, 1024), (390, 844), (360, 640), (844, 390)]:
                 page.locator('#visualTestClose').click()
                 page.set_viewport_size({'width': width, 'height': height})
+                page.locator('#tab-stations').click()
+                page.locator('#stations-tab-scoring').click()
+                page.wait_for_function('!document.querySelector("#scoring-speed-weight").disabled')
+                assert page.evaluate('document.documentElement.scrollWidth <= innerWidth + 1 && document.documentElement.scrollHeight <= innerHeight + 1'), (width, height, 'scoring page overflow')
+                save = page.locator('#scoring-save').bounding_box()
+                assert save and save['y'] >= 0 and save['y'] + save['height'] <= height + 1, (width, height, 'scoring save visibility')
+                assert page.locator('#scoring-wrap').evaluate('e => e.scrollWidth <= e.clientWidth + 1')
+                if width in (1366, 390):
+                    page.screenshot(path=str(OUT / f'{width}-{height}-scoring-policy.png'))
+                page.locator('#tab-monitor').click()
                 page.locator('#monitor-tab-stations').click()
                 page.locator('#station-search').fill('')
                 page.wait_for_timeout(150)

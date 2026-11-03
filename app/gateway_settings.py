@@ -1,4 +1,4 @@
-"""Runtime-editable gateway retry settings and atomic persistence."""
+"""Account-scoped retry, probe, scoring and log settings with atomic persistence."""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import GatewayConfig
+from .scoring import validate_speed_weight
 
 
 RETRY_SETTING_FIELDS = (
@@ -21,6 +22,16 @@ RETRY_SETTING_FIELDS = (
 
 DEFAULT_EVENT_RETENTION = 500
 MAX_EVENT_RETENTION = 10_000
+
+
+def scoring_settings_view(gateway: GatewayConfig) -> dict[str, float]:
+    return {"scoring_speed_weight": gateway.scoring_speed_weight}
+
+
+def validate_scoring_settings(values: object) -> dict[str, float]:
+    if not isinstance(values, dict) or set(values) != {"scoring_speed_weight"}:
+        raise ValueError("评分设置须包含且仅包含 scoring_speed_weight")
+    return {"scoring_speed_weight": validate_speed_weight(values["scoring_speed_weight"])}
 
 
 def retry_settings_view(gateway: GatewayConfig) -> dict[str, int | float]:
@@ -118,10 +129,35 @@ def validate_retry_settings(
 
 
 class GatewaySettingsStore:
-    """Persist retry settings without exposing unrelated gateway secrets."""
+    """Persist account policies without exposing unrelated gateway secrets."""
 
     def __init__(self, data_dir: str):
         self.path = Path(data_dir) / "gateway-settings.json"
+
+    def load_scoring(self) -> dict[str, float] | None:
+        if not self.path.exists():
+            return None
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("settings root must be an object")
+            values = payload.get("scoring")
+            return validate_scoring_settings(values) if values is not None else None
+        except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+            print(f"[settings] 评分设置加载失败（使用配置默认值）: {exc}")
+            return None
+
+    def save_scoring(self, values: dict[str, float]) -> None:
+        normalized = validate_scoring_settings(values)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Preserve retry/probe/log settings and only activate after the atomic write.
+        payload = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
+        if not isinstance(payload, dict):
+            raise ValueError("settings root must be an object")
+        payload["scoring"] = normalized
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.replace(self.path)
 
     def load(self, defaults: GatewayConfig) -> dict[str, int | float] | None:
         if not self.path.exists():

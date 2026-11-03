@@ -185,6 +185,8 @@ async function main() {
   let delayedStationList = null;
   let delayedRetrySave = null;
   let failNextRetrySave = false;
+  let scoringWeightFixture = .15;
+  let failNextScoringSave = false;
   let allowedIps = ["192.0.2.40", "198.51.100.92", "203.0.113.27", "203.0.113.23"];
   let failNextAccessSave = false;
   let servicePort = 8000;
@@ -271,6 +273,17 @@ async function main() {
     }
     if (url === "/admin/service/restart" && method === "POST") {
       return jsonResponse({ scheduled: true }, 202);
+    }
+    if (url === "/admin/settings/scoring") {
+      if (method === "PUT") {
+        if (failNextScoringSave) {
+          failNextScoringSave = false;
+          return jsonResponse({ detail: "mock scoring save failure" }, 500);
+        }
+        scoringWeightFixture = body.scoring_speed_weight;
+        statusFixture.gateway.scoring_speed_weight = scoringWeightFixture;
+      }
+      return jsonResponse({ scoring_speed_weight: scoringWeightFixture, persisted: method === "PUT" });
     }
     if (url === "/admin/settings/retry" && method === "GET") {
       return jsonResponse({ settings: { ...retrySettings } });
@@ -407,9 +420,50 @@ async function main() {
   document.querySelector('#list-wrap [data-score-station]').click();
   assert.equal(document.getElementById('healthScoreDialog').open, true);
   assert.equal(document.getElementById('scoreStationName').textContent, maliciousStation);
+  assert.ok(document.getElementById('scoreSpeedNote').textContent.includes('0.15'));
   assert.equal(document.querySelectorAll('#healthScoreDialog script, #healthScoreDialog img').length, 0);
   document.getElementById('scoreClose').click();
   assert.equal(document.getElementById('healthScoreDialog').open, false);
+  document.getElementById('tab-stations').click();
+  document.getElementById('stations-tab-scoring').click();
+  await settle();
+  const speedInput = document.getElementById('scoring-speed-weight');
+  const scoringForm = document.getElementById('scoring-form');
+  assert.equal(speedInput.value, '15');
+  speedInput.value = '35';
+  speedInput.dispatchEvent(new window.Event('input', { bubbles: true }));
+  assert.match(document.getElementById('scoring-preview').textContent, /65–100/);
+  scoringForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  assert.equal(scoringWeightFixture, .35);
+  assert.match(document.getElementById('scoringSettingsStatus').textContent, /即时生效/);
+  document.querySelector('#list-wrap [data-score-station]').click();
+  assert.match(document.getElementById('scorePolicyNote').textContent, /35%/);
+  assert.match(document.getElementById('scoreSpeedNote').textContent, /0.35/);
+  document.getElementById('scoreClose').click();
+  speedInput.value = '';
+  scoringForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  assert.equal(scoringWeightFixture, .35);
+  assert.match(document.getElementById('scoringSettingsStatus').textContent, /0–100%/);
+  failNextScoringSave = true;
+  speedInput.value = '50';
+  scoringForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  assert.equal(scoringWeightFixture, .35);
+  assert.match(document.getElementById('scoringSettingsStatus').textContent, /保存失败/);
+  speedInput.value = '0';
+  scoringForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  assert.equal(scoringWeightFixture, 0);
+  document.querySelector('#list-wrap [data-score-station]').click();
+  assert.match(document.getElementById('scoreSpeedNote').textContent, /不按速度扣分/);
+  document.getElementById('scoreClose').click();
+  document.getElementById('scoring-reset').click();
+  scoringForm.dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  assert.equal(scoringWeightFixture, .15);
+  document.getElementById('tab-monitor').click();
   const protectionStation = { name: maliciousStation, enabled: true, status: "down", protection: {
     kind: "breaker", until: Date.now() / 1000 + 60, failure_count: 3, status_code: 503,
     source: "request", reason: maliciousModel,

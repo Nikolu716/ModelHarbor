@@ -16,6 +16,7 @@ from app.gateway_settings import (
     GatewaySettingsStore,
     probe_settings_view,
     retry_settings_view,
+    validate_scoring_settings,
 )
 from app.service_settings import ServiceSettingsStore
 from app.state import Registry
@@ -95,6 +96,64 @@ class GatewaySettingsTests(unittest.TestCase):
         payload = json.loads(self.store.path.read_text(encoding="utf-8"))
         self.assertEqual(set(payload), {"retry", "probe"})
         self.assertEqual(payload["probe"], probe_settings_view(self.gateway))
+
+    def test_scoring_weight_is_live_persisted_and_preserves_evidence(self):
+        self.store.save_probe({"generation_probe_enabled": False, "generation_probe_interval": 900})
+        self.store.save_logs(700)
+        self.assertEqual(self.client.get('/admin/settings/scoring').json(), {'scoring_speed_weight': .15})
+        st = self.registry.get('alpha')
+        for _ in range(30):
+            st.record_success(30, model='model-a', path='/responses', stream=True)
+        original_score = st.health_score
+        evidence = list(st.health_samples)
+        counters = (st.calls, st.failures)
+        response = self.client.put('/admin/settings/scoring', json={'scoring_speed_weight': 0})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()['persisted'])
+        self.assertEqual(self.gateway.scoring_speed_weight, 0)
+        self.assertGreater(st.health_score, original_score)
+        self.assertEqual(st.health_score, st.score_breakdown['reliability_score'])
+        self.assertEqual(st.routing_evidence('model-a', '/responses', True)['speed_weight'], 0)
+        self.assertEqual(list(st.health_samples), evidence)
+        self.assertEqual((st.calls, st.failures), counters)
+        self.assertEqual(self.store.load_scoring(), {'scoring_speed_weight': 0})
+        self.assertEqual(self.store.load_logs(), 700)
+        self.assertEqual(self.store.load_probe(self.gateway), probe_settings_view(self.gateway))
+        self.store.save(retry_settings_view(self.gateway))
+        self.assertEqual(self.store.load_scoring(), {'scoring_speed_weight': 0})
+        new = self.registry.add_station(StationConfig('new', 'https://new.invalid', 'fixture'))
+        new.record_success(60)
+        self.assertEqual(new.health_score, new.score_breakdown['reliability_score'])
+        self.assertEqual(self.registry.snapshot()['gateway']['scoring_speed_weight'], 0)
+
+    def test_invalid_scoring_weight_does_not_change_runtime_or_disk(self):
+        for body in [{}, {'unknown': .2}, {'scoring_speed_weight': True},
+                     {'scoring_speed_weight': '0.2'}, {'scoring_speed_weight': -.1},
+                     {'scoring_speed_weight': 1.01}, {'scoring_speed_weight': None},
+                     {'scoring_speed_weight': .2, 'admin_key': 'forbidden'}]:
+            with self.subTest(body=body):
+                response = self.client.put('/admin/settings/scoring', json=body)
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(self.gateway.scoring_speed_weight, .15)
+                self.assertFalse(self.store.path.exists())
+        for value in [float('nan'), float('inf'), -float('inf')]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_scoring_settings({'scoring_speed_weight': value})
+
+    def test_scoring_save_failure_preserves_runtime_and_invalid_saved_values_fall_back(self):
+        st = self.registry.get('alpha')
+        st.record_success(30)
+        before = st.health_score
+        with patch.object(self.store, 'save_scoring', side_effect=OSError('mock disk failure')):
+            response = self.client.put('/admin/settings/scoring', json={'scoring_speed_weight': .4})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(self.gateway.scoring_speed_weight, .15)
+        self.assertEqual(st.health_score, before)
+        self.store.path.write_text('{"scoring":{"scoring_speed_weight":2}}', encoding='utf-8')
+        self.assertIsNone(self.store.load_scoring())
+        self.assertEqual(GatewayConfig.from_dict({'scoring_speed_weight': 1}).scoring_speed_weight, 1)
+        with self.assertRaises(ValueError):
+            GatewayConfig.from_dict({'scoring_speed_weight': True})
 
     def test_probe_settings_are_live_persisted_and_loopback_endpoint_uses_public_url(self) -> None:
         before = self.client.get("/admin/settings/probe")

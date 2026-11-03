@@ -26,6 +26,8 @@ from ..gateway_settings import (
     retry_settings_view,
     validate_probe_settings,
     validate_retry_settings,
+    scoring_settings_view,
+    validate_scoring_settings,
 )
 from ..health import HealthMonitor
 from ..notifier import Notifier
@@ -321,6 +323,25 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             raise HTTPException(500, "重试设置保存失败，请稍后重试") from exc
         for field, value in values.items():
             setattr(gateway, field, value)
+        return {**values, "persisted": True}
+
+    @api.get("/settings/scoring")
+    async def get_scoring_settings():
+        return scoring_settings_view(gateway)
+
+    @api.put("/settings/scoring")
+    async def update_scoring_settings(body: dict):
+        try:
+            values = validate_scoring_settings(body)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            retry_store.save_scoring(values)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(500, "评分设置保存失败，请稍后重试") from exc
+        gateway.scoring_speed_weight = values["scoring_speed_weight"]
+        for st in registry.states.values():
+            st._update_score()
         return {**values, "persisted": True}
 
     @api.get("/settings/probe")
