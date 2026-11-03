@@ -8,6 +8,7 @@
 
 - **多协议接入**：OpenAI Responses / Chat Completions、Anthropic Messages、Gemini GenerateContent，支持流式响应。
 - **模型与路由**：读取渠道模型目录，按精确模型 ID 和协议筛选；支持自动优先级、故障切换、限流冷却与熔断。
+- **模型映射**：各账号按来源 IP 或所有请求配置替代模型，可选多个渠道；日志保留请求模型与实际模型，保存后热生效。
 - **账号热切换**：对外地址保持不变，每个账号独立保存站点、IP 白名单和日志；切换可选账密验证。
 - **可视化统计**：按时间、IP、模型和渠道查看请求与 Token；日志保留条数可配置，重启后恢复已保存数据。
 - **按需测试**：连通性生成探测默认关闭；智商测试支持自定义提示词、模型和推理深度，预览 HTML / SVG，也可选择定时测试。
@@ -76,7 +77,7 @@ python gateway.py
 | Anthropic | `/v1/messages` |
 | Gemini | `/v1beta/models/{model}:generateContent`、`:streamGenerateContent` |
 
-路由保留请求的模型和协议，不自动把一个模型改成另一个。OpenAI 客户端的 Base URL 通常填写 `http://你的主机:8000/v1`；其他客户端按其协议配置。
+默认路由保留请求模型；需要代答时，在「站点管理 → 模型映射」明确配置，例如 `gpt-6-sol → OpenCode Go / deepseek-v4.1-flash`。映射支持 OpenAI Responses / Chat，详见[匹配与兼容范围](docs/model-mappings.md)。OpenAI 客户端的 Base URL 通常填写 `http://你的主机:8000/v1`；其他客户端按其协议配置。
 
 ## 使用边界
 

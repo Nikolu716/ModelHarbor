@@ -346,7 +346,7 @@ class NamespaceMemory:
         return changed
 
 
-def prepare_request(st, path: str, body: dict):
+def prepare_request(st, path: str, body: dict, *, allow_tools: bool = False):
     """决定发往某站的目标路径 / 请求体 / 响应适配器。
 
     返回 (target_path, target_body, adapter)：
@@ -367,6 +367,8 @@ def prepare_request(st, path: str, body: dict):
         paths = st.model_api_paths.get(body.get("model"), [])
         if path in paths:
             wire = entry
+        elif allow_tools and entry == RESPONSES and '/chat/completions' in paths:
+            wire = CHAT
         else:
             raise UnsupportedWireRequest("此模型不支持当前请求协议，请按模型目录选择原生接口。")
     if wire == AUTO:
@@ -375,9 +377,13 @@ def prepare_request(st, path: str, body: dict):
     target_path, target_body, adapter = path, body, None
     if wire != entry:
         if entry == RESPONSES and wire == CHAT:
-            validate_text_adapter(body)
             target_path = "/chat/completions"
-            target_body = responses_to_chat(body)
+            if allow_tools:
+                from .mapping_wire import responses_to_chat as mapped_responses_to_chat
+                target_body = mapped_responses_to_chat(body)
+            else:
+                validate_text_adapter(body)
+                target_body = responses_to_chat(body)
             adapter = ("r2c",)
         elif entry == CHAT and wire == RESPONSES:
             raise UnsupportedWireRequest("此站点使用 Responses，请使用 /v1/responses 接口。")

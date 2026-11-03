@@ -533,6 +533,8 @@ class StationState:
 
 class Registry:
     def __init__(self, gateway: GatewayConfig, stations: list[StationConfig]):
+        from .model_mappings import ModelMappings
+        self.model_mappings = ModelMappings()
         self.gateway = gateway
         self.states: dict[str, StationState] = {
             s.name: StationState(cfg=s, enabled=s.enabled, gateway=gateway) for s in stations
@@ -603,7 +605,8 @@ class Registry:
         with self._activity_lock:
             self._activity_subscribers.pop(subscriber_id, None)
 
-    def begin_route(self, station: str, model: str, client_ip: str | None = None) -> int:
+    def begin_route(self, station: str, model: str, client_ip: str | None = None,
+                    requested_model: str | None = None, mapping_id: str | None = None) -> int:
         """登记一次真正发往上游的尝试，返回用于精确结束该尝试的 ID。"""
         now = time.time()
         with self._activity_lock:
@@ -615,6 +618,7 @@ class Registry:
                 "model": model,
                 "started_at": now,
                 "phase": "connecting",
+                **({'requested_model': requested_model, 'mapping_id': mapping_id} if requested_model else {}),
             }
             self._active_routes[route_id] = route
             self._last_attempt = {
@@ -625,7 +629,8 @@ class Registry:
                 "error": "",
             }
         if self.eventlog:
-            self.eventlog.start_route(route_id, station, model, client_ip)
+            self.eventlog.start_route(route_id, station, model, client_ip,
+                **({'requested_model': requested_model, 'mapping_id': mapping_id} if requested_model else {}))
         self._activity_changed()
         return route_id
 

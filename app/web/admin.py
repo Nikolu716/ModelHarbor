@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from ..config import GatewayConfig, StationConfig
+from ..model_mappings import ModelMappings
 from ..access_control import (
     AccessControlStore, is_ip_allowed, validate_allowed_ips,
 )
@@ -52,6 +53,8 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                         service_store: ServiceSettingsStore | None = None,
                         restart_service=None, visual_scheduler=None) -> APIRouter:
     api = APIRouter(prefix="/admin", tags=["admin"])
+    if registry is not None and gateway is not None and registry.model_mappings.path is None:
+        registry.model_mappings = ModelMappings(gateway.data_dir)
     station_fields = {f.name for f in dataclasses.fields(StationConfig)} - {"name"}
     retry_store = settings_store or (
         GatewaySettingsStore(gateway.data_dir) if gateway is not None else None
@@ -328,6 +331,22 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
     @api.get("/settings/scoring")
     async def get_scoring_settings():
         return scoring_settings_view(gateway)
+
+    @api.get("/model-mappings")
+    async def get_model_mappings():
+        return registry.model_mappings.view()
+
+    @api.put("/model-mappings")
+    async def save_model_mappings(body: dict):
+        if set(body) != {'rules'}:
+            raise HTTPException(400, '请求须包含 rules 列表')
+        try:
+            registry.model_mappings.save(body['rules'], registry)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(500, '映射保存失败，原有规则未改变') from exc
+        return {**registry.model_mappings.view(), 'persisted': True}
 
     @api.put("/settings/scoring")
     async def update_scoring_settings(body: dict):

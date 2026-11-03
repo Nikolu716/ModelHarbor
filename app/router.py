@@ -33,13 +33,21 @@ class Router:
         """返回可路由候选站列表（已过滤不健康/不支持模型的站）。"""
         return self.registry.candidates_for(model, path)
 
-    def pick(self, model: str, path: str | None = None, *, stream: bool | None = None) -> list[StationState]:
+    def pick(self, model: str, path: str | None = None, *, stream: bool | None = None,
+             targets: dict[str, str] | None = None) -> list[StationState]:
         """Composite score bands first; never count the speed penalty twice."""
-        cands = self.candidates(model, path)
+        if targets is None:
+            cands = self.candidates(model, path)
+        else:
+            from .model_mappings import supports_mapping, mapping_path
+            cands = [st for name, st in self.registry.states.items() if name in targets
+                     and self.registry.is_routeable(st) and supports_mapping(st, targets[name], path)]
         if len(cands) <= 1:
             return cands
 
-        evidence = {st.cfg.name: st.routing_evidence(model, path, stream) for st in cands}
+        evidence = {st.cfg.name: st.routing_evidence(
+            targets[st.cfg.name] if targets is not None else model,
+            mapping_path(st, targets[st.cfg.name], path) if targets is not None else path, stream) for st in cands}
         scores = {name: view['score'] if view['score'] is not None else 95.0
                   for name, view in evidence.items()}
         cands.sort(key=lambda st: scores[st.cfg.name], reverse=True)

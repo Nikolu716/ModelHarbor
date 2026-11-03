@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from .access_control import AccessControlStore, is_ip_allowed, validate_allowed_ips
 from .gateway_settings import GatewaySettingsStore
+from .model_mappings import ModelMappings
 from .service_settings import ServiceSettingsStore
 from .health import HealthMonitor
 from .juice import JuiceRegistry
@@ -170,6 +171,7 @@ class AccountRuntime:
             raise ValueError('账号站点配置损坏，已停止加载')
         configs = saved if saved is not None else (manager.seed_stations if account_id == 'default' else [])
         self.registry = Registry(self.gateway, configs)
+        self.registry.model_mappings = ModelMappings(directory)
         self.eventlog = EventLog(
             directory, maxlen=settings.load_logs(),
             retention_days=self.gateway.data_retention_days)

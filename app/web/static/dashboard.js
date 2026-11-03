@@ -507,6 +507,7 @@ function setSectionTab(group, section, { focus = false } = {}) {
 }
 function refreshStationPolicy(force = false) {
   const section = document.querySelector('[data-tab-group="stations"] [aria-selected="true"]')?.dataset.section;
+  if (section === "mappings") return window.refreshModelMappings?.();
   if (section === "retry" && (force || Date.now() - retrySettingsUpdatedAt > 30000)) return refreshRetrySettings({ notify: true });
   if (section === "scoring" && (force || Date.now() - scoringSettingsUpdatedAt > 30000)) return refreshScoringSettings();
   if (["probe", "editor"].includes(section) && (force || Date.now() - probeSettingsUpdatedAt > 30000)) return refreshProbeSettings();
@@ -1150,7 +1151,7 @@ function renderEvents(data) {
       <td class="event-time muted">${formatTime(event.ts)}</td>
       <td class="event-ip" title="${escapeHtml(event.client_ip || "此记录未保存客户端地址，无法还原来源")}">${escapeHtml(event.client_ip || "未记录 IP")}</td>
       <td class="event-station">${escapeHtml(event.station || "-")}</td>
-      <td class="event-model">${escapeHtml(event.model || "-")}</td>
+      <td class="event-model" title="${escapeHtml(event.requested_model ? event.requested_model + ' → ' + event.model : event.model || '-')}">${event.requested_model ? `<span class="mapped-request-model">${escapeHtml(event.requested_model)} →</span>` : ''}${escapeHtml(event.model || "-")}</td>
       <td class="event-result ${event.ok ? "text-ok" : "text-danger"}">${event.ok ? "成功" : "失败"}</td>
       <td class="event-latency">${Number.isFinite(latency) && latency > 0 ? `${(latency / 1000).toFixed(2)}s` : "-"}</td>
       <td class="event-detail" title="${escapeHtml(detail)}">${escapeHtml(detail)}${attempt > 1 ? ` <span class="attempt-count">(${attempt} 次尝试)</span>` : ""}</td>

@@ -7,7 +7,8 @@
   <link rel="icon" href="/static/brand-mark-512.png?v=4" type="image/png">
   <link rel="icon" href="/static/favicon.ico?v=4" sizes="any">
   <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=4">
-  <link rel="stylesheet" href="/static/dashboard.css?v=42">
+  <link rel="stylesheet" href="/static/dashboard.css?v=43">
+  <link rel="stylesheet" href="/static/model-mappings.css?v=1">
   <link rel="stylesheet" href="/static/visual-tests.css?v=9">
   <link rel="stylesheet" href="/static/selects.css?v=1">
 </head>
@@ -145,7 +146,7 @@
           </div>
         </section></section>
 
-      <section id="stations-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stations" hidden=""><div class="section-tabs" data-tab-group="stations" role="tablist" aria-label="站点管理视图"><button id="stations-tab-list" type="button" class="section-tab" data-section="list" role="tab" aria-controls="stations-list" aria-selected="true" tabindex="0">站点列表</button><button id="stations-tab-editor" type="button" class="section-tab" data-section="editor" role="tab" aria-controls="stations-editor" aria-selected="false" tabindex="-1">添加 / 编辑</button><button id="stations-tab-scoring" type="button" class="section-tab" data-section="scoring" role="tab" aria-controls="scoring-wrap" aria-selected="false" tabindex="-1">账号评分策略</button><button id="stations-tab-retry" type="button" class="section-tab" data-section="retry" role="tab" aria-controls="retry-wrap" aria-selected="false" tabindex="-1">账号重试策略</button><button id="stations-tab-probe" type="button" class="section-tab" data-section="probe" role="tab" aria-controls="probe-wrap" aria-selected="false" tabindex="-1">账号探测策略</button></div><section class="stats-section section-panel" aria-labelledby="stations-tab-list" id="stations-list" data-section-panel="stations" data-section="list" role="tabpanel">
+      <section id="stations-wrap" class="tab-panel" role="tabpanel" aria-labelledby="tab-stations" hidden=""><div class="section-tabs" data-tab-group="stations" role="tablist" aria-label="站点管理视图"><button id="stations-tab-list" type="button" class="section-tab" data-section="list" role="tab" aria-controls="stations-list" aria-selected="true" tabindex="0">站点列表</button><button id="stations-tab-editor" type="button" class="section-tab" data-section="editor" role="tab" aria-controls="stations-editor" aria-selected="false" tabindex="-1">添加 / 编辑</button><button id="stations-tab-mappings" type="button" class="section-tab" data-section="mappings" role="tab" aria-controls="mappings-wrap" aria-selected="false" tabindex="-1">模型映射</button><button id="stations-tab-scoring" type="button" class="section-tab" data-section="scoring" role="tab" aria-controls="scoring-wrap" aria-selected="false" tabindex="-1">账号评分策略</button><button id="stations-tab-retry" type="button" class="section-tab" data-section="retry" role="tab" aria-controls="retry-wrap" aria-selected="false" tabindex="-1">账号重试策略</button><button id="stations-tab-probe" type="button" class="section-tab" data-section="probe" role="tab" aria-controls="probe-wrap" aria-selected="false" tabindex="-1">账号探测策略</button></div><section class="stats-section section-panel" aria-labelledby="stations-tab-list" id="stations-list" data-section-panel="stations" data-section="list" role="tabpanel">
             <div class="section-heading compact">
               <div>
                 <span class="section-kicker">MANAGED</span>
@@ -223,6 +224,12 @@
               </div>
             </form>
           </section>
+
+      <section id="mappings-wrap" class="mapping-panel section-panel" data-section-panel="stations" data-section="mappings" role="tabpanel" aria-labelledby="stations-tab-mappings" hidden>
+        <header class="mapping-heading"><div><h2>模型映射</h2><p id="mapping-count">当前账号独立配置</p></div><div class="mapping-heading-actions"><button id="mapping-reload" class="button secondary" type="button">刷新</button><button id="mapping-add" class="button primary" type="button" disabled>新建映射</button></div></header>
+        <p class="mapping-policy">指定 IP 优先于所有来源；请求模型精确匹配。命中后只使用选定渠道，继续遵守白名单、健康状态和并发限制。</p>
+        <div id="mapping-list" class="mapping-list"></div><p class="form-status" id="mapping-status" role="status" aria-live="polite"></p>
+      </section>
 
       <section id="scoring-wrap" class="station-policy-panel section-panel" data-section-panel="stations" data-section="scoring" role="tabpanel" aria-labelledby="stations-tab-scoring" hidden>
         <div class="retry-settings-layout">
@@ -478,6 +485,17 @@
       </div>
     </div>
   </div>
+  <dialog id="mapping-dialog" class="mapping-dialog" aria-labelledby="mapping-title">
+    <header class="account-dialog-heading"><div><span class="section-kicker">当前账号 · 即时生效</span><h2 id="mapping-title">新建模型映射</h2></div><button id="mapping-close" class="account-close" type="button" aria-label="关闭模型映射"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
+    <form id="mapping-form"><div class="mapping-form-content">
+      <div class="mapping-field-grid"><label for="mapping-name">规则名称<input id="mapping-name" maxlength="60" required placeholder="例如：GPT 请求交给 DeepSeek"></label><label for="mapping-model">客户端请求的模型<input id="mapping-model" maxlength="200" required placeholder="gpt-6-sol" spellcheck="false" autocomplete="off"></label></div>
+      <div class="mapping-field-grid"><label for="mapping-scope">来源范围<select id="mapping-scope"><option value="all">所有来源</option><option value="ips">指定 IP</option></select></label><label for="mapping-ips" id="mapping-ips-label" hidden>客户端 IP<textarea id="mapping-ips" rows="2" placeholder="每行一个 IP，也可用逗号分隔" spellcheck="false"></textarea></label></div>
+      <section><div class="mapping-target-heading"><h3>实际回答的渠道与模型</h3><button id="mapping-target-add" class="button secondary" type="button">添加渠道</button></div><div id="mapping-targets"></div><p>多个目标按现有健康评分与优先级调度，失败后可在所选渠道内切换。仅限当前账号的 OpenAI 兼容模型。</p></section>
+      <label class="mapping-enable" for="mapping-enabled"><input id="mapping-enabled" type="checkbox" checked>启用此映射</label>
+      <p>接入地址不变。日志保留请求模型与实际模型，用量按实际模型统计。Responses 转 Chat 支持文本和标准函数工具；图片、内置工具和服务端会话等无法转换时会明确报错。</p>
+    </div><footer class="mapping-form-footer"><button id="mapping-delete" class="button is-destructive" type="button" hidden>删除</button><p id="mapping-form-status" class="form-status" role="status" aria-live="polite"></p><div class="dialog-actions"><button id="mapping-cancel" class="button secondary" type="button">取消</button><button id="mapping-save" class="button primary" type="submit">保存映射</button></div></footer></form>
+  </dialog>
+
   <dialog id="accountEditorDialog" class="account-editor-dialog" aria-labelledby="accountEditorTitle">
     <div class="account-dialog-heading"><div><span class="section-kicker">账号设置</span><h2 id="accountEditorTitle">新建账号</h2></div><button id="accountEditorClose" class="account-close" type="button" aria-label="关闭账号设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
           <form id="accountForm" class="account-form">
@@ -578,11 +596,12 @@
   <dialog id="channelModelsDialog" class="channel-models-dialog" aria-labelledby="channelModelsTitle"><header class="visual-dialog-heading"><div><span class="section-kicker" id="channelModelsStation"></span><h2 id="channelModelsTitle">支持的模型</h2></div><button id="channelModelsClose" class="account-close" type="button" aria-label="关闭模型列表"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="channel-models-toolbar"><input id="channelModelsSearch" type="search" placeholder="搜索完整模型名称" aria-label="搜索完整模型名称"><span id="channelModelsCount"></span></div><div id="channelModelsList" class="channel-models-list"></div><footer class="channel-models-footer" id="channelModelsNote"></footer></dialog>
   <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
   <script src="/static/vendor/echarts.min.js?v=5.6.0" defer=""></script>
-  <script src="/static/dashboard.js?v=46" defer=""></script>
+  <script src="/static/dashboard.js?v=47" defer=""></script>
   <script src="/static/go-usage.js?v=2" defer></script>
   <script src="/static/analytics.js?v=8" defer></script>
   <script src="/static/accounts.js?v=17" defer></script>
   <script src="/static/visual-tests.js?v=11" defer></script>
+  <script src="/static/model-mappings.js?v=1" defer></script>
   <script src="/static/selects.js?v=1" defer></script>
 
 

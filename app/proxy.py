@@ -38,6 +38,9 @@ from .health import _retry_after_seconds
 from .protocols import MESSAGES, GENERATE, STREAM_GENERATE, GEMINI_PATHS, inference_url, native_text, error_body
 from .providers import MissingOpenCodeSession, inference_headers, request_context
 from .wire import UnsupportedWireRequest
+from .model_mappings import supports_mapping
+from .mapping_wire import (chat_to_responses as mapped_chat_to_responses,
+                           ChatStreamToResponsesTranslator as MappedStreamTranslator)
 
 from .juice import response_model, response_text
 
@@ -46,6 +49,16 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+
+class _MappedBody(dict):
+    """Pin a rule snapshot to one request, including retries and streaming."""
+    def __init__(self, body, mapping):
+        super().__init__(body)
+        self.mapping = mapping
+
+    def copy(self):
+        return _MappedBody(self, self.mapping)
 
 
 async def _shielded_close(resp, registry: Registry) -> None:
@@ -201,7 +214,7 @@ def _is_param_error(result) -> bool:
 def _strip_reasoning(body: dict):
     """剥离 reasoning 字段降级重试；无该字段返回 None（不降级）。"""
     if "reasoning" in body:
-        degraded = dict(body)
+        degraded = body.copy()
         degraded.pop("reasoning", None)
         return degraded
     return None
@@ -761,6 +774,19 @@ class OpenAIProxy:
             "invalid_request_error",
         )
 
+    def _mapping_precondition_error(self, mapping, path):
+        targets = mapping['targets']
+        matching = [self.registry.states[target['station']] for target in targets
+                    if target['station'] in self.registry.states and supports_mapping(
+                        self.registry.states[target['station']], target['model'], path)]
+        if any(st.enabled and not st.quota_exhausted for st in matching):
+            return None
+        return _error_response(422, '映射规则指定的渠道已停用、额度不可用、模型已移除或协议不兼容；请检查当前账号的模型映射', 'invalid_request_error')
+
+    def _mapping_retryable(self, targets, path):
+        return any(st.enabled and not st.quota_exhausted and supports_mapping(st, targets[name], path)
+                   for name, st in self.registry.states.items() if name in targets)
+
     def _round_delay(self, round_index: int) -> float:
         """Return a capped exponential delay before the next retry round."""
         base = self.gateway.round_backoff
@@ -853,6 +879,12 @@ class OpenAIProxy:
             return _error_response(400, "model 必须是非空字符串", "invalid_request_error")
         if path == '/responses':
             self.namespace_memory.restore(body)
+        try:
+            mapping = self.registry.model_mappings.match(model, client_ip, path)
+        except ValueError as exc:
+            return failure(model, _error_response(503, str(exc)), 0)
+        if mapping is not None:
+            body = _MappedBody(body, mapping)
 
         stream = path != "/embeddings" and body.get("stream")
         if path in GEMINI_PATHS:
@@ -866,7 +898,8 @@ class OpenAIProxy:
         while self.gateway.max_rounds == 0 or round_index < self.gateway.max_rounds:
             if await request.is_disconnected():
                 return self._client_disconnected_response()
-            precondition_error = self._routing_precondition_error(model, path)
+            precondition_error = (self._mapping_precondition_error(mapping, path) if mapping is not None
+                                  else self._routing_precondition_error(model, path))
             if precondition_error is not None:
                 return failure(model, precondition_error, total_attempts)
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -929,11 +962,25 @@ class OpenAIProxy:
         return failure(
             model, _error_response(502, "重试已停止"), total_attempts)
 
-    async def list_models(self):
+    async def list_models(self, request: Request = None):
+        if self.registry.model_mappings.error:
+            return _error_response(503, self.registry.model_mappings.error)
         merged: dict[str, list[str]] = {}
         for st in self.registry.states.values():
             for m in st.effective_models:
                 merged.setdefault(m, []).append(st.cfg.name)
+        # Advertise only aliases visible to this peer, so catalog-driven clients
+        # can select mapped names even when no channel offers the original model.
+        peer = getattr(request, 'client', None)
+        for rule in self.registry.model_mappings.rules:
+            matched = self.registry.model_mappings.match(rule['source_model'], peer.host if peer else None, '/responses')
+            if matched and matched['id'] == rule['id']:
+                names = [target['station'] for target in matched['targets']
+                         if target['station'] in self.registry.states
+                         and self.registry.states[target['station']].enabled
+                         and supports_mapping(self.registry.states[target['station']], target['model'], '/responses')]
+                if names:
+                    merged[rule['source_model']] = list(dict.fromkeys(names))
         data = [
             {"id": m, "object": "model", "created": 0,
              "owned_by": ",".join(sorted(names))}
@@ -999,20 +1046,27 @@ class OpenAIProxy:
         attempts: list[str] = []
         has_transient = False
         local_errors: list[str] = []
-        candidates = self.router.pick(model, path, stream=False)
+        mapping = getattr(body, 'mapping', None)
+        requested_model = model
+        targets = {t['station']: t['model'] for t in mapping['targets']} if mapping else None
+        log_mapping = {'requested_model': requested_model, 'mapping_id': mapping['id']} if mapping else {}
+        candidates = self.router.pick(model, path, stream=False, **({'targets': targets} if targets is not None else {}))
         # No candidates can mean all matching stations are in a temporary
         # cooldown/rate-limit window.  Preserve that signal so _dispatch can
         # apply the configured round retry budget instead of returning 502
         # immediately (which otherwise leaves retries solely to the client).
         if not candidates:
-            has_transient = self._has_retryable_station(model, path)
+            has_transient = self._mapping_retryable(targets, path) if targets is not None else self._has_retryable_station(model, path)
 
+        sent_attempts = 0
         for idx, st in enumerate(candidates):
-            if idx >= self.gateway.max_attempts:
+            if (sent_attempts if mapping else idx) >= self.gateway.max_attempts:
                 break
             try:
+                model = targets[st.cfg.name] if targets is not None else requested_model
+                routed_body = {**body, 'model': model} if mapping else body
                 signature = st.connection_signature()
-                target_path, target_body, adapter = prepare_request(st, path, body)
+                target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
                 headers = _build_headers(st, client_headers, target_path)
                 url = inference_url(st.cfg, target_path, model)
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
@@ -1025,7 +1079,8 @@ class OpenAIProxy:
                 attempts.append(f"[{st.cfg.name}] 并发已满")
                 has_transient = True  # 下一轮可能不忙
                 continue
-            route_id = self.registry.begin_route(st.cfg.name, model, client_ip)
+            sent_attempts += 1
+            route_id = self.registry.begin_route(st.cfg.name, model, client_ip, **log_mapping)
             route_outcome = "failed"
             route_error = ""
             resp = None
@@ -1055,7 +1110,7 @@ class OpenAIProxy:
                     except (asyncio.TimeoutError, httpx.TimeoutException):
                         await _shielded_close(resp, self.registry)
                         err = first_byte_error(st.cfg.name)
-                        self._record_request_failure(st, err, model=model, path=path, stream=False, signature=signature)
+                        self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
                         route_error = str(err)
                         attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                         has_transient = True
@@ -1063,7 +1118,7 @@ class OpenAIProxy:
                     except httpx.TransportError as e:
                         await _shielded_close(resp, self.registry)
                         err = connect_error(st.cfg.name, type(e).__name__)
-                        self._record_request_failure(st, err, model=model, path=path, stream=False, signature=signature)
+                        self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
                         route_error = str(err)
                         attempts.append(str(err))
                         has_transient = True
@@ -1079,7 +1134,7 @@ class OpenAIProxy:
                         await _shielded_close(resp, self.registry)
                         err = timeout_error(st.cfg.name,
                                             f"读取中断: {type(e).__name__}")
-                        self._record_request_failure(st, err, model=model, path=path, stream=False, signature=signature)
+                        self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
                         route_error = str(err)
                         attempts.append(str(err))
                         has_transient = True
@@ -1093,12 +1148,11 @@ class OpenAIProxy:
                     body_bytes = b"".join(chunks)
                     if _looks_like_error(body_bytes):
                         err = self._handle_failure(st, classify_error(st.cfg.name, 200, body_bytes),
-                                                   model=model, path=path, signature=signature)
+                                                   model=model, path=target_path, signature=signature)
                         route_error = str(err)
                         attempts.append(str(err))
                         has_transient |= not err.deterministic
                         continue
-                    st.record_success(latency / 1000, switched=switched, model=model, path=path, signature=signature)
                     if target_path == '/responses':
                         try:
                             self.namespace_memory.remember_response(json.loads(body_bytes))
@@ -1111,12 +1165,19 @@ class OpenAIProxy:
                         try:
                             obj = json.loads(body_bytes.decode("utf-8", errors="replace"))
                             body_bytes = json.dumps(
-                                chat_to_responses(obj, model), ensure_ascii=False).encode("utf-8")
-                        except Exception:
-                            pass  # 翻译失败降级为透传原响应
+                                (mapped_chat_to_responses if mapping else chat_to_responses)(obj, model),
+                                ensure_ascii=False).encode("utf-8")
+                        except (ValueError, TypeError, KeyError):
+                            route_error = '上游响应不符合协议，无法转换'
+                            self._record_request_failure(st, connect_error(st.cfg.name, route_error),
+                                                         model=model, path=target_path, stream=False, signature=signature)
+                            attempts.append(f'[{st.cfg.name}] {route_error}')
+                            has_transient = True
+                            continue
+                    st.record_success(latency / 1000, switched=switched, model=model, path=target_path, signature=signature)
                     self.eventlog.add(st.cfg.name, model, True, latency,
                                       detail, attempts=len(attempts) + 1,
-                                      client_ip=client_ip, route_id=route_id,
+                                      client_ip=client_ip, route_id=route_id, **log_mapping,
                                       **(usage.as_kwargs() if usage else {
                                           "tokens": tokens}))
                     # Juice 被动统计：上游头家族 + model 回显比对 + 真实响应特征指纹
@@ -1135,7 +1196,7 @@ class OpenAIProxy:
                 payload = await resp.aread()
                 await _shielded_close(resp, self.registry)
                 err = classify_error(st.cfg.name, resp.status_code, payload)
-                err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=path, stream=False, signature=signature)
+                err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=False, signature=signature)
                 route_error = str(err)
                 if not err.retryable:
                     # 客户端问题，无需再试其他站
@@ -1149,7 +1210,7 @@ class OpenAIProxy:
                 raise
             except asyncio.TimeoutError:
                 err = first_byte_error(st.cfg.name)
-                self._record_request_failure(st, err, model=model, path=path, stream=False, signature=signature)
+                self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
                 route_error = str(err)
                 attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                 has_transient = True
@@ -1158,13 +1219,13 @@ class OpenAIProxy:
                     err = self._local_pool_error(st, client)
                 else:
                     err = timeout_error(st.cfg.name)
-                    self._record_request_failure(st, err, model=model, path=path, stream=False, signature=signature)
+                    self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
                 route_error = str(err)
                 attempts.append(str(err))
                 has_transient = True
             except httpx.TransportError as e:
                 err = connect_error(st.cfg.name, type(e).__name__)
-                self._record_request_failure(st, err, model=model, path=path, stream=False, signature=signature)
+                self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
                 route_error = str(err)
                 attempts.append(str(err))
                 has_transient = True
@@ -1194,16 +1255,23 @@ class OpenAIProxy:
         attempts: list[str] = []
         has_transient = False
         local_errors: list[str] = []
-        candidates = self.router.pick(model, path, stream=True)
+        mapping = getattr(body, 'mapping', None)
+        requested_model = model
+        targets = {t['station']: t['model'] for t in mapping['targets']} if mapping else None
+        log_mapping = {'requested_model': requested_model, 'mapping_id': mapping['id']} if mapping else {}
+        candidates = self.router.pick(model, path, stream=True, **({'targets': targets} if targets is not None else {}))
         if not candidates:
-            has_transient = self._has_retryable_station(model, path)
+            has_transient = self._mapping_retryable(targets, path) if targets is not None else self._has_retryable_station(model, path)
 
+        sent_attempts = 0
         for idx, st in enumerate(candidates):
-            if idx >= self.gateway.max_attempts:
+            if (sent_attempts if mapping else idx) >= self.gateway.max_attempts:
                 break
             try:
+                model = targets[st.cfg.name] if targets is not None else requested_model
+                routed_body = {**body, 'model': model} if mapping else body
                 signature = st.connection_signature()
-                target_path, target_body, adapter = prepare_request(st, path, body)
+                target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
                 headers = _build_headers(st, client_headers, target_path)
                 url = inference_url(st.cfg, target_path, model)
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
@@ -1217,7 +1285,8 @@ class OpenAIProxy:
                 has_transient = True
                 continue
 
-            route_id = self.registry.begin_route(st.cfg.name, model, client_ip)
+            sent_attempts += 1
+            route_id = self.registry.begin_route(st.cfg.name, model, client_ip, **log_mapping)
             route_outcome = "failed"
             route_error = ""
             transferred = False
@@ -1240,7 +1309,7 @@ class OpenAIProxy:
                     )
                 except asyncio.TimeoutError:
                     err = first_byte_error(st.cfg.name)
-                    self._record_request_failure(st, err, model=model, path=path, stream=True, signature=signature)
+                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
                     route_error = str(err)
                     attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                     has_transient = True
@@ -1250,14 +1319,14 @@ class OpenAIProxy:
                         err = self._local_pool_error(st, client)
                     else:
                         err = timeout_error(st.cfg.name)
-                        self._record_request_failure(st, err, model=model, path=path, stream=True, signature=signature)
+                        self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
                     route_error = str(err)
                     attempts.append(str(err))
                     has_transient = True
                     continue
                 except httpx.TransportError as e:
                     err = connect_error(st.cfg.name, type(e).__name__)
-                    self._record_request_failure(st, err, model=model, path=path, stream=True, signature=signature)
+                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
                     route_error = str(err)
                     attempts.append(str(err))
                     has_transient = True
@@ -1268,7 +1337,7 @@ class OpenAIProxy:
                 if resp.status_code != 200:
                     payload = await resp.aread()
                     err = classify_error(st.cfg.name, resp.status_code, payload)
-                    err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=path, stream=True, signature=signature)
+                    err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
                     route_error = str(err)
                     if not err.retryable:
                         return (_error_response(err.status_code or 400, err.message,
@@ -1285,7 +1354,7 @@ class OpenAIProxy:
                 except (asyncio.TimeoutError, httpx.TimeoutException):
                     await stream_iter.aclose()
                     err = first_byte_error(st.cfg.name)
-                    self._record_request_failure(st, err, model=model, path=path, stream=True, signature=signature)
+                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
                     route_error = str(err)
                     attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                     has_transient = True
@@ -1293,7 +1362,7 @@ class OpenAIProxy:
                 except httpx.TransportError as e:
                     await stream_iter.aclose()
                     err = connect_error(st.cfg.name, type(e).__name__)
-                    self._record_request_failure(st, err, model=model, path=path, stream=True, signature=signature)
+                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
                     route_error = str(err)
                     attempts.append(str(err))
                     has_transient = True
@@ -1308,7 +1377,7 @@ class OpenAIProxy:
                             raw_error = line[5:].strip()
                             break
                     err = classify_error(st.cfg.name, 200, raw_error)
-                    err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=path, stream=True, signature=signature)
+                    err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
                     route_error = str(err)
                     if not err.retryable:
                         return (_error_response(400, err.message,
@@ -1332,7 +1401,7 @@ class OpenAIProxy:
                 event_time = self.eventlog.add(
                     st.cfg.name, model, True, latency,
                     detail, attempts=len(attempts) + 1,
-                    ttft_ms=ttft_ms, client_ip=client_ip, route_id=route_id)
+                    ttft_ms=ttft_ms, client_ip=client_ip, route_id=route_id, **log_mapping)
                 st.note_upstream(resp.headers, None, model)  # Juice: 上游头家族（流式）
                 self.registry.note_fingerprint(st, model, stream_text(first))
                 self.registry.mark_routed(st.cfg.name, model, latency)
@@ -1350,7 +1419,7 @@ class OpenAIProxy:
                 async def gen(resp=resp, st=st, prefetch=buffered,
                               stream_iter=stream_iter, route_id=route_id,
                               adapter=adapter, model=model):
-                    translator = (ChatStreamToResponsesTranslator(model)
+                    translator = ((MappedStreamTranslator if mapping else ChatStreamToResponsesTranslator)(model)
                                   if adapter == ("r2c",) else None)
                     stream_tokens = None
                     usage_parser = _StreamUsageParser()
@@ -1407,12 +1476,14 @@ class OpenAIProxy:
                                 if incomplete and not usage_parser.error:
                                     usage_parser.error = "上游流提前结束，未收到完整结束事件"
                                     yield _error_sse(usage_parser.error, path)
-                                stream_outcome = "stream_error" if usage_parser.error else "success"
-                                stream_error = usage_parser.error
                                 if translator:
                                     tail = translator.finish()
+                                    if getattr(translator, 'error', '') and not usage_parser.error:
+                                        usage_parser.error = translator.error
                                     if tail:
                                         yield tail
+                                stream_outcome = "stream_error" if usage_parser.error else "success"
+                                stream_error = usage_parser.error
                                 break
                             except asyncio.TimeoutError:
                                 # SSE 保活：长流无事件时发注释行，防止客户端空闲超时
@@ -1430,11 +1501,11 @@ class OpenAIProxy:
                             f"上游 {st.cfg.name} 流中断: {type(e).__name__}", path)
                     finally:
                         if stream_outcome == "success":
-                            st.record_success(latency / 1000, model=model, path=path, stream=True, counted=True, signature=signature)
+                            st.record_success(latency / 1000, model=model, path=target_path, stream=True, counted=True, signature=signature)
                         elif stream_outcome == "stream_error":
                             err = (classify_error(st.cfg.name, 200, usage_parser.error_payload)
                                    if usage_parser.error_payload else connect_error(st.cfg.name, stream_error))
-                            self._handle_failure(st, err, model=model, path=path, stream=True,
+                            self._handle_failure(st, err, model=model, path=target_path, stream=True,
                                                  counted=True, switched=False, signature=signature)
                         # Bookkeeping only: the upstream socket must be closed
                         # from an independent task, because this generator may
@@ -1470,13 +1541,13 @@ class OpenAIProxy:
                 err = (self._local_pool_error(st, client) if isinstance(e, httpx.PoolTimeout)
                        else timeout_error(st.cfg.name))
                 if not isinstance(e, httpx.PoolTimeout):
-                    self._record_request_failure(st, err, model=model, path=path, stream=True, signature=signature)
+                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
                 route_error = str(err)
                 attempts.append(str(err))
                 has_transient = True
             except httpx.TransportError as e:
                 err = connect_error(st.cfg.name, type(e).__name__)
-                self._record_request_failure(st, err, model=model, path=path, stream=True, signature=signature)
+                self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
                 route_error = str(err)
                 attempts.append(str(err))
                 has_transient = True

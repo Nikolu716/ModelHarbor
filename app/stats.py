@@ -135,7 +135,8 @@ class EventLog:
                         self.add(pending['station'], pending['model'], False, 0,
                                  '服务重启中断，最终用量未上报', client_ip=pending.get('client_ip'),
                                  occurred_at=pending['started_at'], outcome='interrupted',
-                                 event_id=pending['event_id'])
+                                 event_id=pending['event_id'], requested_model=pending.get('requested_model'),
+                                 mapping_id=pending.get('mapping_id'))
                     finally:
                         self.durable = old_durable
             if self._pending:
@@ -261,11 +262,11 @@ class EventLog:
             self._runtime[name] = state
             self._commit(runtime={name: state})
 
-    def start_route(self, route_id, station, model, client_ip=None):
+    def start_route(self, route_id, station, model, client_ip=None, **mapping):
         self.load()
         key = f'{self._boot_id}:{route_id}'
         pending = {'event_id': uuid.uuid4().hex, 'station': station, 'model': model,
-                   'client_ip': client_ip, 'started_at': time.time(), 'logged': False}
+                   'client_ip': client_ip, 'started_at': time.time(), 'logged': False, **mapping}
         self._pending[key] = pending
         self._commit(pending={key: pending})
 
@@ -303,6 +304,9 @@ class EventLog:
         result = dict(event)
         result["station"] = cls._safe_text(result.get("station"), EVENT_NAME_MAXLEN) or "-"
         result["model"] = cls._safe_text(result.get("model"), EVENT_NAME_MAXLEN) or "-"
+        for key in ('requested_model', 'mapping_id'):
+            if key in result:
+                result[key] = cls._safe_text(result[key], EVENT_NAME_MAXLEN)
         result["detail"] = cls._safe_text(result.get("detail"), EVENT_DETAIL_MAXLEN)
         client_ip = result.get("client_ip")
         try:
@@ -733,7 +737,8 @@ class EventLog:
             ttft_ms: float | None = None,
             client_ip: str | None = None,
             route_id: int | None = None, occurred_at: float | None = None,
-            outcome: str | None = None, event_id: str | None = None) -> float:
+            outcome: str | None = None, event_id: str | None = None,
+            requested_model: str | None = None, mapping_id: str | None = None) -> float:
         self.load()
         now = time.time() if occurred_at is None else occurred_at
         station = self._safe_text(station, EVENT_NAME_MAXLEN) or "-"
@@ -776,6 +781,8 @@ class EventLog:
             "attempts": attempts,
             "tokens": tokens,
             "client_ip": client_ip,
+            **({'requested_model': self._safe_text(requested_model, EVENT_NAME_MAXLEN),
+                'mapping_id': self._safe_text(mapping_id, EVENT_NAME_MAXLEN)} if requested_model else {}),
             **({"route_id": route_id} if route_id is not None else {}),
         })
         # 今日按站聚合（跨天自动切换日期键；"-" 为全站失败记录，不计入单站）
