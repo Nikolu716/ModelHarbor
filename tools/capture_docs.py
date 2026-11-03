@@ -90,7 +90,9 @@ def capture() -> None:
             st.failures = i + 1
             st.ema_latency = 1.2 + i * .35
             st.ttft_ema = .38 + i * .15
-            st.window_results.extend([True] * 97 + [False] + [True] * 2)
+            st.health_samples.extend(dict(at=now - (100 - j) * 60, ok=j != 97,
+                model=models[j % 2], path='/responses', stream=True, latency=1.2 + i * .35)
+                for j in range(100))
             st.last_used_at = now - i * 8
             st.probed_models = set(models)
             st.probed_model_order = models[:]

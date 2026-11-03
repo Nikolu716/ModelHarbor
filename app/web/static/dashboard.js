@@ -101,21 +101,39 @@ function formatCount(value) {
 }
 
 function scoreBreakdownTitle(breakdown = {}) {
-  const labels = [
-    ["latency", "延迟"],
-    ["business_reliability", "业务可靠性"],
-    ["priority_bias", "手动优先级"],
-    ["failure_streak_penalty", "连续失败扣分"],
-    ["breaker_penalty", "熔断扣分"],
-    ["quota_penalty", "配额扣分"],
-    ["rate_limit_penalty", "限流扣分"],
+  if (breakdown.disabled) return "已停用 · 健康分 0，不参与路由";
+  if (!breakdown.business_samples) return "待评估 · 等待真实业务结果，不会为评分发送生成探测";
+  const confidence = { low: "样本较少", medium: "样本一般", high: "样本充足" }[breakdown.confidence] || "";
+  return `近 24 小时最近 ${formatCount(breakdown.business_samples)} 个有效业务结果 · 成功率 ${(finiteNumber(breakdown.success_rate) * 100).toFixed(1)}% · ${confidence}；速度不扣健康分。点击查看依据`;
+}
+
+function scoreBadge(station) {
+  const known = station.health_score != null;
+  const score = clamp(station.health_score, 0, 100);
+  const detail = station.health_score_breakdown || {};
+  const neutral = !station.enabled || !known || detail.confidence === "low";
+  const label = !station.enabled ? "0.0" : known ? score.toFixed(1) : "待评估";
+  return `<button type="button" class="score-value score-button ${neutral ? "is-neutral" : scoreState(score)}" data-score-station="${escapeHtml(station.name)}" title="${escapeHtml(scoreBreakdownTitle(detail))}" aria-label="${escapeHtml(station.name)}：健康度 ${label}，查看依据">${label}</button>`;
+}
+
+function showScoreDetails(name) {
+  const station = statusData?.stations?.find(item => item.name === name);
+  if (!station) return;
+  const b = station.health_score_breakdown || {};
+  $("scoreStationName").textContent = name;
+  $("scoreSummary").textContent = !station.enabled ? "已停用 · 0 分" : station.health_score == null ? "待评估" : `${station.health_score.toFixed(1)} / 100`;
+  const confidence = { none: "暂无样本", low: "样本较少，暂作参考", medium: "样本一般", high: "样本充足" }[b.confidence] || "暂无样本";
+  const rows = [
+    ["当前状态", statusInfo(station).label],
+    ["有效业务样本", `${formatCount(b.business_samples)} / 100`],
+    ["窗口成功率", b.success_rate == null ? "—" : `${(b.success_rate * 100).toFixed(1)}%`],
+    ["样本可信度", confidence],
+    ["最近业务结果", b.last_sample_at ? formatTime(b.last_sample_at) : "—"],
+    ["统计范围", "最近 24 小时，最多 100 个结果"],
   ];
-  const parts = labels.map(([key, label]) =>
-    `${label} ${finiteNumber(breakdown[key]).toFixed(1)}`);
-  if (breakdown.business_samples != null) {
-    parts.push(`业务样本 ${formatCount(breakdown.business_samples)}`);
-  }
-  return `健康评分拆解：${parts.join(" · ")}`;
+  $("scoreFacts").innerHTML = rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+  $("scoreMigrationNote").hidden = !(b.legacy_samples_ignored && !b.business_samples);
+  $("healthScoreDialog").showModal();
 }
 
 function formatCompactCount(value) {
@@ -194,8 +212,8 @@ function formatBalance(balance, threshold, station = {}) {
 
 function scoreState(score) {
   const value = clamp(score, 0, 100);
-  if (value >= 70) return "is-good";
-  if (value >= 40) return "is-warn";
+  if (value >= 90) return "is-good";
+  if (value >= 70) return "is-warn";
   return "is-bad";
 }
 
@@ -957,14 +975,14 @@ function renderCards(data) {
       <div class="card-content"><div class="health-row" title="${escapeHtml(scoreTitle)}">
         <span>健康评分</span>
         <div class="health-track" aria-hidden="true"><div class="health-bar ${scoreClass}" data-width="${score}"></div></div>
-        <span class="health-number">${score.toFixed(1)}</span>
+        ${scoreBadge(station)}
       </div>
       <div class="station-url" title="${escapeHtml(station.base_url)}">${escapeHtml(station.base_url)}</div>
 
       <div class="card-stats">
         <div class="card-stat"><span class="card-stat-label">延迟 EMA</span><span class="card-stat-value">${formatLatency(station.ema_latency)}</span></div>
         <div class="card-stat"><span class="card-stat-label">首字 TTFT</span><span class="card-stat-value">${formatLatency(station.ttft_ema)}</span></div>
-        <div class="card-stat"><span class="card-stat-label">近 100 次成功率</span><span class="card-stat-value">${percentFormat.format(rate)}%</span></div>
+        <div class="card-stat"><span class="card-stat-label">近期业务成功率</span><span class="card-stat-value">${station.window_success_rate == null ? "—" : `${percentFormat.format(rate)}%`}</span></div>
         <div class="card-stat"><span class="card-stat-label">调用 / 失败</span><span class="card-stat-value">${formatCount(station.calls)} / ${formatCount(station.failures)}</span></div>
         <div class="card-stat"><span class="card-stat-label">额度</span><span class="card-stat-value">${formatBalance(station.balance, threshold, station)}</span></div>
         <div class="card-stat"><span class="card-stat-label">最近检查</span><span class="card-stat-value">${probeValue}</span></div>
@@ -1032,12 +1050,12 @@ function renderList(data) {
       </td>
       <td class="col-models">${window.ModelHarborVisualTests?.modelMarkup(station) || '<span class="muted">—</span>'}</td>
       <td class="col-billing muted">${billing}</td>
-      <td class="col-score" title="${escapeHtml(scoreTitle)}"><span class="score-value ${scoreState(score)}">${score.toFixed(1)}</span></td>
+      <td class="col-score" title="${escapeHtml(scoreTitle)}">${scoreBadge(station)}</td>
       <td class="col-latency">${formatLatency(station.ema_latency)}</td>
       <td class="col-ttft">${formatLatency(station.ttft_ema ?? (station.avg_ttft_ms != null ? station.avg_ttft_ms / 1000 : null))}</td>
       <td class="col-cache">${station.cache_hit_rate == null ? '<span class="muted">-</span>' : (station.cache_hit_rate >= 0.8 ? `<span class="ok">${(station.cache_hit_rate * 100).toFixed(1)}%</span>` : `<span class="warn">${(station.cache_hit_rate * 100).toFixed(1)}%</span>`)}</td>
       <td class="col-juice" title="${escapeHtml(juiceDetail(station))}">${station.juice_score == null ? '<span class="muted">-</span>' : (station.juice_score >= 90 ? `<span class="ok">${station.juice_score}</span>` : (station.juice_score >= 60 ? `<span class="warn">${station.juice_score}</span>` : `<span class="bad">${station.juice_score}</span>`))}</td>
-      <td class="col-rate number-value">${percentFormat.format(rate)}%</td>
+      <td class="col-rate number-value">${station.window_success_rate == null ? "—" : `${percentFormat.format(rate)}%`}</td>
       <td class="col-calls number-value">${formatCount(station.calls)} <span class="text-danger">/ ${formatCount(station.failures)}</span></td>
       <td class="col-balance">${formatBalance(station.balance, threshold, station)}</td>
       <td class="col-probe"><span class="${probeClass}">${probeLabel}</span></td>
@@ -1062,8 +1080,8 @@ function renderList(data) {
       <table class="monitor-table">
         <caption class="sr-only">中转站实时状态</caption>
         <thead><tr>
-          <th class="col-rank">排名</th><th class="col-station">站点</th><th class="col-models">支持的模型</th><th class="col-billing">计费</th>
-          <th class="col-score">评分</th><th class="col-latency">延迟 EMA</th><th class="col-ttft">首字</th><th class="col-cache">缓存命中</th><th class="col-juice">Juice</th><th class="col-rate">成功率</th>
+          <th class="col-rank" title="综合参考；实际调度按请求的模型、协议和流式模式分别比较">参考</th><th class="col-station">站点</th><th class="col-models">支持的模型</th><th class="col-billing">计费</th>
+          <th class="col-score">健康度</th><th class="col-latency">延迟 EMA</th><th class="col-ttft">首字</th><th class="col-cache">缓存命中</th><th class="col-juice">Juice</th><th class="col-rate">成功率</th>
           <th class="col-calls">调用 / 失败</th><th class="col-balance">额度</th><th class="col-probe">探测</th>
           <th class="col-checked">最后检查</th><th class="col-error">最近错误</th><th class="col-visual">智商测试</th><th class="col-actions">操作</th>
         </tr></thead>
@@ -2218,7 +2236,16 @@ $("donut").addEventListener("keydown", (event) => {
   lockChartItem(itemFromChartControl(control));
 });
 
+$("scoreClose").addEventListener("click", () => $("healthScoreDialog").close());
+$("healthScoreDialog").addEventListener("click", event => {
+  if (event.target !== event.currentTarget) return;
+  const rect = event.currentTarget.getBoundingClientRect();
+  if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) event.currentTarget.close();
+});
+
 document.addEventListener("click", (event) => {
+  const scoreButton = event.target.closest("button[data-score-station]");
+  if (scoreButton) { showScoreDetails(scoreButton.dataset.scoreStation); return; }
   const tabButton = event.target.closest("button[data-tab]");
   if (tabButton) {
     setTab(tabButton.dataset.tab);
@@ -2478,8 +2505,8 @@ function updatePriorityMode() {
   const auto = $("sf-priority-auto").checked;
   $("sf-priority").disabled = auto;
   $("sf-priority-note").textContent = auto
-    ? "自动：按健康评分调度，不加手动优先级分；同分段按权重与延迟分流。"
-    : "手动：1 / 2 / 3 / 4 / 5 分别加 15 / 12 / 9 / 6 / 3 分，6 及以上不加分；并非硬排序。";
+    ? "自动：按同模型、同协议的可靠性调度；同档位参考响应速度与权重。"
+    : "手动：1–5 在同可靠性档位内分别给予 2 / 1.8 / 1.6 / 1.4 / 1.2 倍分流权重；6 及以上为 1 倍，不改变健康分。";
 }
 
 function renderStationModels() {
@@ -2691,7 +2718,7 @@ function renderStations() {
           ${station.quota_exhausted ? '<span class="station-warning">上游额度不可用</span>' : ""}</td>
         <td class="station-url-cell" title="${escapeHtml(station.base_url || "")}">${escapeHtml(station.base_url || "-")}</td>
         <td class="station-models-cell"><button type="button" class="catalog-link" data-manage-action="models" data-station="${escapeHtml(name)}" title="${escapeHtml(modelsLabel)}">${escapeHtml(scopeLabel)}</button></td>
-        <td title="${station.priority_auto ? "按健康评分自动调度，无手动加分" : "数字越小加分越高，并非硬排序"}">${station.priority_auto ? `自动${station.rank ? ` · #${station.rank}` : ""}` : formatCount(station.priority)}</td>
+        <td title="${station.priority_auto ? "按同模型、同协议的可靠性自动调度" : "同可靠性档位内优先分流，不改变健康分"}">${station.priority_auto ? `自动${station.rank ? ` · #${station.rank}` : ""}` : formatCount(station.priority)}</td>
         <td class="muted">${station.billing === "subscription" ? "订阅" : "余额"}</td>
         <td>${protectionMarkup(station)}</td>
         <td><div class="station-manage-actions">

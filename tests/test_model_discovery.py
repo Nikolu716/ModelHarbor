@@ -295,21 +295,20 @@ class PriorityScoringTests(unittest.TestCase):
     def station(self, **kw):
         return StationState(StationConfig('alpha', 'https://a.invalid', 'key', **kw))
 
-    def test_legacy_initial_score_and_manual_bias_remain_explicit(self):
+    def test_manual_priority_and_speed_do_not_change_health(self):
         for priority, bias in [(1, 15), (2, 12), (5, 3), (6, 0), (999, 0)]:
             st = self.station(priority=priority)
-            self.assertEqual(st.health_score, 44 + bias)
-            st.ema_latency = 1.0
-            st.window_results.extend([True] * 9 + [False])
-            st._update_score()
-            self.assertEqual(st.health_score, 36 + 26 + bias)
+            self.assertIsNone(st.health_score)
+            st.record_success(90.0)
+            self.assertAlmostEqual(st.health_score, 93.333333, places=4)
+            self.assertEqual(st.priority_bias, bias)
 
     def test_auto_ignores_priority_and_updates_on_real_results(self):
         first = self.station(priority=1, priority_auto=True)
         last = self.station(priority=10000, priority_auto=True)
         self.assertEqual(first.health_score, last.health_score)
         first.record_success(1.0)
-        self.assertEqual(first.health_score, 61)
+        self.assertAlmostEqual(first.health_score, 93.333333, places=4)
         self.assertEqual(first.priority_bias, 0)
 
     def test_scores_control_order_with_randomization_only_inside_band(self):
@@ -317,7 +316,9 @@ class PriorityScoringTests(unittest.TestCase):
                 for name in ['fast', 'near', 'slow']]
         registry = Registry(GatewayConfig(), cfgs)
         for name, latency in [('fast', 1), ('near', 2), ('slow', 6)]:
-            registry.get(name).record_success(latency)
+            registry.get(name).record_success(latency, model='any')
+        from app.errors import UpstreamError
+        registry.get('slow').record_failure(UpstreamError('slow', 503, 'busy'), model='any')
         with patch('app.router.random.random', return_value=0.99):
             picks = Router(registry, registry.gateway).pick('any')
         self.assertEqual([st.cfg.name for st in picks], ['near', 'fast', 'slow'])
@@ -333,7 +334,7 @@ class PriorityScoringTests(unittest.TestCase):
         st.probed_models = {'known'}
         registry.update_station('alpha', {'priority_auto': True, 'models': ['extra']})
         self.assertEqual(st.effective_models, {'known', 'extra'})
-        self.assertEqual(st.health_score, 44)
+        self.assertIsNone(st.health_score)
 
     def test_disabled_station_has_zero_health_score(self):
         st = self.station(enabled=False, priority=1)

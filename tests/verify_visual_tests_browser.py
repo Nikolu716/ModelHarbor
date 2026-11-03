@@ -247,6 +247,17 @@ with tempfile.TemporaryDirectory() as directory:
                 for thumb in page.locator('[data-table-visual]:visible button[data-visual-thumbnail]').all():
                     thumb.frame_locator('iframe').locator('svg').wait_for()
                 page.screenshot(path=str(OUT / f'{width}-{height}-table.png'))
+                score_button = page.locator('#list-wrap [data-score-station]:visible').first
+                score_button.scroll_into_view_if_needed()
+                score_button.click()
+                assert page.locator('#scoreSummary').inner_text() == '待评估'
+                assert '0 / 100' in page.locator('#scoreFacts').inner_text()
+                bounds = page.locator('#healthScoreDialog').bounding_box()
+                assert bounds['x'] >= 0 and bounds['y'] >= 0 and bounds['x'] + bounds['width'] <= width + 1 and bounds['y'] + bounds['height'] <= height + 1
+                assert page.locator('#healthScoreDialog').evaluate('e => e.scrollWidth <= e.clientWidth + 1')
+                if width in (1366, 390):
+                    page.screenshot(path=str(OUT / f'{width}-{height}-health-score.png'))
+                page.locator('#scoreClose').click()
                 assert page.locator('#list-wrap .table-actions:visible').evaluate_all('''nodes => nodes.every(node => {
                     const buttons = [...node.querySelectorAll('button')].map(b => b.getBoundingClientRect());
                     const cell = node.closest('td').getBoundingClientRect();

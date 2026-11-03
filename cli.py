@@ -33,28 +33,34 @@ def _client(base: str) -> httpx.Client:
 
 def cmd_status(c: httpx.Client):
     data = c.get("/admin/status").json()
-    table = Table(title="中转站状态（动态托管 · 按健康评分排序）")
-    table.add_column("排名", justify="right")
+    table = Table(title="中转站状态（综合参考 · 实际调度按模型与协议）")
+    table.add_column("参考", justify="right")
     table.add_column("站点", style="bold")
     table.add_column("状态", no_wrap=True)
-    table.add_column("评分", justify="right")
+    table.add_column("健康度", justify="right")
     table.add_column("计费")
-    table.add_column("成功率\n(近100)", justify="right")
+    table.add_column("成功率\n(24h/近100)", justify="right")
     table.add_column("延迟(EMA)", justify="right")
     table.add_column("额度", justify="right")
     table.add_column("调用", justify="right")
     table.add_column("切换出", justify="right")
     table.add_column("最近错误", overflow="fold", max_width=40)
 
-    for st in sorted(data["stations"], key=lambda s: s["rank"]):
+    for st in sorted(data["stations"], key=lambda s: s.get("rank") or float("inf")):
         label = STATUS_LABEL.get(st["status"], st["status"])
         color = STATUS_COLOR.get(st["status"], "white")
-        if st.get("quota_exhausted"):
+        if not st.get("enabled", True):
+            label, color = "已停用", "dim"
+        elif st.get("quota_exhausted"):
             label, color = "配额耗尽", "magenta"
         lat = "-" if st["ema_latency"] is None else f"{st['ema_latency'] * 1000:.0f}ms"
         score = st["health_score"]
-        score_color = "green" if score >= 70 else ("yellow" if score >= 40 else "red")
-        rate = f"{st['window_success_rate'] * 100:.0f}%"
+        score_text = "待评估" if score is None else f"{score:.0f}"
+        confidence = st.get("health_score_breakdown", {}).get("confidence")
+        score_color = ("dim" if score is None or not st.get("enabled", True) or confidence == "low"
+                       else "green" if score >= 90 else "yellow" if score >= 70 else "red")
+        success_rate = st.get("window_success_rate")
+        rate = "—" if success_rate is None else f"{success_rate * 100:.0f}%"
         bal = st.get("balance")
         if bal is None:
             bal_txt = "-"
@@ -66,8 +72,9 @@ def cmd_status(c: httpx.Client):
         err = err if len(err) <= 40 else err[:37] + "..."
         billing = "订阅" if st.get("billing") == "subscription" else "余额"
         table.add_row(
-            f"#{st['rank']}", st["name"], f"[{color}]{label}[/{color}]",
-            f"[{score_color}]{score:.0f}[/{score_color}]", billing,
+            f"#{st['rank']}" if st.get("rank") is not None else "—",
+            st["name"], f"[{color}]{label}[/{color}]",
+            f"[{score_color}]{score_text}[/{score_color}]", billing,
             rate, lat, bal_txt, str(st["calls"]), str(st["switch_out"]), err,
         )
 

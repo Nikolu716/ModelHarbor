@@ -174,11 +174,13 @@ class QuotaHandleFailureTests(unittest.TestCase):
 
             proxy._record_request_failure(station, error)
             self.assertEqual(station.consecutive_failures, 1)
-            self.assertEqual(station.score_breakdown["failure_streak_penalty"], 5)
+            self.assertEqual(station.score_breakdown["business_samples"], 1)
+            self.assertLess(station.health_score, 70)
             proxy._record_request_failure(station, error)
 
             self.assertEqual(station.status, "down")
-            self.assertEqual(station.score_breakdown["breaker_penalty"], 25)
+            self.assertEqual(station.score_breakdown["business_samples"], 2)
+            self.assertEqual(station.score_breakdown["success_rate"], 0)
 
     def test_rate_limit_uses_retry_after_without_opening_breaker(self) -> None:
         from app.proxy import OpenAIProxy
@@ -195,7 +197,8 @@ class QuotaHandleFailureTests(unittest.TestCase):
             self.assertEqual(station.consecutive_failures, 0)
             self.assertEqual(station.status, "up")
             self.assertGreater(station.rate_limit_until, time.time() + 119)
-            self.assertEqual(station.score_breakdown["rate_limit_penalty"], 35)
+            self.assertIsNone(station.health_score)
+            self.assertEqual(station.score_breakdown["business_samples"], 0)
             protection = registry.snapshot()['stations'][0]['protection']
             self.assertEqual(protection['kind'], 'rate_limited')
             self.assertEqual(protection['source'], 'request')

@@ -21,6 +21,7 @@ from .config import GatewayConfig, StationConfig
 from . import juice
 from .errors import UpstreamError
 from .http_cleanup import close_resource, protect_response
+from . import scoring
 
 # EMA 平滑系数：越新延迟权重越高
 EMA_ALPHA = 0.3
@@ -118,12 +119,14 @@ class StationState:
     last_error: str = ""
     last_error_at: float = 0.0
 
-    # 动态健康评分（0-100，路由排序依据）
-    health_score: float = 60.0
+    # Reliability only. None means no trustworthy recent business samples.
+    health_score: float | None = None
     score_breakdown: dict = field(default_factory=dict)
     score_refreshed_at: float = 0.0
     window_results: deque = field(
         default_factory=lambda: deque(maxlen=SCORE_WINDOW))
+    health_samples: deque = field(default_factory=lambda: deque(maxlen=scoring.STORED_SAMPLES))
+    legacy_score_samples: int = 0
 
     # 探针历史：固定 60 个分钟槽（索引 0 = 当前分钟），事件按分钟累加，
     # 不因事件条数多而挤出历史（与事件队列不同，容量与分钟数解耦）
@@ -155,7 +158,9 @@ class StationState:
                  'go_usage_updated_at', 'go_usage_checked_at', 'go_usage_next_at', 'go_usage_retry_at', 'go_usage_failures')
         return {'signature': self.connection_signature(), 'saved_at': time.time(),
                 'values': {name: getattr(self, name) for name in names},
-                'window_results': list(self.window_results), 'go_usage': self.go_usage}
+                'window_results': list(self.window_results), 'go_usage': self.go_usage,
+                'score_version': 2, 'health_samples': list(self.health_samples),
+                'legacy_score_samples': self.legacy_score_samples}
 
     def restore_durable(self, data):
         if not isinstance(data, dict) or data.get('signature') != self.connection_signature():
@@ -189,12 +194,17 @@ class StationState:
         # Historical totals remain, but stale performance samples should not bias routing forever.
         saved_at = data.get('saved_at', 0)
         age = time.time() - saved_at if isinstance(saved_at, (int, float)) and math.isfinite(saved_at) else float('inf')
-        samples = data.get('window_results', [])
-        if not isinstance(samples, list):
-            samples = []
-        if 0 <= age < 86400:
-            self.window_results.extend(v for v in samples[-SCORE_WINDOW:] if isinstance(v, bool))
+        if data.get('score_version') == 2:
+            self.health_samples.extend(scoring.valid_samples(data.get('health_samples'), time.time()))
+            legacy_count = data.get('legacy_score_samples', 0)
+            if isinstance(legacy_count, int) and not isinstance(legacy_count, bool):
+                self.legacy_score_samples = max(0, min(100, legacy_count))
         else:
+            # Old booleans have neither occurrence time nor error attribution.
+            # Preserve accounting, but do not present them as new reliable evidence.
+            old_samples = data.get('window_results', [])
+            self.legacy_score_samples = len(old_samples) if isinstance(old_samples, list) else 0
+        if not 0 <= age < 86400:
             self.ema_latency = self.ttft_ema = None
         self._update_score()
 
@@ -331,6 +341,7 @@ class StationState:
             self.status = STATUS_DOWN
             self.down_since = now
         self._update_score()
+        self._persist_state()
 
     @property
     def accepts_any_model(self) -> bool:
@@ -344,60 +355,44 @@ class StationState:
         return (self.calls - self.failures) / self.calls
 
     @property
-    def window_success_rate(self) -> float:
-        """最近 SCORE_WINDOW 次调用的成功率（动态评分用，新站默认 0.8 保守）。"""
-        if not self.window_results:
-            return 0.8
-        return sum(self.window_results) / len(self.window_results)
+    def window_success_rate(self) -> float | None:
+        return self.score_breakdown.get('success_rate')
+
+    def routing_evidence(self, model: str, path: str | None, stream: bool | None = None) -> dict:
+        from .protocols import capability_path
+        return scoring.summarize(self.health_samples, time.time(), model=model,
+                                 path=capability_path(path) if path else None, stream=stream)
+
+    def _health_result(self, ok: bool, *, model: str = '', path: str = '',
+                       stream: bool = False, latency: float | None = None) -> None:
+        from .protocols import capability_path
+        self.health_samples.append(dict(at=time.time(), ok=ok, model=model,
+                                        path=capability_path(path), stream=stream, latency=latency))
 
     def _update_score(self) -> None:
-        """Score business evidence and operational availability separately."""
-        if not self.enabled:
-            self.health_score = 0.0
-            self.score_breakdown = {
-                "latency": 0.0,
-                "business_reliability": 0.0,
-                "priority_bias": 0.0,
-                "failure_streak_penalty": 0.0,
-                "breaker_penalty": 0.0,
-                "quota_penalty": 0.0,
-                "rate_limit_penalty": 0.0,
-                "business_samples": len(self.window_results),
-            }
-            self.score_refreshed_at = time.time()
-            self._persist_state()
-            return
-        latency_points = (20.0 if self.ema_latency is None else
-                          max(0.0, min(40.0, 40.0 - self.ema_latency * 4.0)))
-        sample_count = len(self.window_results)
-        successes = sum(self.window_results)
-        smoothed_success_rate = (successes + 4.0) / (sample_count + 5.0)
-        reliability_points = smoothed_success_rate * 30.0
-        failure_streak_penalty = min(15.0, self.consecutive_failures * 5.0)
-        breaker_penalty = 25.0 if self.status == STATUS_DOWN else 0.0
-        quota_penalty = 60.0 if self.quota_exhausted else 0.0
-        rate_limit_penalty = 35.0 if time.time() < self.rate_limit_until else 0.0
-        self.health_score = max(0.0, min(100.0,
-            latency_points + reliability_points + self.priority_bias
-            - failure_streak_penalty - breaker_penalty
-            - quota_penalty - rate_limit_penalty))
-        self.score_breakdown = {
-            "latency": round(latency_points, 1),
-            "business_reliability": round(reliability_points, 1),
-            "priority_bias": round(self.priority_bias, 1),
-            "failure_streak_penalty": round(failure_streak_penalty, 1),
-            "breaker_penalty": breaker_penalty,
-            "quota_penalty": quota_penalty,
-            "rate_limit_penalty": rate_limit_penalty,
-            "business_samples": sample_count,
-        }
-        self.score_refreshed_at = time.time()
-        self._persist_state()
+        """Recompute without persisting on dashboard reads or ageing ticks."""
+        now = time.time()
+        self.health_samples = deque((s for s in self.health_samples
+                                     if 0 <= now - s['at'] < scoring.MAX_AGE),
+                                    maxlen=scoring.STORED_SAMPLES)
+        view = scoring.summarize(self.health_samples, now)
+        self.window_results = deque((s['ok'] for s in list(self.health_samples)[-SCORE_WINDOW:]),
+                                    maxlen=SCORE_WINDOW)
+        self.health_score = view['score'] if self.enabled else 0.0
+        self.score_breakdown = {**view, 'version': 2, 'disabled': not self.enabled,
+                                'legacy_samples_ignored': self.legacy_score_samples}
+        self.score_refreshed_at = now
 
-    def record_success(self, latency_s: float, switched: bool = False) -> None:
-        self.calls += 1
+    def record_success(self, latency_s: float, switched: bool = False, *, model: str = '',
+                       path: str = '', stream: bool = False, counted: bool = False,
+                       signature: str | None = None) -> None:
+        if not counted:
+            self.calls += 1
         if switched:
             self.switch_in += 1
+        if signature is not None and signature != self.connection_signature():
+            self._persist_state()
+            return
         # 成功即恢复健康
         self.recover_health()
         # EMA 平滑延迟
@@ -408,12 +403,13 @@ class StationState:
                 else EMA_ALPHA * latency_s + (1 - EMA_ALPHA) * self.ema_latency
             )
         self.last_used_at = time.time()
-        self.window_results.append(True)
+        self._health_result(True, model=model, path=path, stream=stream, latency=latency_s)
         self._record_history(True)
         self._update_score()
+        self._persist_state()
 
     def record_ttft(self, sec: float | None) -> None:
-        """记录首字时间（TTFT）EMA：响应头到达 → 首个数据块。"""
+        """End-to-end first-content latency; independent of the health score."""
         if sec is None:
             return
         self.ttft_ema = (sec if self.ttft_ema is None
@@ -430,14 +426,9 @@ class StationState:
     def record_probe(self, latency_s: float) -> None:
         """Generation success restores availability, without fabricating business samples."""
         self.recover_health()
-        if latency_s is not None:
-            self.ema_latency = (
-                latency_s
-                if self.ema_latency is None
-                else EMA_ALPHA * latency_s + (1 - EMA_ALPHA) * self.ema_latency
-            )
         self._record_history(True)
         self._update_score()
+        self._persist_state()
 
     def _record_history(self, ok: bool) -> None:
         """记录探针历史：事件累加到当前分钟槽，跨分钟自动滚动。
@@ -470,16 +461,24 @@ class StationState:
                 "fail": list(reversed(self.history_fail)),
                 "minutes": HISTORY_SLOTS}
 
-    def record_failure(self, err: UpstreamError | Exception, switched: bool = True) -> None:
-        self.calls += 1
+    def record_failure(self, err: UpstreamError | Exception, switched: bool = True, *,
+                       model: str = '', path: str = '', stream: bool = False,
+                       counted: bool = False, signature: str | None = None) -> None:
+        if not counted:
+            self.calls += 1
         self.failures += 1
         if switched:
             self.switch_out += 1
+        if signature is not None and signature != self.connection_signature():
+            self._persist_state()
+            return
         self.last_error = str(err)
         self.last_error_at = time.time()
-        self.window_results.append(False)
+        if scoring.affects_health(err):
+            self._health_result(False, model=model, path=path, stream=stream)
         self._record_history(False)
         self._update_score()
+        self._persist_state()
 
     # ---------- 资金/配额与限流 ----------
     def mark_quota_exhausted(self, err: UpstreamError,
@@ -498,6 +497,7 @@ class StationState:
         self.last_error = str(err)
         self.last_error_at = self.quota_at
         self._update_score()
+        self._persist_state()
 
     def mark_rate_limited(self, cooldown_s: float, *, reason: str = "",
                           source: str = "request", wait_source: str = "gateway") -> None:
@@ -509,6 +509,7 @@ class StationState:
             self.rate_limit_source = source
             self.rate_limit_wait_source = wait_source
         self._update_score()
+        self._persist_state()
 
     def reset_quota(self) -> None:
         """清除配额耗尽状态（探测确认有额度，或管理员强制重置）。"""
@@ -524,6 +525,7 @@ class StationState:
         self.rate_limit_reason = self.rate_limit_source = self.rate_limit_wait_source = ""
         self.recover_health()
         self._update_score()
+        self._persist_state()
 
 
 class Registry:
@@ -770,9 +772,14 @@ class Registry:
     def update_station(self, name: str, changes: dict) -> StationState:
         """更新站点配置；base_url/key/并发等变化时重建客户端与信号量。"""
         st = self.states[name]
+        previous_signature = st.connection_signature()
         connection_changed = any(k in changes and changes[k] != getattr(st.cfg, k)
                                  for k in ("base_url", "api_key", "provider", "opencode_plan"))
         st.cfg = dataclasses.replace(st.cfg, **changes)
+        if previous_signature != st.connection_signature():
+            st.health_samples.clear()
+            st.legacy_score_samples = 0
+            st.ema_latency = st.ttft_ema = None
         if connection_changed or "headers" in changes:
             st.go_usage = {}
             st.go_usage_status, st.go_usage_error = "pending", ""
@@ -804,6 +811,7 @@ class Registry:
             if "max_concurrency" in changes:
                 st.semaphore = asyncio.Semaphore(st.cfg.max_concurrency)
         st._update_score()
+        st._persist_state()
         return st
 
     def remove_station(self, name: str) -> None:
@@ -963,11 +971,11 @@ class Registry:
                     "quota_probe_error": st.quota_probe_error,
                     "quota_probe_backoff": st.quota_probe_backoff,
                     "rate_limit_until": st.rate_limit_until,
-                    "health_score": round(st.health_score, 1),
+                    "health_score": round(st.health_score, 1) if st.health_score is not None else None,
                     "health_score_breakdown": dict(st.score_breakdown),
                     "ttft_ema": st.ttft_ema,
                     "juice_score": juice.juice_score(st),
-                    "window_success_rate": round(st.window_success_rate, 4),
+                    "window_success_rate": round(st.window_success_rate, 4) if st.window_success_rate is not None else None,
                     "balance": st.balance,
                     "balance_at": st.balance_at,
                     "history_hour": st.history_hour(),
@@ -1009,13 +1017,13 @@ class Registry:
                 }
             )
         up = sum(1 for s in stations if s["status"] == STATUS_UP and s["enabled"])
-        # 动态排名：按健康评分降序（托管模式下的实际路由顺序）
+        # Overview only; actual routing uses this request's model and protocol.
         for s in stations:
             s["rank"] = None
         ordered = sorted((s for s in stations
                           if self.is_routeable(self.states[s["name"]], now)
                           and (s["models"] or s["accepts_any_model"])),
-                         key=lambda s: (s["health_score"],
+                         key=lambda s: (s["health_score"] if s["health_score"] is not None else 95.0,
                                         -(6 if s["priority_auto"] else s["priority"])),
                          reverse=True)
         for i, s in enumerate(ordered):

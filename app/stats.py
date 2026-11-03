@@ -256,7 +256,8 @@ class EventLog:
         previous = self._runtime.get(name, {})
         # Dashboard polling only recomputes scores; it must not write to disk
         # or renew the age of historical performance evidence.
-        if any(previous.get(key) != state.get(key) for key in ('signature', 'values', 'window_results')):
+        if any(previous.get(key) != state.get(key) for key in (
+                'signature', 'values', 'window_results', 'score_version', 'health_samples', 'legacy_score_samples')):
             self._runtime[name] = state
             self._commit(runtime={name: state})
 

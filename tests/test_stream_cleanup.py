@@ -186,7 +186,7 @@ class ForwardCleanupTests(unittest.IsolatedAsyncioTestCase):
                 waiting.set()
                 return httpx.Response(503, json={'error': {'message': 'unavailable'}})
             self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(fail))
-            self.proxy.router.pick = lambda *args: [self.st, other]
+            self.proxy.router.pick = lambda *args, **kwargs: [self.st, other]
             task = asyncio.create_task(method('/chat/completions', {'model': 'm'}, 'm'))
             await asyncio.wait_for(waiting.wait(), 1)
             await asyncio.sleep(.03)

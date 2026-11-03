@@ -1,8 +1,7 @@
 """路由与故障转移。
 
 根据模型名选出候选站（启用 + 健康 + 支持该模型），按**动态健康评分**
-排序（延迟 EMA + 滑动窗口成功率 + 状态惩罚，自动托管无需手工配置），
-评分相近的站做加权随机避免频繁抖动。
+排序。健康分只反映可靠性；同模型、同协议、同流式模式的速度独立参与分流。
 """
 from __future__ import annotations
 
@@ -34,30 +33,34 @@ class Router:
         """返回可路由候选站列表（已过滤不健康/不支持模型的站）。"""
         return self.registry.candidates_for(model, path)
 
-    def pick(self, model: str, path: str | None = None) -> list[StationState]:
-        """按动态健康评分排序，评分相近的站按权重+延迟加权随机。
-
-        无需手工配置优先级：系统根据实时健康自动排列（托管模式）。
-        """
+    def pick(self, model: str, path: str | None = None, *, stream: bool | None = None) -> list[StationState]:
+        """Reliability bands first, bounded speed/manual preference inside a band."""
         cands = self.candidates(model, path)
         if len(cands) <= 1:
             return cands
 
-        cands.sort(key=lambda st: st.health_score, reverse=True)
+        evidence = {st.cfg.name: st.routing_evidence(model, path, stream) for st in cands}
+        scores = {name: view['score'] if view['score'] is not None else 95.0
+                  for name, view in evidence.items()}
+        cands.sort(key=lambda st: scores[st.cfg.name], reverse=True)
         ordered: list[StationState] = []
         i = 0
         while i < len(cands):
             j = i
-            while j < len(cands) and cands[j].health_score >= cands[i].health_score - SCORE_BAND:
+            while j < len(cands) and scores[cands[j].cfg.name] >= scores[cands[i].cfg.name] - SCORE_BAND:
                 j += 1
             group = cands[i:j]
             if len(group) == 1:
                 ordered.append(group[0])
             else:
-                # 有效权重 = 配置权重 / (1 + 延迟秒数)：同健康度下更快、更重的站靠前
-                lat = {st.cfg.name: (st.ema_latency if st.ema_latency is not None
-                                    else 5.0) for st in group}
-                w = [st.cfg.weight / (1.0 + lat[st.cfg.name]) for st in group]
+                measured = sorted(evidence[st.cfg.name]['latency'] for st in group
+                                  if evidence[st.cfg.name]['latency'] is not None)
+                neutral = measured[len(measured) // 2] if measured else 10.0
+                lat = {st.cfg.name: evidence[st.cfg.name]['latency']
+                       if evidence[st.cfg.name]['latency'] is not None else neutral for st in group}
+                # Never let speed drown out reliability; no cross-model latency fallback.
+                w = [st.cfg.weight * (1 + st.priority_bias / 15.0)
+                     / (1 + min(30.0, lat[st.cfg.name]) / 10.0) for st in group]
                 total = sum(w)
                 ordered.append(_weighted_choice(group, [x / total for x in w]))
                 ordered.extend(st for st in group if st not in ordered)

@@ -404,6 +404,12 @@ async function main() {
   await settle();
 
   const document = window.document;
+  document.querySelector('#list-wrap [data-score-station]').click();
+  assert.equal(document.getElementById('healthScoreDialog').open, true);
+  assert.equal(document.getElementById('scoreStationName').textContent, maliciousStation);
+  assert.equal(document.querySelectorAll('#healthScoreDialog script, #healthScoreDialog img').length, 0);
+  document.getElementById('scoreClose').click();
+  assert.equal(document.getElementById('healthScoreDialog').open, false);
   const protectionStation = { name: maliciousStation, enabled: true, status: "down", protection: {
     kind: "breaker", until: Date.now() / 1000 + 60, failure_count: 3, status_code: 503,
     source: "request", reason: maliciousModel,

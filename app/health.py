@@ -248,7 +248,7 @@ class HealthMonitor:
     async def _notify_changes(self) -> None:
         """每轮探测后统一刷新评分，并检测状态变化推送 webhook（挂机托管）。"""
         for st in self.registry.states.values():
-            st._update_score()  # 探测结果（熔断/恢复/配额）实时反映到评分
+            st._update_score()  # 按样本真实时间衰减，探测结果不制造业务评分样本
             cur = ("quota" if st.quota_exhausted
                    else ("down" if st.status == STATUS_DOWN else "up"))
             prev = self._prev_status.get(st.cfg.name)

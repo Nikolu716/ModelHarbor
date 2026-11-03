@@ -57,8 +57,8 @@ def verify_static() -> None:
     assert not parser.inline_handlers, f"inline handlers: {parser.inline_handlers}"
     assert parser.inline_style_blocks == 0, "dashboard CSS must remain external"
     assert parser.inline_script_blocks == 0, "dashboard JS must remain external"
-    assert '/static/dashboard.css?v=41' in html
-    assert '/static/dashboard.js?v=44' in html
+    assert '/static/dashboard.css?v=42' in html
+    assert '/static/dashboard.js?v=45' in html
     assert '/static/visual-tests.js?v=11' in html
     assert '/static/visual-tests.css?v=9' in html
     assert '/static/analytics.js?v=8' in html
@@ -243,7 +243,7 @@ def verify_live() -> None:
     base = local_service_url(settings)
 
     for asset in (
-        "index.html", "dashboard.css?v=41", "dashboard.js?v=44", "analytics.js?v=8",
+        "index.html", "dashboard.css?v=42", "dashboard.js?v=45", "analytics.js?v=8",
         "visual-tests.js?v=11", "visual-tests.css?v=9",
         "vendor/echarts.min.js?v=5.6.0",
         "brand-logo-source.png?v=4", "brand-mark-180.png?v=4",
