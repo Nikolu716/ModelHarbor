@@ -35,6 +35,11 @@ with tempfile.TemporaryDirectory() as directory:
                  [StationConfig(name=name, base_url='https://mock.invalid/v1', api_key='fixture-only', models=['first-model'])
                   for name in ['Atlas', 'Cedar', 'Harbor', 'Quartz', 'Willow']]))
     runtime = app.state.accounts.active
+    # A low-score station awaiting recovery exercises the widest primary action.
+    recovery_station = runtime.registry.get('Cedar')
+    recovery_station.status = 'down'
+    recovery_station.down_since = time.time() - runtime.gateway.cool_down - 1
+    recovery_station.consecutive_failures = 3
     loop_holder = []
     async def quiet_health():
         loop_holder.append(asyncio.get_running_loop())
@@ -242,6 +247,12 @@ with tempfile.TemporaryDirectory() as directory:
                 for thumb in page.locator('[data-table-visual]:visible button[data-visual-thumbnail]').all():
                     thumb.frame_locator('iframe').locator('svg').wait_for()
                 page.screenshot(path=str(OUT / f'{width}-{height}-table.png'))
+                assert page.locator('#list-wrap .table-actions:visible').evaluate_all('''nodes => nodes.every(node => {
+                    const buttons = [...node.querySelectorAll('button')].map(b => b.getBoundingClientRect());
+                    const cell = node.closest('td').getBoundingClientRect();
+                    return buttons.length === 2 && Math.abs(buttons[0].top - buttons[1].top) < 1
+                        && buttons[1].right <= cell.right;
+                })'''), (width, height, 'station actions wrapped or overflowed')
                 first_rows = page.locator('[data-table-visual]:visible').evaluate_all('nodes => nodes.map(n => n.dataset.tableVisual)')
                 next_page = page.locator('#monitorPagination [data-page-step="1"]')
                 if next_page.is_enabled():
@@ -279,6 +290,13 @@ with tempfile.TemporaryDirectory() as directory:
                 assert bounds['x'] >= -1 and bounds['y'] >= -1 and bounds['width'] <= width + 1 and bounds['height'] <= height + 1, (width, height, bounds)
                 fits = page.locator('#visualTestDialog').evaluate('(el) => el.scrollWidth <= el.clientWidth + 1 && el.scrollHeight <= el.clientHeight + 1')
                 assert fits, (width, height, 'dialog overflow')
+                assert page.locator('#visualTestClose').evaluate('''button => {
+                    const box = button.getBoundingClientRect();
+                    const icon = button.querySelector('svg').getBoundingClientRect();
+                    return box.width >= 36 && box.height >= 36
+                        && Math.abs(box.x + box.width / 2 - icon.x - icon.width / 2) < 1
+                        && Math.abs(box.y + box.height / 2 - icon.y - icon.height / 2) < 1;
+                }'''), (width, height, 'close icon alignment')
                 run = page.locator('#visualTestRun').bounding_box()
                 assert run and run['y'] + run['height'] <= height + 1
                 page.screenshot(path=str(OUT / f'{width}-{height}-config.png'))

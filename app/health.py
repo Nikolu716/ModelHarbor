@@ -182,7 +182,9 @@ class HealthMonitor:
                                 raise ValueError("用量响应超过大小限制")
                         windows = normalize_usage(json.loads(raw))
                         status = "ready"
-            except (httpx.HTTPError, ValueError, TypeError):
+            except (httpx.HTTPError, ValueError, TypeError) as e:
+                if isinstance(e, httpx.PoolTimeout):
+                    self.registry.reset_client(st, expected_client=client)
                 error = "暂时无法读取上游用量，保留上次数据"
             if self.registry.get(cfg.name) is not st or st.cfg is not cfg:
                 return st.go_usage_view()
@@ -236,7 +238,9 @@ class HealthMonitor:
                             "balance_low", st.cfg.name,
                             f"余额不足预警: ${st.balance:.2f}（低于 ${threshold:.2f}，请及时充值）")
             # 非 2xx（404 等）：不支持，保持 balance=None 静默降级
-        except (httpx.TimeoutException, httpx.TransportError):
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if isinstance(e, httpx.PoolTimeout):
+                self.registry.reset_client(st, expected_client=client)
             pass  # 网络异常静默降级
         except Exception as e:  # noqa: BLE001
             print(f"[health] {st.cfg.name} 余额探测异常: {e}")
@@ -412,6 +416,8 @@ class HealthMonitor:
             reason = f"上游限流冷却中，{math.ceil(st.rate_limit_until - now)} 秒后可测试"
         elif st.status == STATUS_DOWN and now < st.down_since + self.gateway.cool_down:
             reason = f"网关熔断保护中，{math.ceil(st.down_since + self.gateway.cool_down - now)} 秒后可测试"
+        elif st.recovery_inflight:
+            reason = "正在用业务请求验证恢复，请稍后再试"
         elif st.generation_probe_lock.locked() or now - st.probe_chat_at < 60:
             reason = "生成测试正在执行或距上次不足 60 秒，请稍后再试"
         if reason:
@@ -446,7 +452,8 @@ class HealthMonitor:
                 and configured_probe_model not in st.cfg.models):
             st.last_probe_ok = None
             st.last_probe_error = (
-                f"已配置的探测模型 {configured_probe_model} 不在当前模型目录中")
+                f"已配置的探测模型 {configured_probe_model} 不在当前模型目录中；"
+                f"请在站点设置中改选可用模型或恢复自动选择")
             return "skip", None, UpstreamError(
                 st.cfg.name, 0, st.last_probe_error)
         model = configured_probe_model
@@ -473,11 +480,14 @@ class HealthMonitor:
         st.probe_chat_at = time.time()
         st.last_probe_kind = "generation"
         t0 = time.perf_counter()
+        # Reasoning models may stay silent for minutes before the single token.
+        # A 30s cap falsely marks healthy stations as failed and re-trips the breaker.
+        probe_read_timeout = max(30.0, min(st.cfg.timeout, 120.0))
         try:
             resp = await client.post(url, json=body, headers=headers,
                                      timeout=httpx.Timeout(
                                          connect=self.gateway.connect_timeout,
-                                         read=30.0, write=10.0, pool=10.0))
+                                         read=probe_read_timeout, write=10.0, pool=10.0))
             if st.cfg is not probe_config or not st.enabled:
                 return "skip", None, UpstreamError(st.cfg.name, 0, "站点配置已变更，忽略旧配置的生成测试结果")
             latency = time.perf_counter() - t0
@@ -503,6 +513,15 @@ class HealthMonitor:
                 return "server_error", latency, err
             return "client_error", latency, err
         except (httpx.TimeoutException, httpx.TransportError) as e:
+            if isinstance(e, httpx.PoolTimeout):
+                self.registry.reset_client(st, expected_client=client)
+                err = UpstreamError(
+                    st.cfg.name, 0,
+                    "网关本地连接池已重置，本次生成测试未计入站点故障，请稍后重试")
+                st.last_probe_ok = None
+                st.last_probe_error = str(err)
+                st.last_probe_quota = False
+                return "skip", None, err
             err = UpstreamError(
                 st.cfg.name, 0, f"真实链路探测失败: {type(e).__name__}")
             st.last_probe_ok = False
@@ -615,10 +634,15 @@ class HealthMonitor:
                 elif resp.status_code == 408 or resp.status_code >= 500:
                     self._mark_failure(st, err)
         except (httpx.TimeoutException, httpx.TransportError) as e:
-            st.last_probe_ok = False
             st.last_probe_latency = None
-            st.last_probe_error = f"探测失败: {type(e).__name__}"
             st.last_probe_quota = False
+            if isinstance(e, httpx.PoolTimeout):
+                self.registry.reset_client(st, expected_client=client)
+                st.last_probe_ok = None
+                st.last_probe_error = "网关本地连接池已重置，本次检查未计入站点故障，请稍后重试"
+                return
+            st.last_probe_ok = False
+            st.last_probe_error = f"探测失败: {type(e).__name__}"
             self._mark_failure(st)
         except Exception as e:  # noqa: BLE001 保证探测健壮
             st.last_probe_ok = False
@@ -702,8 +726,10 @@ class HealthMonitor:
                     status = "ready"
             except (ValueError, UnicodeError):
                 status, error = "invalid_response", "模型列表格式无效或不完整，已保留上次列表；自动刷新已暂停"
-            except (httpx.TimeoutException, httpx.TransportError):
-                error = "模型接口连接失败，已保留上次列表，稍后重试"
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                error = ("网关本地连接池已重置，已保留上次列表，稍后重试"
+                         if isinstance(e, httpx.PoolTimeout) else
+                         "模型接口连接失败，已保留上次列表，稍后重试")
             except asyncio.CancelledError:
                 if st.models_discovery_revision == revision:
                     st.models_discovery_status = previous_status
@@ -748,10 +774,15 @@ class HealthMonitor:
         """Fetch bounded native catalog pages, never a URL returned by upstream."""
         items, seen, params = [], set(), {}
         for _ in range(10):
-            response = await self.registry.ensure_client(st).get(
-                cfg.models_url, params=params, headers=inference_headers(cfg, catalog=True),
-                timeout=httpx.Timeout(connect=self.gateway.connect_timeout, read=10, write=10, pool=10),
-                follow_redirects=False)
+            client = self.registry.ensure_client(st)
+            try:
+                response = await client.get(
+                    cfg.models_url, params=params, headers=inference_headers(cfg, catalog=True),
+                    timeout=httpx.Timeout(connect=self.gateway.connect_timeout, read=10, write=10, pool=10),
+                    follow_redirects=False)
+            except httpx.PoolTimeout:
+                self.registry.reset_client(st, expected_client=client)
+                raise
             if not response.is_success or cfg.provider not in ("anthropic", "gemini"):
                 return response
             if len(response.content) > 2_000_000:

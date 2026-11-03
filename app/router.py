@@ -8,12 +8,21 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
+from dataclasses import dataclass
 
 from .config import GatewayConfig
-from .state import Registry, StationState
+from .state import Registry, StationState, STATUS_DOWN
 
 # 评分相差不超过该值时视为"同等健康"，组内加权随机
 SCORE_BAND = 5.0
+
+
+@dataclass
+class RoutePermit:
+    semaphore: asyncio.Semaphore
+    recovery: bool = False
+    released: bool = False
 
 
 class Router:
@@ -47,31 +56,54 @@ class Router:
             else:
                 # 有效权重 = 配置权重 / (1 + 延迟秒数)：同健康度下更快、更重的站靠前
                 lat = {st.cfg.name: (st.ema_latency if st.ema_latency is not None
-                                    else 999.0) for st in group}
+                                    else 5.0) for st in group}
                 w = [st.cfg.weight / (1.0 + lat[st.cfg.name]) for st in group]
                 total = sum(w)
                 ordered.append(_weighted_choice(group, [x / total for x in w]))
                 ordered.extend(st for st in group if st not in ordered)
             i = j
+        # One real request can validate an expired breaker, even with a low
+        # score. No extra generation, and no concurrent recovery stampede.
+        now = time.time()
+        recovering = [st for st in ordered if st.status == STATUS_DOWN
+                      and not st.recovery_inflight
+                      and now >= st.recovery_attempt_at + max(1.0, self.gateway.cool_down)]
+        if recovering:
+            trial = min(recovering, key=lambda st: (st.recovery_attempt_at, st.down_since))
+            ordered.remove(trial)
+            ordered.insert(0, trial)
         return ordered
 
-    async def acquire(self, st: StationState, timeout: float = 0.0) -> bool:
+    async def acquire(self, st: StationState, timeout: float = 0.0) -> RoutePermit | None:
         """尝试获取站点并发额度；timeout=0 时立即失败不等待。"""
         sem = self.registry.ensure_semaphore(st)
         if timeout > 0:
             try:
                 await asyncio.wait_for(sem.acquire(), timeout=timeout)
-                return True
             except asyncio.TimeoutError:
-                return False
-        if sem.locked():
-            return False
-        await sem.acquire()
-        return True
+                return None
+        else:
+            if sem.locked():
+                return None
+            await sem.acquire()
+        now = time.time()
+        recovery = st.status == STATUS_DOWN
+        if not self.registry.is_routeable(st, now) or (recovery and (
+                st.recovery_inflight or st.generation_probe_lock.locked()
+                or now < st.recovery_attempt_at + max(1.0, self.gateway.cool_down))):
+            sem.release()
+            return None
+        if recovery:
+            st.recovery_inflight = True
+            st.recovery_attempt_at = now
+        return RoutePermit(sem, recovery)
 
-    def release(self, st: StationState) -> None:
-        if st.semaphore is not None:
-            st.semaphore.release()
+    def release(self, st: StationState, permit: RoutePermit) -> None:
+        if not permit.released:
+            permit.released = True
+            permit.semaphore.release()
+            if permit.recovery:
+                st.recovery_inflight = False
 
 
 def _weighted_choice(items: list, probs: list[float]):

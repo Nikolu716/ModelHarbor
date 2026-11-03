@@ -19,7 +19,6 @@ import weakref
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
 
 from .config import GatewayConfig
 from .errors import (
@@ -30,7 +29,8 @@ from .errors import (
     first_byte_error,
     timeout_error,
 )
-from .router import Router
+from .router import Router, RoutePermit
+from .http_cleanup import close_resource, protect_response, CLOSE_TIMEOUT
 from .state import Registry, StationState
 from .stats import EventLog
 from .wire import ChatStreamToResponsesTranslator, NamespaceMemory, chat_to_responses, prepare_request
@@ -48,46 +48,96 @@ SSE_HEADERS = {
 }
 
 
+async def _shielded_close(resp, registry: Registry) -> None:
+    if resp is not None:
+        await asyncio.shield(registry.start_cleanup(close_resource(resp)))
+
+
 class _StreamRouteLease:
     """Idempotently release a committed stream route on every exit path."""
 
     def __init__(self, registry: Registry, router: Router, st: StationState,
-                 route_id: int, resp: httpx.Response, stream_iter) -> None:
+                 route_id: int, resp: httpx.Response, stream_iter, permit: RoutePermit) -> None:
         self.registry = registry
         self.router = router
         self.st = st
         self.route_id = route_id
         self.resp = resp
         self.stream_iter = stream_iter
+        self.permit = permit
         self.closed = False
+        self.pending_read: asyncio.Future | None = None
+        self._close_task: asyncio.Task | None = None
+
+    def start_close(self, outcome: str = "cancelled",
+                    error: str = "client_stream_closed") -> asyncio.Task:
+        """Schedule cleanup on an independent task and return it.
+
+        Cancellation of the calling ASGI task must not abort the upstream
+        socket close, so the task is created directly on the loop rather than
+        inside the response's (possibly cancelled) task group.
+        """
+        if self._close_task is None:
+            self._close_task = self.registry.start_cleanup(
+                self._close_now(outcome, error))
+        return self._close_task
+
+    async def _close_now(self, outcome: str, error: str) -> None:
+        try:
+            pending = self.pending_read
+            if pending is not None:
+                if not pending.done():
+                    pending.cancel()
+                try:
+                    async with asyncio.timeout(CLOSE_TIMEOUT):
+                        await asyncio.gather(pending, return_exceptions=True)
+                except TimeoutError:
+                    pass
+            await close_resource(self.stream_iter)
+        finally:
+            try:
+                await close_resource(self.resp)
+            finally:
+                self.closed = True
+                self.registry.end_route(self.route_id, outcome, error)
+                self.router.release(self.st, self.permit)
 
     async def close(self, outcome: str = "cancelled",
                     error: str = "client_stream_closed") -> None:
-        if self.closed:
-            return
-        self.closed = True
+        task = self.start_close(outcome, error)
         try:
-            await self.stream_iter.aclose()
-        finally:
-            try:
-                await self.resp.aclose()
-            finally:
-                self.registry.end_route(self.route_id, outcome, error)
-                self.router.release(self.st)
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
 
     def abandon(self, loop: asyncio.AbstractEventLoop) -> None:
         """Best-effort safety net when a response is dropped before ASGI starts it."""
-        if self.closed or loop.is_closed():
+        if self._close_task is not None or loop.is_closed():
             return
 
         def schedule() -> None:
-            if not self.closed:
-                loop.create_task(self.close())
+            if self._close_task is None:
+                self._close_task = self.registry.start_cleanup(
+                    self._close_now("cancelled", "response_dropped"))
 
         try:
             loop.call_soon_threadsafe(schedule)
         except RuntimeError:
             pass
+
+
+class _LeasedStreamingResponse(StreamingResponse):
+    """Release the route even if ASGI send fails before/after yielding a chunk."""
+
+    def __init__(self, *args, lease, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lease = lease
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self.lease.close()
 
 
 def _error_response(status: int, message: str, err_type: str = "upstream_error") -> JSONResponse:
@@ -883,6 +933,19 @@ class OpenAIProxy:
     # ------------------------------------------------------------------
     # 失败处理（计费模式策略）
     # ------------------------------------------------------------------
+    def _local_pool_error(self, st: StationState, client: httpx.AsyncClient) -> UpstreamError:
+        """PoolTimeout is local saturation, not evidence against the upstream.
+
+        Rebuild the wedged client, but do not charge this to the station's
+        breaker or success-rate statistics: the request never reached upstream.
+        """
+        self.registry.reset_client(st, expected_client=client)
+        return UpstreamError(
+            st.cfg.name, 0,
+            "网关本地连接池已重置，本次请求未计入站点故障，请重试",
+            retryable=True,
+        )
+
     def _record_request_failure(self, st: StationState, err: UpstreamError):
         st.record_failure(err)
         if err.retryable and not err.deterministic and not err.quota and err.status_code != 429:
@@ -939,21 +1002,23 @@ class OpenAIProxy:
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
                 local_errors.append(str(exc))
                 continue  # No upstream I/O, semaphore, or station-health failure.
-            if not await self.router.acquire(st):
+            if attempts:
+                await asyncio.sleep(self.gateway.retry_backoff)
+            permit = await self.router.acquire(st)
+            if permit is None:
                 attempts.append(f"[{st.cfg.name}] 并发已满")
                 has_transient = True  # 下一轮可能不忙
                 continue
-            if attempts:  # 之前失败过，切换前稍作退避
-                await asyncio.sleep(self.gateway.retry_backoff)
             route_id = self.registry.begin_route(st.cfg.name, model, client_ip)
             route_outcome = "failed"
             route_error = ""
+            resp = None
             try:
                 client = self.registry.ensure_client(st)
                 timeout = httpx.Timeout(
                     connect=self.gateway.connect_timeout,
                     read=st.cfg.timeout,
-                    write=30.0, pool=10.0,
+                    write=30.0, pool=min(10.0, self.gateway.first_byte_timeout * .8),
                 )
                 t0 = time.perf_counter()
                 req = client.build_request("POST", url, json=target_body,
@@ -965,6 +1030,7 @@ class OpenAIProxy:
                     timeout=self.gateway.first_byte_timeout,
                 )
 
+                protect_response(resp, self.registry.start_cleanup)
                 if resp.status_code in (200, 201):
                     # 等首字节（卡死检测），之后缓冲剩余；顺带测量首字时间
                     t_first = time.perf_counter()
@@ -972,7 +1038,7 @@ class OpenAIProxy:
                         stream_iter, first = await _read_first(
                             resp, timeout=self.gateway.first_byte_timeout)
                     except (asyncio.TimeoutError, httpx.TimeoutException):
-                        await resp.aclose()
+                        await _shielded_close(resp, self.registry)
                         err = first_byte_error(st.cfg.name)
                         self._record_request_failure(st, err)
                         route_error = str(err)
@@ -980,7 +1046,7 @@ class OpenAIProxy:
                         has_transient = True
                         continue
                     except httpx.TransportError as e:
-                        await resp.aclose()
+                        await _shielded_close(resp, self.registry)
                         err = connect_error(st.cfg.name, type(e).__name__)
                         self._record_request_failure(st, err)
                         route_error = str(err)
@@ -995,7 +1061,7 @@ class OpenAIProxy:
                             chunks.append(chunk)
                     except (httpx.TimeoutException, httpx.TransportError) as e:
                         await stream_iter.aclose()
-                        await resp.aclose()
+                        await _shielded_close(resp, self.registry)
                         err = timeout_error(st.cfg.name,
                                             f"读取中断: {type(e).__name__}")
                         self._record_request_failure(st, err)
@@ -1003,7 +1069,7 @@ class OpenAIProxy:
                         attempts.append(str(err))
                         has_transient = True
                         continue
-                    await resp.aclose()
+                    await _shielded_close(resp, self.registry)
 
                     latency = (time.perf_counter() - t0) * 1000
                     # 非流式不记录 TTFT（响应体和响应头同时到达，无"首字"体感含义）
@@ -1045,7 +1111,7 @@ class OpenAIProxy:
                     ), False)
                 # 非 2xx：读错误体（该响应尚未被迭代，可安全 aread）
                 payload = await resp.aread()
-                await resp.aclose()
+                await _shielded_close(resp, self.registry)
                 err = classify_error(st.cfg.name, resp.status_code, payload)
                 err = self._handle_failure(st, err, resp.headers.get("retry-after"))
                 route_error = str(err)
@@ -1065,9 +1131,12 @@ class OpenAIProxy:
                 route_error = str(err)
                 attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                 has_transient = True
-            except httpx.TimeoutException:
-                err = timeout_error(st.cfg.name)
-                self._record_request_failure(st, err)
+            except httpx.TimeoutException as e:
+                if isinstance(e, httpx.PoolTimeout):
+                    err = self._local_pool_error(st, client)
+                else:
+                    err = timeout_error(st.cfg.name)
+                    self._record_request_failure(st, err)
                 route_error = str(err)
                 attempts.append(str(err))
                 has_transient = True
@@ -1080,8 +1149,11 @@ class OpenAIProxy:
             finally:
                 if route_outcome == "failed" and not route_error:
                     route_error = "request_aborted"
-                self.registry.end_route(route_id, route_outcome, route_error)
-                self.router.release(st)
+                try:
+                    await _shielded_close(resp, self.registry)
+                finally:
+                    self.registry.end_route(route_id, route_outcome, route_error)
+                    self.router.release(st, permit)
 
         if local_errors and not attempts and not has_transient:
             return (_error_response(400, local_errors[0], "invalid_request_error"), False)
@@ -1114,12 +1186,13 @@ class OpenAIProxy:
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
                 local_errors.append(str(exc))
                 continue  # No upstream I/O, semaphore, or station-health failure.
-            if not await self.router.acquire(st):
+            if attempts:
+                await asyncio.sleep(self.gateway.retry_backoff)
+            permit = await self.router.acquire(st)
+            if permit is None:
                 attempts.append(f"[{st.cfg.name}] 并发已满")
                 has_transient = True
                 continue
-            if attempts:
-                await asyncio.sleep(self.gateway.retry_backoff)
 
             route_id = self.registry.begin_route(st.cfg.name, model, client_ip)
             route_outcome = "failed"
@@ -1131,7 +1204,7 @@ class OpenAIProxy:
                 timeout = httpx.Timeout(
                     connect=self.gateway.connect_timeout,
                     read=self.gateway.read_timeout,
-                    write=30.0, pool=10.0,
+                    write=30.0, pool=min(10.0, self.gateway.first_byte_timeout * .8),
                 )
                 t0 = time.perf_counter()
                 req = client.build_request("POST", url, json=target_body,
@@ -1149,9 +1222,12 @@ class OpenAIProxy:
                     attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                     has_transient = True
                     continue
-                except httpx.TimeoutException:
-                    err = timeout_error(st.cfg.name)
-                    self._record_request_failure(st, err)
+                except httpx.TimeoutException as e:
+                    if isinstance(e, httpx.PoolTimeout):
+                        err = self._local_pool_error(st, client)
+                    else:
+                        err = timeout_error(st.cfg.name)
+                        self._record_request_failure(st, err)
                     route_error = str(err)
                     attempts.append(str(err))
                     has_transient = True
@@ -1164,6 +1240,7 @@ class OpenAIProxy:
                     has_transient = True
                     continue
 
+                protect_response(resp, self.registry.start_cleanup)
                 # ---- 状态码检查（首字节之前，可切换） ----
                 if resp.status_code != 200:
                     payload = await resp.aread()
@@ -1223,7 +1300,10 @@ class OpenAIProxy:
                 ttft_ms = (time.perf_counter() - t_first) * 1000
                 st.record_ttft(ttft_ms / 1000)
                 switched = bool(attempts)
-                st.record_success(latency / 1000, switched=switched)
+                # A half-open trial must finish before reopening the station.
+                # One content chunk followed by a broken stream is not recovery.
+                if not permit.recovery:
+                    st.record_success(latency / 1000, switched=switched)
                 detail = "流式成功" + (f" (经{len(attempts)}次切换)" if switched else "")
                 event_time = self.eventlog.add(
                     st.cfg.name, model, True, latency,
@@ -1241,7 +1321,7 @@ class OpenAIProxy:
                 registry = self.registry
                 router = self.router
                 lease = _StreamRouteLease(
-                    registry, router, st, route_id, resp, stream_iter)
+                    registry, router, st, route_id, resp, stream_iter, permit)
 
                 async def gen(resp=resp, st=st, prefetch=buffered,
                               stream_iter=stream_iter, route_id=route_id,
@@ -1271,9 +1351,11 @@ class OpenAIProxy:
                             try:
                                 if pending_read is None:
                                     pending_read = asyncio.ensure_future(stream_iter.__anext__())
+                                    lease.pending_read = pending_read
                                 chunk = await asyncio.wait_for(
                                     asyncio.shield(pending_read), timeout=keepalive or None)
                                 pending_read = None
+                                lease.pending_read = None
                                 if namespace_scanner:
                                     namespace_scanner.feed(chunk)
                                 parsed_tokens = usage_parser.feed(chunk)
@@ -1287,6 +1369,7 @@ class OpenAIProxy:
                                     yield chunk
                             except StopAsyncIteration:
                                 pending_read = None
+                                lease.pending_read = None
                                 if namespace_scanner:
                                     namespace_scanner.finish()
                                 parsed_tokens = usage_parser.finish()
@@ -1322,10 +1405,14 @@ class OpenAIProxy:
                         yield _error_sse(
                             f"上游 {st.cfg.name} 流中断: {type(e).__name__}", path)
                     finally:
-                        if pending_read is not None:
-                            if not pending_read.done():
-                                pending_read.cancel()
-                            await asyncio.gather(pending_read, return_exceptions=True)
+                        if permit.recovery:
+                            if stream_outcome == "success":
+                                st.record_success(latency / 1000, switched=switched)
+                            elif stream_outcome == "stream_error":
+                                self._record_request_failure(st, connect_error(st.cfg.name, stream_error))
+                        # Bookkeeping only: the upstream socket must be closed
+                        # from an independent task, because this generator may
+                        # be running inside Starlette's cancelled task group.
                         usage = usage_parser.last
                         if usage is not None and usage.tokens is not None:
                             eventlog.add_tokens(
@@ -1338,11 +1425,13 @@ class OpenAIProxy:
                             eventlog.add_tokens(
                                 st.cfg.name, route_model, stream_tokens,
                                 occurred_at=route_event_time, route_id=route_id)
+                        # close() moves the socket close onto an independent
+                        # task, so a cancelled caller cannot abort it; normal
+                        # completion still waits for the route to be released.
                         await lease.close(stream_outcome, stream_error)
 
-                response = StreamingResponse(
-                    gen(), media_type="text/event-stream", headers=dict(SSE_HEADERS),
-                    background=BackgroundTask(lease.close))
+                response = _LeasedStreamingResponse(
+                    gen(), media_type="text/event-stream", headers=dict(SSE_HEADERS), lease=lease)
                 response._route_lease_finalizer = weakref.finalize(
                     response, lease.abandon, asyncio.get_running_loop())
                 transferred = True
@@ -1351,16 +1440,29 @@ class OpenAIProxy:
                 route_outcome = "cancelled"
                 route_error = "client_cancelled"
                 raise
+            except httpx.TimeoutException as e:
+                err = (self._local_pool_error(st, client) if isinstance(e, httpx.PoolTimeout)
+                       else timeout_error(st.cfg.name))
+                if not isinstance(e, httpx.PoolTimeout):
+                    self._record_request_failure(st, err)
+                route_error = str(err)
+                attempts.append(str(err))
+                has_transient = True
+            except httpx.TransportError as e:
+                err = connect_error(st.cfg.name, type(e).__name__)
+                self._record_request_failure(st, err)
+                route_error = str(err)
+                attempts.append(str(err))
+                has_transient = True
             finally:
                 if not transferred:
                     try:
-                        if resp is not None:
-                            await resp.aclose()
+                        await _shielded_close(resp, self.registry)
                     finally:
                         if route_outcome == "failed" and not route_error:
                             route_error = "request_aborted"
                         self.registry.end_route(route_id, route_outcome, route_error)
-                        self.router.release(st)
+                        self.router.release(st, permit)
 
         # ---- 全部失败 ----
         if local_errors and not attempts and not has_transient:

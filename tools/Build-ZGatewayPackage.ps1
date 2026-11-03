@@ -15,7 +15,7 @@ $staging = Join-Path ([IO.Path]::GetTempPath()) ("ModelHarbor-package-" + [guid]
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 try {
     $copyFiles = @(
-        "gateway.py", "cli.py", "config.example.yaml", "requirements.txt", "README.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",
+        "gateway.py", "cli.py", "config.example.yaml", "requirements.txt", "README.md", "CHANGELOG.md", "LICENSE", "SECURITY.md", "CONTRIBUTING.md",
         "Install-ZGateway.ps1", "Uninstall-ZGateway.ps1", "Verify-ZGateway.ps1",
         "tools\Build-ZGatewayPackage.ps1", "tools\install.cmd", "tools\watchdog.bat", "tools\tray.py",
         "tools\zgateway-service.cmd", "tools\nssm-2.24\win64\nssm.exe",
@@ -38,7 +38,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $ProjectRoot $relative) -Destination $destination -Force
     }
     foreach ($relative in @('docs\native-protocols.md', 'docs\opencode-go.md', 'docs\dashboard-settings-and-statistics.md',
-                            'docs\screenshots\overview.png', 'docs\screenshots\requests.png', 'docs\screenshots\visual-tests.png')) {
+                            'docs\screenshots\overview.png', 'docs\screenshots\usage.png', 'docs\screenshots\requests.png', 'docs\screenshots\visual-tests.png')) {
         $destination = Join-Path $staging $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $ProjectRoot $relative) -Destination $destination -Force

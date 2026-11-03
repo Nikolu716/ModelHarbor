@@ -643,8 +643,12 @@ class VisualTestRunner:
         except asyncio.CancelledError:
             cancelled = True
             result["error"] = "账号切换或服务停止，测试已结束；上游可能已计费"
-        except (TimeoutError, httpx.TimeoutException):
-            result["error"] = "测试超时，未自动重试；上游可能已计费"
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            if isinstance(exc, httpx.PoolTimeout):
+                self.registry.reset_client(st, expected_client=client)
+                result["error"] = "网关本地连接池等待超时，已重置；本次未发送到上游，请稍后手动重试"
+            else:
+                result["error"] = "测试超时，未自动重试；上游可能已计费"
         except httpx.TransportError:
             result["error"] = "上游连接中断，未自动重试；上游可能已计费"
         except (ValueError, TypeError, KeyError, AttributeError) as exc:

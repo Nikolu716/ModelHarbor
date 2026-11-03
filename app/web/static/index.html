@@ -7,8 +7,8 @@
   <link rel="icon" href="/static/brand-mark-512.png?v=4" type="image/png">
   <link rel="icon" href="/static/favicon.ico?v=4" sizes="any">
   <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=4">
-  <link rel="stylesheet" href="/static/dashboard.css?v=40">
-  <link rel="stylesheet" href="/static/visual-tests.css?v=8">
+  <link rel="stylesheet" href="/static/dashboard.css?v=41">
+  <link rel="stylesheet" href="/static/visual-tests.css?v=9">
   <link rel="stylesheet" href="/static/selects.css?v=1">
 </head>
 <body>
@@ -461,7 +461,7 @@
     </div>
   </div>
   <dialog id="accountEditorDialog" class="account-editor-dialog" aria-labelledby="accountEditorTitle">
-    <div class="account-dialog-heading"><div><span class="section-kicker">账号设置</span><h2 id="accountEditorTitle">新建账号</h2></div><button id="accountEditorClose" class="account-close" type="button" aria-label="关闭账号设置">×</button></div>
+    <div class="account-dialog-heading"><div><span class="section-kicker">账号设置</span><h2 id="accountEditorTitle">新建账号</h2></div><button id="accountEditorClose" class="account-close" type="button" aria-label="关闭账号设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
           <form id="accountForm" class="account-form">
             <div class="account-fields">
               <label>显示名称<input id="accountDisplay" maxlength="60" required placeholder="例如：研发团队"></label>
@@ -503,7 +503,7 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite" hidden=""></div>
   <dialog id="visualTestDialog" class="visual-test-dialog" aria-labelledby="visualTestTitle">
-    <header class="visual-dialog-heading"><div><span class="section-kicker" id="visualTestStation">站点测试</span><h2 id="visualTestTitle">智商测试</h2></div><button id="visualTestClose" class="account-close" type="button" aria-label="关闭测试窗口">×</button></header>
+    <header class="visual-dialog-heading"><div><span class="section-kicker" id="visualTestStation">站点测试</span><h2 id="visualTestTitle">智商测试</h2></div><button id="visualTestClose" class="account-close" type="button" aria-label="关闭测试窗口"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
     <div class="visual-mobile-tabs" role="group" aria-label="测试工作区"><button type="button" data-visual-workspace="config" aria-pressed="true">测试配置</button><button type="button" data-visual-workspace="result" aria-pressed="false">生成结果</button></div>
     <div class="visual-workspace" id="visualWorkspace" data-view="config">
       <form id="visualTestForm" class="visual-config" novalidate>
@@ -551,10 +551,10 @@
       </section>
     </div>
   </dialog>
-  <dialog id="channelModelsDialog" class="channel-models-dialog" aria-labelledby="channelModelsTitle"><header class="visual-dialog-heading"><div><span class="section-kicker" id="channelModelsStation"></span><h2 id="channelModelsTitle">支持的模型</h2></div><button id="channelModelsClose" class="account-close" type="button" aria-label="关闭模型列表">×</button></header><div class="channel-models-toolbar"><input id="channelModelsSearch" type="search" placeholder="搜索完整模型名称" aria-label="搜索完整模型名称"><span id="channelModelsCount"></span></div><div id="channelModelsList" class="channel-models-list"></div><footer class="channel-models-footer" id="channelModelsNote"></footer></dialog>
-  <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量">×</button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
+  <dialog id="channelModelsDialog" class="channel-models-dialog" aria-labelledby="channelModelsTitle"><header class="visual-dialog-heading"><div><span class="section-kicker" id="channelModelsStation"></span><h2 id="channelModelsTitle">支持的模型</h2></div><button id="channelModelsClose" class="account-close" type="button" aria-label="关闭模型列表"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="channel-models-toolbar"><input id="channelModelsSearch" type="search" placeholder="搜索完整模型名称" aria-label="搜索完整模型名称"><span id="channelModelsCount"></span></div><div id="channelModelsList" class="channel-models-list"></div><footer class="channel-models-footer" id="channelModelsNote"></footer></dialog>
+  <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
   <script src="/static/vendor/echarts.min.js?v=5.6.0" defer=""></script>
-  <script src="/static/dashboard.js?v=43" defer=""></script>
+  <script src="/static/dashboard.js?v=44" defer=""></script>
   <script src="/static/go-usage.js?v=2" defer></script>
   <script src="/static/analytics.js?v=8" defer></script>
   <script src="/static/accounts.js?v=17" defer></script>

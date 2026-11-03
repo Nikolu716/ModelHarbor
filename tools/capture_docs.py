@@ -158,6 +158,11 @@ def capture() -> None:
                 page.locator('[data-channel-models="Harbor OpenAI"]').first.wait_for()
                 page.wait_for_timeout(1200)
                 page.screenshot(path=str(OUT / 'overview.png'))
+                page.locator('#tab-stats').click()
+                page.locator('#stats-tab-trend').click()
+                page.locator('#stats-trend canvas').first.wait_for()
+                page.wait_for_timeout(800)
+                page.screenshot(path=str(OUT / 'usage.png'))
                 page.locator('#tab-events').click()
                 page.locator('#events-tab-analytics').click()
                 page.locator('#eventBreakdownLegend').get_by_text('192.0.2.10', exact=False).wait_for()
@@ -175,13 +180,13 @@ def capture() -> None:
         finally:
             server.should_exit = True
             thread.join(timeout=10)
-    for name in ('overview.png', 'requests.png', 'visual-tests.png'):
+    for name in ('overview.png', 'usage.png', 'requests.png', 'visual-tests.png'):
         path = OUT / name
         with Image.open(path) as screenshot:
             clean = Image.new('RGB', screenshot.size)
             clean.paste(screenshot)
             clean.save(path, optimize=True)
-    print('Captured 3 synthetic screenshots; 0 provider calls; 0 external browser requests.')
+    print('Captured 4 synthetic screenshots; 0 provider calls; 0 external browser requests.')
 
 
 if __name__ == '__main__':

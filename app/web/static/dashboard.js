@@ -226,7 +226,7 @@ function statusInfo(station) {
       reason: protection.reason || station.last_error };
   }
   if (["breaker", "recovering"].includes(protection.kind) || ["cooling", "recovering"].includes(station.status)) {
-    return { className: "cooling", label: "待恢复验证", detail: "等待已结束，允许业务请求或手动生成测试验证恢复", reason: protection.reason };
+    return { className: "cooling", label: "待恢复验证", detail: "冷却已结束，将以单个业务请求验证恢复；也可手动验证", reason: protection.reason };
   }
   switch (station.status) {
     case "up": return { className: "up", label: "在线", detail: "允许参与路由" };
@@ -746,17 +746,27 @@ function actionButton(action, station, label, options = {}) {
   const key = `${action}:${station.name}`;
   const pending = pendingActions.has(key);
   const disabled = pending || options.disabled;
-  const className = `action-button${options.destructive ? " is-destructive" : ""}`;
+  const className = `action-button${options.destructive ? " is-destructive" : ""}${options.primary ? " is-primary-action" : ""}`;
   const buttonLabel = pending ? "处理中" : label;
   return `<button class="${className}" type="button" data-action="${action}"
-                  data-station="${escapeHtml(station.name)}" ${disabled ? "disabled" : ""}>${buttonLabel}</button>`;
+                  data-station="${escapeHtml(station.name)}" title="${escapeHtml(options.title || label)}" ${disabled ? "disabled" : ""}>${buttonLabel}</button>`;
 }
 
 function stationActions(station) {
+  const kind = station.protection?.kind;
+  const go = station.provider === "opencode" && station.opencode_plan === "go";
+  let action = "probe", label = "连接检查";
+  let title = "读取连接状态，不发送生成请求，也不解除生成故障保护";
+  if (station.quota_exhausted) {
+    action = "reset"; label = "检查额度";
+    title = "按站点策略验证额度恢复；生成检查可能产生用量";
+  } else if (kind === "recovering" && !go) {
+    action = "generation-probe"; label = "验证恢复";
+    title = "用站点配置的探测模型发送一次生成请求，可能产生用量；成功后解除熔断";
+  }
   return [
-    actionButton("toggle", station, station.enabled ? "禁用" : "启用", { destructive: station.enabled }),
-    actionButton("probe", station, "连接检查", { disabled: !station.enabled }),
-    station.quota_exhausted ? actionButton("reset", station, "立即探测恢复") : "",
+    actionButton(action, station, label, { primary: true, title, disabled: !station.enabled }),
+    actionButton("toggle", station, station.enabled ? "停用" : "启用", { destructive: station.enabled }),
   ].join("");
 }
 
@@ -2106,17 +2116,31 @@ async function runStationAction(action, stationName) {
   if (pendingActions.has(key)) return;
   pendingActions.add(key);
   render(true);
-  const labels = { toggle: "站点状态已更新", probe: "连接检查已完成（不代表模型能生成）", reset: "额度探测已完成" };
+  const labels = { toggle: "站点状态已更新", probe: "连接检查已完成（不代表模型能生成，也不会解除熔断）", reset: "额度探测已完成" };
   try {
     const encodedName = encodeURIComponent(stationName);
     const result = await api(`/admin/station/${encodedName}/${action}`, "POST");
     let message = labels[action] || "操作已完成";
-    if (action === "reset") {
+    let isError = false;
+    if (action === "generation-probe") {
+      message = result.skipped
+        ? `${stationName} 未发送生成请求：${result.error || "缺少可用探测模型"}`
+        : result.ok
+          ? `${stationName} · ${result.model} 生成验证成功，已恢复路由`
+          : `${stationName} 生成验证失败：${result.error || "上游未返回成功"}`;
+      isError = !result.ok;
+    } else if (action === "probe") {
+      isError = result.ok === false;
+      message = result.ok
+        ? `${stationName} 连接可达；生成能力和额度需单独验证`
+        : `${stationName} ${result.ok === false ? "连接检查未通过" : "本次检查未完成"}：${result.error || "请稍后再试"}`;
+    } else if (action === "reset") {
       message = result.recovered || !result.quota_exhausted
         ? `${stationName} 额度已恢复`
         : `${stationName} 尚未确认额度恢复：${result.probe_error || "请检查上游额度或测试结果"}`;
+      isError = Boolean(result.quota_exhausted);
     }
-    showToast(message, action === "reset" && result.quota_exhausted);
+    showToast(message, isError);
     await refresh(true);
   } catch (error) {
     showToast(`操作失败: ${error.message}`, true);

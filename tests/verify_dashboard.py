@@ -57,10 +57,10 @@ def verify_static() -> None:
     assert not parser.inline_handlers, f"inline handlers: {parser.inline_handlers}"
     assert parser.inline_style_blocks == 0, "dashboard CSS must remain external"
     assert parser.inline_script_blocks == 0, "dashboard JS must remain external"
-    assert '/static/dashboard.css?v=40' in html
-    assert '/static/dashboard.js?v=43' in html
+    assert '/static/dashboard.css?v=41' in html
+    assert '/static/dashboard.js?v=44' in html
     assert '/static/visual-tests.js?v=11' in html
-    assert '/static/visual-tests.css?v=8' in html
+    assert '/static/visual-tests.css?v=9' in html
     assert '/static/analytics.js?v=8' in html
     assert '/static/brand-logo-source.png?v=4' in html
     assert '/static/favicon.ico?v=4' in html
@@ -163,7 +163,8 @@ def verify_static() -> None:
     assert "function renderCacheCompare" in js
     assert "最佳1小时" in js
     assert "function quotaRecoveryHint" in js
-    assert "立即探测恢复" in js
+    assert "检查额度" in js
+    assert "验证恢复" in js
     assert "当前使用" not in js
     assert "正在使用" in js and "最近使用" in js
     assert "station.calls / totalCalls" not in js
@@ -242,8 +243,8 @@ def verify_live() -> None:
     base = local_service_url(settings)
 
     for asset in (
-        "index.html", "dashboard.css?v=39", "dashboard.js?v=43", "analytics.js?v=8",
-        "visual-tests.js?v=11", "visual-tests.css?v=8",
+        "index.html", "dashboard.css?v=41", "dashboard.js?v=44", "analytics.js?v=8",
+        "visual-tests.js?v=11", "visual-tests.css?v=9",
         "vendor/echarts.min.js?v=5.6.0",
         "brand-logo-source.png?v=4", "brand-mark-180.png?v=4",
         "brand-mark-512.png?v=4", "favicon.ico?v=4",

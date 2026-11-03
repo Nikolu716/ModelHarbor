@@ -177,6 +177,8 @@ if ($existingService) {
 & $nssm set $ServiceName Start SERVICE_AUTO_START | Out-Null
 & $nssm set $ServiceName AppExit Default Restart | Out-Null
 & $nssm set $ServiceName AppRestartDelay 5000 | Out-Null
+# Allow Uvicorn's 10s request drain and bounded connection/statistics cleanup.
+& $nssm set $ServiceName AppStopMethodConsole 30000 | Out-Null
 & $nssm set $ServiceName DisplayName "ModelHarbor" | Out-Null
 & $nssm set $ServiceName Description "ModelHarbor OpenAI-compatible multi-upstream gateway" | Out-Null
 

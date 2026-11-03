@@ -108,8 +108,8 @@
 #list-wrap .col-calls { width:80px; }
 #list-wrap .col-balance { width:146px; }
 #list-wrap .col-visual { width:108px; }
-#list-wrap .col-actions { width:140px; }
-#list-wrap .table-actions { gap:5px; }
+#list-wrap .col-actions { width:152px; }
+#list-wrap .table-actions { gap:6px; }
 #list-wrap .table-actions .action-button { min-height:28px; padding:4px 7px; }
 #monitor-wrap.show-details #list-wrap .monitor-table { min-width:1680px; }
 .visual-editor-entry { width:100%; margin-top:12px; font-size:11px; }

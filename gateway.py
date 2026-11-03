@@ -130,7 +130,9 @@ def main():
     app = build_app(cfg)
     server = uvicorn.Server(uvicorn.Config(
         app, host=host, port=port, reload=args.reload,
-        log_level="info", proxy_headers=False))
+        log_level="info", proxy_headers=False,
+        # Long-lived SSE streams must not block service restarts forever.
+        timeout_graceful_shutdown=10))
     app.state.uvicorn_server = server
     server.run()
 

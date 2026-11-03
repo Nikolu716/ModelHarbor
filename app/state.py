@@ -20,6 +20,7 @@ import httpx
 from .config import GatewayConfig, StationConfig
 from . import juice
 from .errors import UpstreamError
+from .http_cleanup import close_resource, protect_response
 
 # EMA 平滑系数：越新延迟权重越高
 EMA_ALPHA = 0.3
@@ -48,6 +49,8 @@ class StationState:
     breaker_reason: str = ""
     breaker_source: str = ""
     breaker_status_code: int = 0
+    recovery_inflight: bool = False
+    recovery_attempt_at: float = 0.0
     ema_latency: float | None = None  # 秒
     ttft_ema: float | None = None  # 首字时间 EMA（秒）
 
@@ -530,6 +533,8 @@ class Registry:
             s.name: StationState(cfg=s, enabled=s.enabled) for s in stations
         }
         self._lock = asyncio.Lock()
+        self._cleanup_tasks: set[asyncio.Task] = set()
+        self._retired_clients: dict[httpx.AsyncClient, asyncio.Task | None] = {}
         # 路由活动由同步方法维护，FastAPI 的异步任务和测试线程都可安全读取。
         # last_routed 保留原有结构与字段名，仅表示最近一次成功路由，不代表当前使用。
         self._activity_lock = threading.RLock()
@@ -795,9 +800,9 @@ class Registry:
         if any(k in changes for k in ("base_url", "api_key", "headers",
                                       "timeout", "max_concurrency", "provider", "opencode_plan")):
             if st.client is not None:
-                asyncio.create_task(st.client.aclose())
-                st.client = None  # 懒重建：ensure_client 会新建
-            st.semaphore = asyncio.Semaphore(st.cfg.max_concurrency)
+                self.reset_client(st)
+            if "max_concurrency" in changes:
+                st.semaphore = asyncio.Semaphore(st.cfg.max_concurrency)
         st._update_score()
         return st
 
@@ -805,8 +810,7 @@ class Registry:
         """删除站点并异步关闭其连接池。"""
         st = self.states.pop(name, None)
         if st is not None and st.client is not None:
-            asyncio.create_task(st.client.aclose())
-            st.client = None
+            self.reset_client(st)
 
     # ---------- HTTP 客户端 ----------
     def ensure_client(self, state: StationState) -> httpx.AsyncClient:
@@ -819,6 +823,7 @@ class Registry:
             )
             state.client = httpx.AsyncClient(
                 timeout=timeout,
+                event_hooks={"response": [self._protect_response]},
                 limits=httpx.Limits(
                     max_connections=max(state.cfg.max_concurrency * 2, 10),
                     max_keepalive_connections=state.cfg.max_concurrency,
@@ -827,16 +832,76 @@ class Registry:
             )
         return state.client
 
+    async def _protect_response(self, response: httpx.Response) -> None:
+        protect_response(response, self.start_cleanup)
+
+    def start_cleanup(self, coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        self._cleanup_tasks.add(task)
+
+        def done(task):
+            self._cleanup_tasks.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        task.add_done_callback(done)
+        return task
+
+    def reset_client(self, state: StationState, *, grace: float | None = None,
+                     expected_client: httpx.AsyncClient | None = None) -> bool:
+        """Rebuild a station client whose connection pool is exhausted.
+
+        httpcore marks a response stream closed before releasing its socket.
+        If that first close is interrupted by a cancelled ASGI task, the
+        connection stays checked out forever and every later request ends in
+        PoolTimeout. A fresh client restores routing immediately; the old one
+        keeps serving in-flight streams and is closed after a grace period.
+        """
+        old = state.client
+        if old is None or old.is_closed or (expected_client is not None and old is not expected_client):
+            return False
+        state.client = None
+        self._retired_clients[old] = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return True
+        if grace is None:
+            grace = max(60.0, self.gateway.read_timeout, state.cfg.timeout)
+
+        async def drain() -> None:
+            await asyncio.sleep(grace)
+            await asyncio.shield(self.start_cleanup(close_resource(old)))
+            self._retired_clients.pop(old, None)
+
+        task = loop.create_task(drain())
+        self._retired_clients[old] = task
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
+        return True
+
     def ensure_semaphore(self, state: StationState) -> asyncio.Semaphore:
         if state.semaphore is None:
             state.semaphore = asyncio.Semaphore(state.cfg.max_concurrency)
         return state.semaphore
 
     async def close_clients(self) -> None:
+        retired = list(self._retired_clients.items())
+        drains = [task for _, task in retired if task is not None]
+        for task in drains:
+            task.cancel()
+        await asyncio.gather(*drains, return_exceptions=True)
+        clients = {client for client, _ in retired}
         for st in self.states.values():
             if st.client is not None:
-                await st.client.aclose()
+                clients.add(st.client)
                 st.client = None
+        # Finish independent response cleanup before tearing down their pools.
+        while self._cleanup_tasks:
+            batch = list(self._cleanup_tasks)
+            await asyncio.gather(*batch, return_exceptions=True)
+            self._cleanup_tasks.difference_update(batch)
+        await asyncio.gather(*(close_resource(client) for client in clients))
+        self._retired_clients.clear()
 
     # ---------- 健康/路由 ----------
     def is_routeable(self, state: StationState, now: float | None = None) -> bool:

@@ -19,6 +19,10 @@
 
 ![运行概览（演示数据）](docs/screenshots/overview.png)
 
+**用量分析** · 按时间、模型与渠道查看 Token 趋势、分布和缓存命中。
+
+![用量分析（演示数据）](docs/screenshots/usage.png)
+
 **请求统计** · 按渠道、模型、IP 和时间查看最近保留的请求。
 
 ![请求统计（演示数据）](docs/screenshots/requests.png)
@@ -85,7 +89,7 @@ python gateway.py
 
 ## 更多说明
 
-[协议接入](docs/native-protocols.md) · [OpenCode Go](docs/opencode-go.md) · [设置与统计](docs/dashboard-settings-and-statistics.md) · [开发与测试](CONTRIBUTING.md) · [安全说明](SECURITY.md)
+[更新记录](CHANGELOG.md) · [协议接入](docs/native-protocols.md) · [OpenCode Go](docs/opencode-go.md) · [设置与统计](docs/dashboard-settings-and-statistics.md) · [开发与测试](CONTRIBUTING.md) · [安全说明](SECURITY.md)
 
 本地配置、数据库、日志和真实测试结果不属于发布内容；仓库仅包含代码、示例配置及脱敏演示截图。
 

@@ -134,7 +134,9 @@ input,select,textarea { accent-color:var(--accent); }
 .station-state.cooling { color:var(--warn); }
 .score-value { display:inline-flex; justify-content:center; min-width:38px; padding:3px 6px; border-radius:5px; background:var(--surface-hover); font-size:11px; font-weight:600; }
 .score-value.is-good { background:var(--ok-soft); } .score-value.is-warn { background:var(--warn-soft); } .score-value.is-bad { background:var(--danger-soft); }
-.table-actions,.card-actions { display:flex; align-items:center; flex-wrap:wrap; gap:5px; }
+.table-actions,.card-actions { display:flex; align-items:center; flex-wrap:nowrap; gap:6px; }
+.table-actions .action-button,.card-actions .action-button { white-space:nowrap; flex:none; }
+.action-button.is-primary-action { color:var(--text); background:var(--surface); }
 .table-actions .action-button { padding:4px 8px; min-height:29px; font-size:11px; border-color:var(--line); }
 .status-tag,.model-tag { display:inline-flex; align-items:center; padding:2px 7px; border:1px solid var(--line); border-radius:5px; background:var(--surface-raised); color:var(--muted); font-size:10px; line-height:1.6; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .status-tag.is-alert { color:var(--danger); background:var(--danger-soft); border-color:#f2dce0; }
@@ -807,8 +809,11 @@ h1 { font-size:25px; }
 .account-dialog-heading { display:flex; justify-content:space-between; align-items:center; gap:12px; flex:none; }
 .account-dialog-heading .section-kicker { font-size:10px; }
 .account-dialog-heading h2 { margin-top:4px; font-size:20px; }
-.account-close { border:0; background:transparent; color:var(--muted); font-size:23px; width:32px; height:32px; border-radius:7px; }
-.account-close:hover { background:var(--surface-hover); }
+.account-close { display:grid; place-items:center; flex:0 0 36px; width:36px; height:36px; min-height:36px; padding:0; border:1px solid transparent; border-radius:10px; background:transparent; color:var(--muted); cursor:pointer; line-height:1; transition:background .15s,color .15s,border-color .15s; }
+.account-close svg { display:block; width:18px; height:18px; pointer-events:none; }
+.account-close:hover { color:var(--text); background:var(--surface-hover); border-color:var(--line); }
+.account-close:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+.account-close:active { background:var(--line); }
 .account-form-note { color:var(--muted); font-size:11px; line-height:1.8; }
 .account-form { display:flex; flex-direction:column; flex:1; min-height:0; }
 .account-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px 24px; align-content:start; min-height:0; overflow:auto; padding:20px 3px 12px; }
