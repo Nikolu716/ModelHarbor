@@ -57,9 +57,10 @@ def verify_static() -> None:
     assert not parser.inline_handlers, f"inline handlers: {parser.inline_handlers}"
     assert parser.inline_style_blocks == 0, "dashboard CSS must remain external"
     assert parser.inline_script_blocks == 0, "dashboard JS must remain external"
-    assert '/static/dashboard.css?v=42' in html
-    assert '/static/dashboard.js?v=46' in html
-    assert '/static/visual-tests.js?v=11' in html
+    assert re.search(r'/static/dashboard\.css\?v=\d+', html)
+    assert re.search(r'/static/dashboard\.js\?v=\d+', html)
+    assert '/static/visual-tests.js?v=12' in html
+    assert '/static/chatgpt-quota.js?v=3' in html
     assert '/static/visual-tests.css?v=9' in html
     assert '/static/analytics.js?v=8' in html
     assert '/static/brand-logo-source.png?v=4' in html

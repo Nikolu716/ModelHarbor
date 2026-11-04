@@ -91,6 +91,7 @@ class StationState:
     probed_models: set[str] = field(default_factory=set)
     probed_model_order: list[str] = field(default_factory=list)
     model_api_paths: dict[str, list[str]] = field(default_factory=dict)
+    model_display_names: dict[str, str] = field(default_factory=dict)
     model_unavailable: dict[str, str] = field(default_factory=dict)
     models_discovery_status: str = "pending"
     models_discovered_at: float = 0.0
@@ -146,7 +147,7 @@ class StationState:
 
     def connection_signature(self):
         cfg = self.cfg
-        values = [cfg.api_base, cfg.api_key, cfg.headers, cfg.provider, cfg.opencode_plan, cfg.wire_api]
+        values = [cfg.api_base, cfg.api_key, cfg.headers, cfg.provider, cfg.opencode_plan, cfg.wire_api, cfg.chatgpt_account]
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
     def durable_view(self):
@@ -246,6 +247,8 @@ class StationState:
         return set(self.cfg.models) | self.probed_models
 
     def protocol_view(self) -> dict[str, list[str]]:
+        if self.cfg.provider == "chatgpt":
+            return {model: ["/responses"] for model in self.known_models}
         if self.cfg.provider in ("anthropic", "gemini"):
             path = "/messages" if self.cfg.provider == "anthropic" else "/generateContent"
             return {model: [path] for model in self.known_models}
@@ -259,6 +262,8 @@ class StationState:
     def supports_model(self, model: str, path: str | None = None) -> bool:
         from .protocols import capability_path, provider_supports
         if not self.model_allowed(model):
+            return False
+        if self.cfg.provider == "chatgpt" and not self.cfg.chatgpt_account:
             return False
         if self.cfg.provider == "opencode":
             paths = self.model_api_paths.get(model, [])
@@ -533,6 +538,8 @@ class StationState:
 
 class Registry:
     def __init__(self, gateway: GatewayConfig, stations: list[StationConfig]):
+        from .chatgpt import ChatGPTAccounts
+        self.chatgpt = ChatGPTAccounts(gateway.data_dir)
         from .model_mappings import ModelMappings
         self.model_mappings = ModelMappings()
         self.gateway = gateway
@@ -782,7 +789,7 @@ class Registry:
         st = self.states[name]
         previous_signature = st.connection_signature()
         connection_changed = any(k in changes and changes[k] != getattr(st.cfg, k)
-                                 for k in ("base_url", "api_key", "provider", "opencode_plan"))
+                                 for k in ("base_url", "api_key", "provider", "opencode_plan", "chatgpt_account"))
         st.cfg = dataclasses.replace(st.cfg, **changes)
         if previous_signature != st.connection_signature():
             st.health_samples.clear()
@@ -801,10 +808,11 @@ class Registry:
             st.enabled = st.cfg.enabled
             st._update_score()
         if any(k in changes for k in (
-                "base_url", "api_key", "headers", "probe_models", "provider", "opencode_plan")):
+                "base_url", "api_key", "headers", "probe_models", "provider", "opencode_plan", "chatgpt_account")):
             st.probed_models.clear()
             st.probed_model_order.clear()
             st.model_api_paths.clear()
+            st.model_display_names.clear()
             st.model_unavailable.clear()
             st.models_discovery_revision += 1
             st.models_discovery_status = "pending"
@@ -1011,7 +1019,11 @@ class Registry:
                     "provider": st.cfg.provider,
                     "opencode_plan": st.cfg.opencode_plan,
                     "go_usage": st.go_usage_view(),
+                    "chatgpt": self.chatgpt.store.view(st.cfg.chatgpt_account) if st.cfg.provider == "chatgpt" else None,
+                    "chatgpt_usage": self.chatgpt.usage_view(st.cfg.chatgpt_account) if st.cfg.provider == "chatgpt" else None,
+                    "chatgpt_account": st.cfg.chatgpt_account,
                     "model_api_paths": st.protocol_view(),
+                    "model_display_names": dict(st.model_display_names),
                     "probe_model_candidates": list(st.probe_model_candidates),
                     "model_unavailable": dict(st.model_unavailable),
                     "calls": st.calls,

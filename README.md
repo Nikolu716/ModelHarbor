@@ -13,6 +13,7 @@
 - **可视化统计**：按时间、IP、模型和渠道查看请求与 Token；日志保留条数可配置，重启后恢复已保存数据。
 - **按需测试**：连通性生成探测默认关闭；智商测试支持自定义提示词、模型和推理深度，预览 HTML / SVG，也可选择定时测试。
 - **OpenCode Go**：独立计费入口与模型目录，展示上游提供的订阅用量，不自定义额度上限。
+- **ChatGPT订阅**：官方 OAuth 接入 Plus / Pro 模型目录与 Responses API；可选连接 Codex 用量，并在官方支持时检测、确认使用重置卡。
 
 ## 界面预览
 
@@ -90,7 +91,7 @@ python gateway.py
 
 ## 更多说明
 
-[更新记录](CHANGELOG.md) · [协议接入](docs/native-protocols.md) · [OpenCode Go](docs/opencode-go.md) · [设置与统计](docs/dashboard-settings-and-statistics.md) · [开发与测试](CONTRIBUTING.md) · [安全说明](SECURITY.md)
+[更新记录](CHANGELOG.md) · [协议接入](docs/native-protocols.md) · [ChatGPT订阅](docs/chatgpt-subscription.md) · [OpenCode Go](docs/opencode-go.md) · [设置与统计](docs/dashboard-settings-and-statistics.md) · [开发与测试](CONTRIBUTING.md) · [安全说明](SECURITY.md)
 
 本地配置、数据库、日志和真实测试结果不属于发布内容；仓库仅包含代码、示例配置及脱敏演示截图。
 

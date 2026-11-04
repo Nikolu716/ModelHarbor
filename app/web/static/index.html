@@ -7,7 +7,7 @@
   <link rel="icon" href="/static/brand-mark-512.png?v=4" type="image/png">
   <link rel="icon" href="/static/favicon.ico?v=4" sizes="any">
   <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=4">
-  <link rel="stylesheet" href="/static/dashboard.css?v=43">
+  <link rel="stylesheet" href="/static/dashboard.css?v=46">
   <link rel="stylesheet" href="/static/model-mappings.css?v=1">
   <link rel="stylesheet" href="/static/visual-tests.css?v=9">
   <link rel="stylesheet" href="/static/selects.css?v=1">
@@ -174,11 +174,24 @@
                 <button id="editor-tab-routing" type="button" class="section-tab" data-section="routing" role="tab" aria-selected="false" aria-controls="editor-routing" tabindex="-1">路由设置</button>
               </div>
               <div class="form-grid section-panel" id="editor-connection" data-section-panel="editor" data-section="connection" role="tabpanel" aria-labelledby="editor-tab-connection">
-                <label class="connection-provider">接口类型 <select id="sf-provider"><option value="openai">OpenAI 兼容接口</option><option value="opencode">OpenCode Go</option><option value="anthropic">Anthropic Messages</option><option value="gemini">Google Gemini</option></select></label>
+                <label class="connection-provider">接口类型 <select id="sf-provider"><option value="openai">OpenAI 兼容接口</option><option value="chatgpt">ChatGPT订阅</option><option value="opencode">OpenCode Go</option><option value="anthropic">Anthropic Messages</option><option value="gemini">Google Gemini</option></select></label>
                 <label class="connection-plan" id="sf-opencode-plan-field" hidden>计费入口 <select id="sf-opencode-plan"><option value="go">Go 订阅</option><option value="balance">按量余额 · 独立计费</option></select></label>
                 <label class="connection-name">名称 <input id="sf-name" required="" autocomplete="off" placeholder="如 station-a"></label>
                 <label class="connection-url">Base URL <input id="sf-base-url" type="url" required="" autocomplete="url" placeholder="https://api.xxx.com/v1"></label>
                 <label class="connection-key">API Key <input id="sf-api-key" type="password" required="" autocomplete="new-password" placeholder="your-upstream-key"></label>
+                <div class="chatgpt-connection" id="sf-chatgpt-connection" hidden>
+                  <div><strong id="sf-chatgpt-status">尚未授权</strong><span id="sf-chatgpt-email"></span><small>使用官方 OAuth 登录。订阅用量与 ChatGPT 其他应用共享。</small></div>
+                  <button id="sf-chatgpt-login" class="button secondary" type="button">Continue with ChatGPT</button>
+                  <input id="sf-chatgpt-account" type="hidden">
+                  <button id="sf-chatgpt-usage-link" class="button secondary" type="button" disabled>连接用量与重置卡</button>
+                  <div class="chatgpt-usage" id="sf-chatgpt-usage" hidden>
+                    <p id="sf-chatgpt-usage-status" role="status"></p>
+                    <p id="sf-chatgpt-device-code" hidden><a href="https://auth.openai.com/codex/device" target="_blank" rel="noopener noreferrer">打开官方 Codex 登录页</a>，输入验证码 <strong></strong></p>
+                    <div id="sf-chatgpt-windows"></div>
+                    <div id="sf-chatgpt-credits"></div>
+                    <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noopener noreferrer">在 ChatGPT 查看完整用量</a>
+                  </div>
+                </div>
                 <p class="routing-note" id="sf-provider-note" hidden>OpenCode 使用对应套餐的官方模型目录与原生接口。</p>
               </div>
               <div class="section-panel model-catalog-panel" id="editor-models" data-section-panel="editor" data-section="models" hidden="" role="tabpanel" aria-labelledby="editor-tab-models">
@@ -555,8 +568,8 @@
           <div class="visual-template-actions"><button id="visualTemplateUpdate" class="policy-link" type="button" hidden>更新模板</button><button id="visualTemplateDelete" class="policy-link text-danger" type="button" hidden>删除模板</button><span id="visualTemplateStatus" role="status" aria-live="polite"></span></div></details>
           <p class="visual-cost-note">测试在后台执行，可随时关闭。每站保留最近一次结果；用量可在结果详情查看。</p>
           </div><div id="visual-config-options" hidden>
-          <div class="visual-run-options"><label>推理深度<select id="visualTestReasoning"><option value="auto">跟随站点配置</option><option value="omit">上游默认 · 不传参数</option><option value="none">None · 不推理</option><option value="minimal">Minimal · 极低</option><option value="low">Low · 低</option><option value="medium">Medium · 中</option><option value="high">High · 高</option><option value="xhigh">XHigh · 更高</option><option value="max">Max · 最高</option></select></label><label>输出 Token 上限<input id="visualTestLimit" type="number" min="1" step="1" value="4096" required></label></div>
-          <p class="visual-prompt-note">推理档位与输出 Token 范围由模型决定。上限由你填写，网关原样发送，超出模型范围时显示上游错误。</p>
+          <div class="visual-run-options"><label>推理深度<select id="visualTestReasoning"><option value="auto">跟随站点配置</option><option value="omit">上游默认 · 不传参数</option><option value="none">None · 不推理</option><option value="minimal">Minimal · 极低</option><option value="low">Low · 低</option><option value="medium">Medium · 中</option><option value="high">High · 高</option><option value="xhigh">XHigh · 更高</option><option value="max">Max · 最高</option></select></label><label>输出 Token 上限<input id="visualTestLimit" type="number" min="1" step="1" value="12000" required></label></div>
+          <p class="visual-prompt-note" id="visualLimitNote">默认 12,000 Token，可自由修改，网关原样发送；超出模型范围时显示上游错误。</p>
           <div class="visual-compatibility"><label>请求协议<select id="visualTestProtocol"><option value="auto">自动 · 匹配模型协议</option><option value="responses">Responses</option><option value="chat_completions">Chat Completions</option><option value="chat_completions_legacy">Chat · 旧版 max_tokens</option><option value="messages">Anthropic Messages</option><option value="generate_content">Gemini GenerateContent</option></select></label><p class="visual-prompt-note" id="visualProtocolNote">参数不受支持时直接显示错误，不会自动重发。</p></div>
           <p class="visual-cost-note">生成可能计费，最长等待 120 秒。更高的推理深度与输出上限可能增加用量。</p>
           </div>
@@ -596,11 +609,27 @@
   <dialog id="channelModelsDialog" class="channel-models-dialog" aria-labelledby="channelModelsTitle"><header class="visual-dialog-heading"><div><span class="section-kicker" id="channelModelsStation"></span><h2 id="channelModelsTitle">支持的模型</h2></div><button id="channelModelsClose" class="account-close" type="button" aria-label="关闭模型列表"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="channel-models-toolbar"><input id="channelModelsSearch" type="search" placeholder="搜索完整模型名称" aria-label="搜索完整模型名称"><span id="channelModelsCount"></span></div><div id="channelModelsList" class="channel-models-list"></div><footer class="channel-models-footer" id="channelModelsNote"></footer></dialog>
   <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
   <script src="/static/vendor/echarts.min.js?v=5.6.0" defer=""></script>
-  <script src="/static/dashboard.js?v=47" defer=""></script>
+  <script src="/static/dashboard.js?v=51" defer=""></script>
+    <dialog id="chatgptUsageDialog" class="go-usage-dialog chatgpt-usage-dialog" aria-labelledby="chatgptUsageTitle">
+      <header><div><span id="chatgptUsageStation" class="section-kicker"></span><div class="subscription-title-row"><h2 id="chatgptUsageTitle">ChatGPT 订阅用量</h2><span id="chatgptUsageBadge" class="subscription-status-badge"></span></div></div><button id="chatgptUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
+      <section id="chatgptUsageDevice" class="subscription-device" aria-labelledby="chatgptDeviceTitle" hidden>
+        <div class="subscription-device-intro"><h3 id="chatgptDeviceTitle">连接 Codex 用量</h3><p>在官方页面登录此渠道绑定的 ChatGPT 账号，再输入下方验证码。</p></div>
+        <div class="subscription-device-code"><div><span>一次性验证码</span><strong id="chatgptUsageCode"></strong></div><button id="chatgptUsageCopy" class="button secondary" type="button" aria-label="复制验证码"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V4H4v12h4"/></svg><span>复制验证码</span></button></div>
+        <div class="subscription-device-actions"><a id="chatgptUsageLogin" class="button primary" href="https://auth.openai.com/codex/device" target="_blank" rel="noopener noreferrer">前往官方登录<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M5 3h8v8M13 3 3 13"/></svg></a><span id="chatgptUsageWaiting" class="subscription-device-wait"><span aria-hidden="true"></span><span id="chatgptUsageExpiry"></span></span></div>
+        <p class="subscription-device-hint">完成授权后自动同步用量，无需再次点击连接。</p>
+      </section>
+      <section id="chatgptUsageEmpty" class="subscription-usage-empty" hidden><h3>连接订阅用量</h3><p>查看账号实际额度、重置时间，以及官方提供的重置卡。</p></section>
+      <div id="chatgptUsageWindows" class="go-usage-windows"></div>
+      <p id="chatgptUsageStatus" class="go-usage-status" role="status"></p>
+      <section id="chatgptUsageCreditSection" class="subscription-credits"><div><h3>重置卡</h3><span id="chatgptUsageCreditCount"></span></div><div id="chatgptUsageCredits"></div></section>
+      <footer id="chatgptUsageFooter"><details class="subscription-usage-help"><summary>额度说明</summary><p>按官方返回的窗口展示，与其他客户端共享。任一窗口额度耗尽都可能暂时无法调用。7 天窗口不代表自然周，重置以显示时间为准。连接后每 15 分钟读取一次，不调用模型。</p></details><div class="subscription-usage-actions"><button id="chatgptUsageConnect" type="button" class="button secondary">连接用量</button><button id="chatgptUsageRefresh" type="button" class="button primary">刷新用量</button></div></footer>
+    </dialog>
+    <script src="/static/chatgpt.js?v=4" defer=""></script>
+    <script src="/static/chatgpt-quota.js?v=3" defer></script>
   <script src="/static/go-usage.js?v=2" defer></script>
   <script src="/static/analytics.js?v=8" defer></script>
   <script src="/static/accounts.js?v=17" defer></script>
-  <script src="/static/visual-tests.js?v=11" defer></script>
+  <script src="/static/visual-tests.js?v=12" defer></script>
   <script src="/static/model-mappings.js?v=1" defer></script>
   <script src="/static/selects.js?v=1" defer></script>
 

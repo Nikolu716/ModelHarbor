@@ -1,6 +1,7 @@
 """Provider catalog capabilities; never follow URLs supplied by model metadata."""
 from __future__ import annotations
 
+from . import __version__
 
 OPENCODE_SESSION_HEADERS = ("x-opencode-session", "session-id")
 CLIENT_CONTEXT_HEADERS = (*OPENCODE_SESSION_HEADERS, "thread-id", "user-agent", "anthropic-version", "anthropic-beta")
@@ -46,9 +47,9 @@ def inference_headers(cfg, client_headers=None, *, test_session: str | None = No
             "OpenCode Go 需要稳定的对话会话 ID：请让客户端发送 x-opencode-session "
             "或保留 Codex 原生 session-id；同一对话保持不变，不同对话使用不同值。未向上游发送请求。")
     headers.update(context)
-    headers.setdefault("user-agent", "ModelHarbor/1.0")
+    headers.setdefault("user-agent", "ModelHarbor/" + __version__)
     if headers["user-agent"].lower().startswith(("python-", "openai/", "go-http-client", "curl/", "httpx/")):
-        headers["user-agent"] = "ModelHarbor/1.0 via " + headers["user-agent"]
+        headers["user-agent"] = "ModelHarbor/" + __version__ + " via " + headers["user-agent"]
     return headers
 
 

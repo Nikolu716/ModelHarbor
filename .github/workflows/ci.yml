@@ -24,3 +24,4 @@ jobs:
           node-version: "20"
       - run: npm ci --prefix tests
       - run: node tests/verify_dashboard_ui.js
+      - run: node tests/verify_subscription_ui.js

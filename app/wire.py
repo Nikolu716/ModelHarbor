@@ -354,6 +354,11 @@ def prepare_request(st, path: str, body: dict, *, allow_tools: bool = False):
     - adapter is None 表示直接透传
     """
     from .protocols import MESSAGES, GEMINI_PATHS, capability_path
+    if st.cfg.provider == "chatgpt":
+        if path != "/responses":
+            raise UnsupportedWireRequest("ChatGPT 订阅站点请使用 /v1/responses 接口。")
+        from .chatgpt import subscription_request
+        return path, subscription_request(inject_params(body, st.cfg.inject)), None
     if path == MESSAGES or path in GEMINI_PATHS:
         if not st.supports_model(body.get("model", ""), capability_path(path)):
             raise UnsupportedWireRequest("此站点不支持当前原生协议")

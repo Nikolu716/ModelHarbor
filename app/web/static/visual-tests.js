@@ -226,6 +226,13 @@
     el("visualTestClear").disabled = busy || loading;
     el("visualTestRun").disabled = busy || submitting || loading || saving || loadFailed || !station?.enabled || !el("visualTestModel").options.length;
     el("visualScheduleSave").disabled = loading || saving || submitting || loadFailed;
+    el("visualScheduleEnabled").disabled = loading || saving || submitting || station?.provider === "chatgpt";
+    if (station?.provider === "chatgpt") {
+      el("visualScheduleSave").disabled = !plan?.enabled || loading || saving || submitting;
+      el("visualScheduleEnabled").checked = false;
+      el("visualScheduleInterval").disabled = true;
+      el("visualScheduleFeedback").textContent = "ChatGPT 订阅仅手动测试，不发送定时生成请求。";
+    }
     el("visualTestRun").textContent = busy ? "生成中…" : "开始测试";
     el("visualTestRun").classList.toggle("is-generating", busy);
     el("visualTestForm").setAttribute("aria-busy", String(busy || loading));
@@ -234,8 +241,14 @@
 
   function syncProtocolOptions() {
     if (!station) return;
+    const subscription = station.provider === "chatgpt";
+    el("visualTestLimit").closest("label").hidden = subscription;
+    el("visualTestLimit").disabled = subscription || loading || saving || submitting;
+    el("visualLimitNote").textContent = subscription
+      ? "ChatGPT 订阅不接受输出 Token 上限，本次不发送该参数；输出由模型决定，最长等待 120 秒。"
+      : "默认 12,000 Token，可自由修改，网关原样发送；超出模型范围时显示上游错误。";
     const paths = station.model_api_paths?.[el("visualTestModel").value]
-      || (station.provider === 'anthropic' ? ['/messages'] : station.provider === 'gemini' ? ['/generateContent'] : null);
+      || (subscription ? ['/responses'] : station.provider === 'anthropic' ? ['/messages'] : station.provider === 'gemini' ? ['/generateContent'] : null);
     const mapping = {responses:'/responses',chat_completions:'/chat/completions',chat_completions_legacy:'/chat/completions',messages:'/messages',generate_content:'/generateContent'};
     for (const option of el('visualTestProtocol').options) {
       option.disabled = option.value !== 'auto' && (paths ? !paths.includes(mapping[option.value]) : ['messages','generate_content'].includes(option.value));
@@ -262,16 +275,18 @@
   for (const button of dialog.querySelectorAll("[data-visual-config]")) button.addEventListener("click", () => setConfig(button.dataset.visualConfig));
 
   function formSettings() {
-    return { model: el("visualTestModel").value, prompt: el("visualTestPrompt").value,
+    const settings = { model: el("visualTestModel").value, prompt: el("visualTestPrompt").value,
       template_name: template()?.name || el("visualTemplateName").value.trim() || "临时提示词",
       protocol: el("visualTestProtocol").value, max_output_tokens: Number(el("visualTestLimit").value),
       reasoning_effort: el("visualTestReasoning").value };
+    if (station?.provider === "chatgpt") delete settings.max_output_tokens;
+    return settings;
   }
 
   function validContent() {
     const limit = el("visualTestLimit");
     limit.setCustomValidity(Number.isSafeInteger(Number(limit.value)) && Number(limit.value) > 0 ? "" : "请填写可精确表示的正整数");
-    const invalid = [el("visualTestPrompt"), el("visualTestLimit")].find(control => !control.checkValidity());
+    const invalid = [el("visualTestPrompt"), ...(station?.provider === "chatgpt" ? [] : [el("visualTestLimit")])].find(control => !control.checkValidity());
     if (!invalid) return true;
     setWorkspace("config"); setConfig(invalid.id === "visualTestLimit" ? "options" : "content"); invalid.reportValidity();
     return false;
@@ -287,7 +302,7 @@
       el("visualScheduleFeedback").textContent = "";
     }
     const settings = value?.settings;
-    el("visualScheduleSummary").textContent = settings ? `${settings.model} · ${settings.template_name} · 推理 ${settings.reasoning_effort} · 最多 ${settings.max_output_tokens} Token · 间隔 ${value.interval_seconds / 60} 分钟` : "尚未保存模型与提示词";
+    el("visualScheduleSummary").textContent = settings ? `${settings.model} · ${settings.template_name} · 推理 ${settings.reasoning_effort} · ${station?.provider === "chatgpt" ? "输出由模型决定" : `最多 ${settings.max_output_tokens} Token`} · 间隔 ${value.interval_seconds / 60} 分钟` : "尚未保存模型与提示词";
     const labels = {disabled:"仅手动测试", inactive:"账号未启用，自动计划不执行", waiting:"站点已停用，等待启用", running:"正在测试", paused:"已暂停"};
     const state = labels[value?.state] || "已开启自动测试";
     el("visualScheduleStatus").textContent = [state, value?.paused_reason, value?.next_run_at ? `下次执行不早于 ${new Date(value.next_run_at * 1000).toLocaleString()}` : "", value?.last_error ? `上次提示：${value.last_error}` : ""].filter(Boolean).join("。 ");
@@ -356,7 +371,7 @@
     el("visualTestStation").textContent = name;
     el("visualTestProtocol").value = "auto";
     el("visualTestReasoning").value = "auto";
-    el("visualTestLimit").value = "4096";
+    el("visualTestLimit").value = "12000";
     const models = station.probe_model_candidates || [...new Set([...(station.detected_models || []), ...(station.models || [])])];
     el("visualTestModel").replaceChildren(...models.map((model) => new Option(model, model)));
     const selected = station.generation_probe?.model || station.probe_chat_model || models[0];
@@ -378,7 +393,7 @@
         if (!models.includes(settings.model)) el("visualTestModel").add(new Option(`${settings.model} · 不在当前目录`, settings.model));
         el("visualTestModel").value = settings.model;
         el("visualTestReasoning").value = settings.reasoning_effort || "auto";
-        el("visualTestLimit").value = settings.max_output_tokens || 4096;
+        el("visualTestLimit").value = (latest.running || latest.schedule?.enabled) ? settings.max_output_tokens || 12000 : 12000;
         el("visualTestProtocol").value = settings.protocol || "auto";
         const match = templates.find(item => item.prompt === settings.prompt);
         applyTemplate(match?.id || "draft");

@@ -256,8 +256,9 @@ class JuiceRegistry:
             import json as _json
             import os
             try:
-                data = _json.loads(open(persist_path, encoding="utf-8").read())
-                for key, row in data.items():
+                with open(persist_path, encoding="utf-8") as stream:
+                    data = _json.load(stream)
+                for key, row in data.get("fingerprints", data).items():
                     if not isinstance(row, dict):
                         continue  # 跳过损坏行
                     try:

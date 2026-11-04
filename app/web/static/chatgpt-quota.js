@@ -1,0 +1,196 @@
+"use strict";
+(() => {
+  const el = id => document.getElementById(id);
+  let selected = "", profile = "", data = null, busy = false, epoch = 0;
+  let pollTimer = 0, pollFailures = 0, copyBusy = false, copiedCode = "", copiedUntil = 0;
+  const windows = value => (Array.isArray(value?.windows) ? value.windows : []).filter(item => item && typeof item === "object");
+  const number = value => typeof value === "number" && Number.isFinite(value);
+  const percentage = value => number(value) ? new Intl.NumberFormat("zh-CN", {maximumFractionDigits: 1}).format(value) + "%" : "—";
+  const tone = value => value >= 100 ? "is-exhausted" : value >= 80 ? "is-warning" : "";
+  const progress = value => number(value) ? Math.min(100, Math.max(0, value)) : 0;
+  function label(item) {
+    const mins = item.duration_mins;
+    if (mins === 10080) return "7 天";
+    if (number(mins) && mins > 0) return mins % 60 === 0 ? mins / 60 + " 小时" : mins + " 分钟";
+    return item.window === "secondary" ? "长时" : "短时";
+  }
+  function markup(station) {
+    const usage = station.chatgpt_usage, items = windows(usage);
+    const rows = items.slice(0, 2).map(item => {
+      const name = label(item), value = item.used_percent;
+      return '<span class="go-quota-item ' + tone(value) + '"><small title="' + escapeHtml(name) + '">' + escapeHtml(name) +
+        '</small><progress max="100" value="' + progress(value) + '" aria-label="' + escapeHtml(name + "已用 " + percentage(value)) +
+        '"></progress><b>' + percentage(value) + '</b></span>';
+    }).join("");
+    const empty = '<span class="subscription-quota-empty">' + (station.chatgpt?.connected ? "连接用量" : "等待授权") + '</span>';
+    return '<button type="button" class="go-quota-summary chatgpt-quota-summary" data-chatgpt-usage="' + escapeHtml(station.name) +
+      '" aria-label="查看 ' + escapeHtml(station.name) + ' 的 ChatGPT订阅用量"><span class="go-quota-caption"><span>ChatGPT订阅' +
+      (usage?.stale ? ' · 缓存' : '') + (items.length > 2 ? ' · +' + (items.length - 2) : '') +
+      '</span><svg aria-hidden="true" viewBox="0 0 16 16" width="11" height="11"><path d="m6 4 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="go-quota-values">' + (rows || empty) + '</span></button>';
+  }
+  function update(profileId, usage) {
+    for (const station of [...(typeof STATIONS === "undefined" ? [] : STATIONS), ...(statusData?.stations || [])]) {
+      if (station.chatgpt_account === profileId) station.chatgpt_usage = usage;
+    }
+    if (profile === profileId) { data = usage; renderDetail(); }
+  }
+  function renderCredits() {
+    const credits = data?.reset_credits, count = credits?.availableCount ?? credits?.available_count;
+    el("chatgptUsageCreditCount").textContent = number(count) ? count + " 张可用" : "上游未提供";
+    const available = (Array.isArray(credits?.credits) ? credits.credits : []).filter(item => item && item.status === "available");
+    if (!available.length && number(count) && count > 0) available.push({title: "下一张可用重置卡"});
+    el("chatgptUsageCredits").replaceChildren(...available.map(item => {
+      const row = document.createElement("div"), text = document.createElement("span"), button = document.createElement("button");
+      const expiresAt = item.expiresAt ?? item.expires_at;
+      const expires = expiresAt ? new Date(number(expiresAt) ? expiresAt * 1000 : expiresAt) : null;
+      text.textContent = (item.title || "速率限制重置卡") + (expires && !Number.isNaN(expires.valueOf()) ? " · 有效期至 " + expires.toLocaleString() : "");
+      const id = typeof item.id === "string" ? item.id : typeof item.creditId === "string" ? item.creditId : null;
+      button.type = "button"; button.className = "button secondary"; button.textContent = "使用"; button.disabled = busy;
+      button.addEventListener("click", async () => {
+        if (busy) return;
+        busy = true; renderDetail();
+        try { await window.ModelHarborChatGPT.consume(id, item.title || "速率限制重置卡", profile); }
+        finally { busy = false; renderDetail(); }
+      });
+      row.append(text, button); return row;
+    }));
+  }
+  const pending = () => data?.status === "pending";
+  const expired = () => pending() && number(data?.expires_at) && data.expires_at * 1000 <= Date.now();
+  function renderDevice() {
+    const waiting = pending(), elapsed = expired(), code = waiting ? data?.user_code || "" : "";
+    el("chatgptUsageDevice").hidden = !waiting;
+    el("chatgptUsageDevice").classList.toggle("is-expired", elapsed);
+    el("chatgptDeviceTitle").textContent = elapsed ? "验证码已过期" : "连接 Codex 用量";
+    if (el("chatgptUsageCode").textContent !== code) el("chatgptUsageCode").textContent = code;
+    const copied = code && copiedCode === code && Date.now() < copiedUntil;
+    el("chatgptUsageCopy").disabled = !code || elapsed || copyBusy;
+    el("chatgptUsageCopy").classList.toggle("is-copied", Boolean(copied));
+    el("chatgptUsageCopy").querySelector("span").textContent = copied ? "已复制" : "复制验证码";
+    el("chatgptUsageLogin").hidden = elapsed;
+    el("chatgptUsageWaiting").classList.toggle("is-expired", elapsed);
+    const seconds = Math.max(0, Math.ceil((data?.expires_at || 0) - Date.now() / 1000));
+    el("chatgptUsageExpiry").textContent = elapsed ? "请重新获取验证码" : seconds
+      ? "等待授权 · " + Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0")
+      : "等待官方授权";
+  }
+  function renderControls() {
+    const waiting = pending(), elapsed = expired(), connected = data?.status === "connected";
+    const badge = el("chatgptUsageBadge");
+    badge.textContent = waiting ? elapsed ? "验证码过期" : "等待授权" : connected ? "已连接" : data?.error ? "读取失败" : "待连接";
+    badge.classList.toggle("is-connected", connected);
+    el("chatgptUsageFooter").hidden = waiting && !elapsed;
+    const wait = Math.max(0, Math.ceil((data?.manual_refresh_at || 0) - Date.now() / 1000));
+    el("chatgptUsageRefresh").hidden = waiting || !windows(data).length && !connected;
+    el("chatgptUsageRefresh").disabled = busy || !profile || wait > 0;
+    el("chatgptUsageRefresh").textContent = busy ? "读取中…" : wait > 0 ? wait + " 秒后可刷新" : "刷新用量";
+    el("chatgptUsageConnect").disabled = busy || !profile;
+    el("chatgptUsageConnect").classList.toggle("primary", !connected);
+    el("chatgptUsageConnect").classList.toggle("secondary", connected);
+    el("chatgptUsageConnect").textContent = busy ? "连接中…" : elapsed ? "重新获取验证码" : connected ? "重新连接" : "连接用量";
+  }
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    if (pending() && !expired() && el("chatgptUsageDialog").open && !busy) {
+      pollTimer = setTimeout(() => refresh(false), Math.min(30000, 2000 * 2 ** Math.min(pollFailures, 4)));
+    }
+  }
+  function copyFallback(code) {
+    const field = document.createElement("textarea"), focused = document.activeElement;
+    field.value = code; field.className = "clipboard-helper"; field.setAttribute("readonly", "");
+    // Modal dialogs make elements outside the dialog inert, including copy helpers.
+    el("chatgptUsageDialog").append(field);
+    field.focus({preventScroll: true});
+    field.select();
+    try { if (!document.execCommand("copy")) throw new Error("Clipboard unavailable"); }
+    finally { field.remove(); focused?.focus({preventScroll: true}); }
+  }
+  async function copyCode() {
+    const code = pending() ? data?.user_code : "", revision = epoch;
+    if (!code || expired() || copyBusy) return;
+    copyBusy = true; renderDevice();
+    try {
+      if (navigator.clipboard?.writeText && window.isSecureContext) {
+        try { await navigator.clipboard.writeText(code); } catch { copyFallback(code); }
+      } else copyFallback(code);
+      if (epoch === revision) {
+        copiedCode = code; copiedUntil = Date.now() + 2500;
+        showToast("验证码已复制");
+      }
+    } catch {
+      if (epoch === revision) {
+        const range = document.createRange(); range.selectNodeContents(el("chatgptUsageCode"));
+        const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
+        showToast("复制未成功，验证码已选中，请手动复制", true);
+      }
+    } finally { copyBusy = false; if (epoch === revision) renderDevice(); }
+  }
+  function renderDetail() {
+    el("chatgptUsageStation").textContent = selected;
+    const items = windows(data);
+    el("chatgptUsageWindows").hidden = !items.length || pending();
+    el("chatgptUsageEmpty").hidden = Boolean(items.length || pending());
+    el("chatgptUsageWindows").replaceChildren(...items.map(item => {
+      const card = document.createElement("section"); card.className = "go-usage-window " + tone(item.used_percent);
+      const heading = document.createElement("h3"); heading.textContent = (item.name || "Codex") + " · " + label(item);
+      const metric = document.createElement("strong"); metric.textContent = percentage(item.used_percent);
+      const caption = document.createElement("span"); caption.textContent = number(item.used_percent) ? "已使用" : "上游未提供";
+      const bar = document.createElement("progress"); bar.max = 100; bar.value = progress(item.used_percent);
+      bar.setAttribute("aria-label", heading.textContent + "已用 " + percentage(item.used_percent));
+      const reset = document.createElement("small");
+      reset.textContent = item.resets_at ? (item.resets_at * 1000 <= Date.now() ? "窗口已到期，等待刷新 · " : "重置于 ") + new Date(item.resets_at * 1000).toLocaleString() : "重置时间未提供";
+      card.append(heading, metric, caption, bar, reset); return card;
+    }));
+    renderCredits();
+    el("chatgptUsageCreditSection").hidden = pending() || !data?.reset_credits;
+    const status = data?.error || (!pending() && data?.updated_at ? "更新于 " + new Date(data.updated_at * 1000).toLocaleString() + (data?.stale ? " · 缓存数据" : "") : "");
+    el("chatgptUsageStatus").textContent = status;
+    el("chatgptUsageStatus").hidden = !status;
+    el("chatgptUsageStatus").classList.toggle("is-error", Boolean(data?.error));
+    renderDevice(); renderControls();
+  }
+  async function refresh(manual) {
+    if (busy || !profile) return;
+    const id = profile, revision = epoch;
+    busy = true; renderDetail();
+    try {
+      const usage = await api("/admin/chatgpt/profile/" + encodeURIComponent(id) + "/usage" + (manual ? "?refresh=true" : ""));
+      if (epoch === revision) { pollFailures = 0; update(id, usage); render(true); }
+    } catch (error) {
+      if (epoch === revision) {
+        pollFailures++; data = {...data, error: error.message};
+        if (manual) showToast(error.message, true);
+      }
+    } finally { if (epoch === revision) { busy = false; renderDetail(); schedulePoll(); } }
+  }
+  async function connect() {
+    if (busy || !profile) return;
+    const id = profile, revision = epoch;
+    busy = true; renderDetail();
+    try {
+      const login = await api("/admin/chatgpt/profile/" + encodeURIComponent(id) + "/codex-login", "POST", true, {});
+      if (epoch !== revision) return;
+      pollFailures = 0; copiedCode = ""; update(id, login);
+    } catch (error) {
+      if (epoch === revision) data = {...data, error: error.message};
+      showToast(error.message, true);
+    } finally { if (epoch === revision) { busy = false; renderDetail(); schedulePoll(); } }
+  }
+  document.addEventListener("click", event => {
+    const button = event.target.closest("[data-chatgpt-usage]");
+    if (!button) return;
+    const station = (statusData?.stations || []).find(item => item.name === button.dataset.chatgptUsage);
+    if (!station) return;
+    selected = station.name; profile = station.chatgpt_account || ""; data = station.chatgpt_usage; epoch++; busy = false;
+    pollFailures = 0; copiedCode = "";
+    renderDetail(); el("chatgptUsageDialog").showModal(); refresh(false);
+  });
+  el("chatgptUsageRefresh").addEventListener("click", () => refresh(true));
+  el("chatgptUsageConnect").addEventListener("click", connect);
+  el("chatgptUsageCopy").addEventListener("click", copyCode);
+  el("chatgptUsageClose").addEventListener("click", () => el("chatgptUsageDialog").close());
+  el("chatgptUsageDialog").addEventListener("close", () => { epoch++; busy = false; clearTimeout(pollTimer); });
+  setInterval(() => { if (el("chatgptUsageDialog").open) { renderDevice(); renderControls(); } }, 1000);
+  window.ModelHarborChatGPTQuota = {markup, update};
+  render(true);
+})();

@@ -214,6 +214,9 @@ function formatLatency(seconds) {
 }
 
 function formatBalance(balance, threshold, station = {}) {
+  if (station.provider === "chatgpt") {
+    return window.ModelHarborChatGPT?.markup(station) || '<span class="subscription-value">ChatGPT订阅</span>';
+  }
   if (station.provider === "opencode" && station.opencode_plan === "go") {
     return window.ModelHarborGoUsage?.markup(station) || '<span class="subscription-value">Go 订阅 · 读取中</span>';
   }
@@ -2636,7 +2639,9 @@ function renderStationModels() {
     const reason = station?.model_unavailable?.[model];
     const paths = station?.model_api_paths?.[model];
     const detail = reason || (paths?.length ? paths.map(p => ({'/responses':'Responses','/chat/completions':'Chat Completions','/messages':'Anthropic Messages','/generateContent':'Gemini GenerateContent'}[p] || p)).join(' / ') : '');
-    return `<button type="button" class="catalog-model" data-probe-model="${escapeHtml(model)}" aria-pressed="false" ${reason ? 'disabled' : ''} title="${escapeHtml(detail)}"><span>${escapeHtml(model)}</span>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</button>`;
+    const label = station?.model_display_names?.[model] || model;
+    const subtitle = [label !== model ? model : '', detail].filter(Boolean).join(' · ');
+    return `<button type="button" class="catalog-model" data-probe-model="${escapeHtml(model)}" aria-pressed="false" ${reason ? 'disabled' : ''} title="${escapeHtml(detail)}"><span>${escapeHtml(label)}</span>${subtitle ? `<small>${escapeHtml(subtitle)}</small>` : ''}</button>`;
   }).join("")
     || `<span class="catalog-empty">${query ? "没有匹配模型" : (discovery.status === "ready" ? "上游返回空列表" : "暂无模型列表")}</span>`;
   syncModelSelection($("sf-probe-chat-model").value, stationProbeModels()[0]);
@@ -2660,6 +2665,7 @@ function updateModelRouting() {
     + ' 多项用逗号分隔，支持末尾 *。故障切换保持原模型，不替换型号。';
 }
 function updateProvider(changed = false) {
+  const chatgpt = $("sf-provider").value === 'chatgpt';
   const opencode = $("sf-provider").value === 'opencode';
   const native = ['anthropic', 'gemini'].includes($("sf-provider").value);
   $("editor-connection").classList.toggle('is-opencode', opencode);
@@ -2670,7 +2676,7 @@ function updateProvider(changed = false) {
   $("sf-provider-note").hidden = !opencode && !native;
   $("sf-opencode-plan-field").hidden = !opencode;
   $("sf-billing").disabled = opencode;
-  $("sf-probe-chat").disabled = go;
+  $("sf-probe-chat").disabled = chatgpt || go;
   if (go) $("sf-probe-chat").checked = false;
   $("sf-provider-note").textContent = go
     ? 'Go 订阅使用独立额度，额外付费余额 $0 不代表订阅不可用。需保留编程对话的稳定会话 ID；不发送通用 ping，网关不切换到余额入口。若要避免上游超额扣费，请在 OpenCode 控制台关闭 Extra Usage。'
@@ -2700,6 +2706,27 @@ function updateProvider(changed = false) {
       $("sf-probe-interval").value = '3600';
     }
   }
+  $("editor-connection").classList.toggle('is-chatgpt', chatgpt);
+  $("sf-chatgpt-connection").hidden = !chatgpt;
+  $("sf-api-key").closest('label').hidden = chatgpt;
+  $("sf-api-key").required = !chatgpt && !editingStation;
+  if (chatgpt) {
+    $("sf-base-url").value = 'https://api.openai.com/v1';
+    $("sf-base-url").readOnly = true;
+    $("sf-billing").value = 'subscription';
+    $("sf-billing").disabled = true;
+    $("sf-model-routing").value = 'catalog';
+    $("sf-model-routing").disabled = true;
+    $("sf-probe-models").checked = true;
+    $("sf-probe-models").disabled = true;
+    $("sf-probe-chat").checked = false;
+    $("sf-probe-chat").disabled = true;
+    $("sf-models").closest('details').hidden = true;
+    $("sf-provider-note").hidden = false;
+    $("sf-provider-note").textContent = '通过官方授权使用 Plus / Pro 订阅。当前接入 Responses 协议；客户端需携带完整上下文。不发送后台 ping。首次授权请在部署机器的浏览器完成。';
+    if (changed && !$("sf-name").value) $("sf-name").value = 'ChatGPT订阅';
+  }
+  window.ModelHarborChatGPT?.update();
   updateModelRouting();
 }
 $("sf-provider").addEventListener('change', () => { updateProvider(true); renderStationModels(); });
@@ -2834,13 +2861,14 @@ function fillStationForm(station) {
   if (stationSubmitting) return;
   editingStation = station.name;
   $("sf-name").value = station.name;
-  $("sf-name").disabled = true;
+  $("sf-name").disabled = false;
   $("sf-base-url").value = station.base_url;
   $("sf-api-key").value = "";
   $("sf-api-key").required = false;
   $("sf-api-key").placeholder = "已配置，留空保持不变";
   $("sf-models").value = (station.models || []).join(", ");
   $("sf-provider").value = station.provider || 'openai';
+  $("sf-chatgpt-account").value = station.chatgpt_account || '';
   $("sf-opencode-plan").value = station.opencode_plan || 'balance';
   $("sf-model-routing").value = station.model_routing || (station.accepts_any_model ? 'passthrough' : 'catalog');
   $("sf-route-models").value = (station.route_models || []).join(', ');
@@ -2875,6 +2903,7 @@ function resetStationForm({ keepStatus = false } = {}) {
   $("sf-api-key").placeholder = "your-upstream-key";
   $("sf-models").value = "";
   $("sf-provider").value = 'openai';
+  $("sf-chatgpt-account").value = '';
   $("sf-opencode-plan").value = 'go';
   $("sf-model-routing").value = 'catalog';
   $("sf-route-models").value = '';
@@ -2921,6 +2950,7 @@ $("station-form").addEventListener("submit", async (event) => {
     api_key: $("sf-api-key").value.trim(),
     models: $("sf-models").value.split(/[,，]/).map(x => x.trim()).filter(Boolean),
     provider: $("sf-provider").value,
+    chatgpt_account: $("sf-provider").value === 'chatgpt' ? $("sf-chatgpt-account").value : '',
     opencode_plan: $("sf-opencode-plan").value,
     model_routing: $("sf-model-routing").value,
     route_models: routeRules(),
@@ -2933,7 +2963,7 @@ $("station-form").addEventListener("submit", async (event) => {
     probe_models: $("sf-probe-models").checked,
     enabled: $("sf-enabled").checked,
   };
-  if (!body.name || !body.base_url || (!body.api_key && !editingStation)) {
+  if (!body.name || !body.base_url || (!body.api_key && !editingStation && body.provider !== 'chatgpt')) {
     setStationFormStatus("名称、Base URL 和 API Key 必填", true);
     return;
   }
@@ -2944,7 +2974,6 @@ $("station-form").addEventListener("submit", async (event) => {
   try {
     let result;
     if (wasEditing) {
-      delete body.name;
       if (!body.api_key) delete body.api_key;
       result = await api(
         "/admin/stations/" + encodeURIComponent(stationName),
@@ -2953,10 +2982,11 @@ $("station-form").addEventListener("submit", async (event) => {
     } else {
       result = await api("/admin/stations", "POST", true, body);
     }
+    const savedName = result?.name || body.name;
     const probeNote = result?.probe_scheduled ? "，连接检查已在后台排队" : "";
     const message = wasEditing
-      ? `${stationName} 已保存${probeNote}`
-      : `${stationName} 已添加并保存${probeNote}`;
+      ? `${savedName} 已保存${probeNote}`
+      : `${savedName} 已添加并保存${probeNote}`;
     const listRefreshed = await refreshStations({ force: true });
     const finalMessage = listRefreshed
       ? message

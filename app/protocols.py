@@ -15,6 +15,8 @@ def capability_path(path):
 def provider_supports(provider, path):
     if path is None:
         return True
+    if provider == "chatgpt":
+        return path == "/responses"
     if provider == "anthropic":
         return path == MESSAGES
     if provider == "gemini":

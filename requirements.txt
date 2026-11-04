@@ -5,3 +5,4 @@ pyyaml>=6.0
 rich>=13.0
 pillow>=10.0
 pystray>=0.19
+PyJWT[crypto]>=2.9,<3

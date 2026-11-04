@@ -140,6 +140,7 @@ class StationConfig:
     route_models: list[str] = field(default_factory=list)  # Optional exact IDs or trailing-* prefixes.
     provider: str = "openai"  # openai-compatible or OpenCode's documented native endpoints.
     opencode_plan: str = "balance"  # balance / go; never fall back between billing sources.
+    chatgpt_account: str = ""  # Opaque reference to a protected account-scoped OAuth record.
     priority: int = 5
     priority_auto: bool = False  # Legacy stations keep their manual score bias.
     weight: float = 1.0
@@ -170,6 +171,8 @@ class StationConfig:
         兼容用户写成 https://host 或 https://host/v1 两种形式。
         """
         url = self.base_url.rstrip("/")
+        if self.provider == "chatgpt":
+            return "https://api.openai.com/v1"
         if self.provider == "gemini":
             return url if url.endswith(("/v1beta", "/v1")) else url + "/v1beta"
         if self.provider == "opencode":
@@ -195,9 +198,27 @@ class StationConfig:
             kw["model_routing"] = "catalog" if kw.get("models") or kw.get("probe_models") else "passthrough"
         if "opencode_plan" not in kw and str(kw.get("base_url", "")).startswith("https://opencode.ai/inference/go/"):
             kw["opencode_plan"] = "go"
+        if kw.get("provider") == "chatgpt":
+            kw.setdefault("base_url", "https://api.openai.com/v1")
+            kw.setdefault("api_key", "")
         cfg = cls(name=name, **kw)
-        if cfg.provider not in ("openai", "opencode", "anthropic", "gemini"):
-            raise ValueError("provider 必须是 openai、opencode、anthropic 或 gemini")
+        if cfg.provider not in ("openai", "opencode", "anthropic", "gemini", "chatgpt"):
+            raise ValueError("不支持的站点接口类型")
+        if cfg.provider == "chatgpt":
+            from .chatgpt import PROFILE_RE
+            if cfg.chatgpt_account and (not isinstance(cfg.chatgpt_account, str) or not PROFILE_RE.fullmatch(cfg.chatgpt_account)):
+                raise ValueError("ChatGPT 账号引用无效")
+            cfg.base_url = "https://api.openai.com/v1"
+            cfg.api_key = ""  # Never persist OAuth credentials in station configuration.
+            cfg.headers = {}
+            cfg.models = []
+            cfg.billing = "subscription"
+            cfg.probe_chat = cfg.probe_balance = False
+            cfg.probe_models = True
+            cfg.probe_path = "/models"
+            cfg.probe_chat_path = "/responses"
+            cfg.model_routing = "catalog"
+            cfg.wire_api = "responses"
         if cfg.provider in ("anthropic", "gemini"):
             cfg.probe_balance = False
             cfg.wire_api = "auto"
@@ -266,7 +287,7 @@ def load_config(path: str = DEFAULT_CONFIG) -> AppConfig:
             raise ValueError("每个中转站必须配置 name")
         if not item.get("base_url"):
             raise ValueError(f"中转站 [{name}] 缺少 base_url")
-        if not item.get("api_key"):
+        if not item.get("api_key") and item.get("provider") != "chatgpt":
             raise ValueError(f"中转站 [{name}] 缺少 api_key")
         cfg.stations.append(StationConfig.from_dict(name, item))
 

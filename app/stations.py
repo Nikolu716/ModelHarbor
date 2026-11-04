@@ -36,7 +36,7 @@ class StationStore:
                     raise ValueError("站点名称不能为空")
                 if not isinstance(item.get("base_url"), str) or not item["base_url"].strip():
                     raise ValueError(f"站点 [{name}] 缺少 base_url")
-                if not isinstance(item.get("api_key"), str) or not item["api_key"].strip():
+                if item.get("provider") != "chatgpt" and (not isinstance(item.get("api_key"), str) or not item["api_key"].strip()):
                     raise ValueError(f"站点 [{name}] 缺少 api_key")
                 models = item.get("models", [])
                 if not isinstance(models, list) or any(
@@ -80,6 +80,7 @@ def dataclass_to_dict(cfg: StationConfig) -> dict:
         "route_models": cfg.route_models,
         "provider": cfg.provider,
         "opencode_plan": cfg.opencode_plan,
+        "chatgpt_account": cfg.chatgpt_account,
         "priority": cfg.priority,
         "priority_auto": cfg.priority_auto,
         "weight": cfg.weight,

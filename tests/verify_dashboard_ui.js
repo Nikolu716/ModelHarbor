@@ -205,6 +205,8 @@ async function main() {
 
   const html = fs.readFileSync(path.join(ROOT, "app", "web", "static", "index.html"), "utf8");
   const script = fs.readFileSync(path.join(ROOT, "app", "web", "static", "dashboard.js"), "utf8");
+  const quotaScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "chatgpt-quota.js"), "utf8");
+  const chatgptScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "chatgpt.js"), "utf8");
   const analyticsScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "analytics.js"), "utf8");
   const dom = new JSDOM(html, { runScripts: "outside-only", url: "http://127.0.0.1:8000/dashboard" });
   const { window } = dom;
@@ -260,6 +262,9 @@ async function main() {
       });
     }
     if (url === "/admin/capabilities") return jsonResponse({can_manage_service: canManageService});
+    if (url.endsWith("/reset-credit") && method === "POST") {
+      return jsonResponse({outcome: "reset", usage: {status: "connected", reset_credits: {availableCount: 1}, windows: []}});
+    }
     if (url === "/admin/settings/service") {
       if (method === "PUT") servicePort = body.port;
       return jsonResponse({
@@ -413,10 +418,35 @@ async function main() {
   if (!window.HTMLDialogElement.prototype.close) {
     window.HTMLDialogElement.prototype.close = function close() { this.open = false; };
   }
-  window.eval(`${script}\n${analyticsScript}\n;globalThis.__testFormatters = {finiteNumber, formatBalance, formatLatency};globalThis.__testConsumeActivityEvent = consumeActivityEvent;globalThis.__testDrainActivityBuffer = drainActivityBuffer;globalThis.__testApi = api;globalThis.__testProtectionMarkup = protectionMarkup;globalThis.__testRefreshCapabilities = refreshCapabilities;`);
+  window.eval(`${script}\n${analyticsScript}\n${chatgptScript}\n${quotaScript}\n;globalThis.__testFormatters = {finiteNumber, formatBalance, formatLatency};globalThis.__testConsumeActivityEvent = consumeActivityEvent;globalThis.__testDrainActivityBuffer = drainActivityBuffer;globalThis.__testApi = api;globalThis.__testProtectionMarkup = protectionMarkup;globalThis.__testRefreshCapabilities = refreshCapabilities;`);
   await settle();
 
   const document = window.document;
+  const quotaStation = {name: 'quota <img src=x onerror="globalThis.pwned=1">', provider: "chatgpt", chatgpt_account: "profile-test",
+    chatgpt: {connected: true, email: "private@example.test"},
+    chatgpt_usage: {status: "connected", windows: [
+      {name: "Codex", window: "primary", used_percent: 12.5, duration_mins: 300},
+      {name: "Codex", window: "secondary", used_percent: null, duration_mins: 10080}]}};
+  const quota = document.createElement("div");
+  quota.innerHTML = window.ModelHarborChatGPTQuota.markup(quotaStation);
+  assert.equal(quota.querySelectorAll("progress").length, 2);
+  assert.equal(quota.querySelector("progress").value, 12.5);
+  assert.ok(quota.textContent.includes("5 小时"));
+  assert.ok(quota.textContent.includes("7 天"));
+  assert.ok(quota.textContent.includes("—"));
+  assert.ok(!quota.textContent.includes("private@example.test"));
+  assert.equal(quota.querySelectorAll("img,script").length, 0);
+  assert.equal(window.ModelHarborChatGPTQuota.markup({...quotaStation, chatgpt_usage: null}).includes("连接用量"), true);
+  window.ModelHarborChatGPT.renderUsage({status: "connected", reset_credits: {availableCount: 2}, windows: []});
+  const nextCreditButton = document.querySelector("#sf-chatgpt-credits button");
+  assert.equal(nextCreditButton.textContent, "使用一张");
+  nextCreditButton.click();
+  await settle();
+  const resetRequest = fetchCalls.find(call => call.url.endsWith("/reset-credit"));
+  assert.equal(resetRequest.body.confirmed, true);
+  assert.equal(resetRequest.body.credit_id, undefined);
+  assert.match(resetRequest.body.idempotency_key, /^[0-9a-f-]{36}$/i);
+
   document.querySelector('#list-wrap [data-score-station]').click();
   assert.equal(document.getElementById('healthScoreDialog').open, true);
   assert.equal(document.getElementById('scoreStationName').textContent, maliciousStation);
@@ -990,7 +1020,7 @@ async function main() {
   maliciousManagedRow = [...document.querySelectorAll("[data-station-row]")]
     .find((row) => row.dataset.stationRow === maliciousStation);
   maliciousManagedRow.querySelector('[data-manage-action="edit"]').click();
-  assert.equal(document.getElementById("sf-name").disabled, true);
+  assert.equal(document.getElementById("sf-name").disabled, false);
   assert.equal(document.getElementById("sf-api-key").required, false);
   assert.equal(document.getElementById("sf-api-key").value, "");
   document.getElementById("editor-tab-models").click();
@@ -1074,6 +1104,13 @@ async function main() {
   assert.equal(document.getElementById("sf-base-url").readOnly, false);
   assert.equal(document.getElementById("sf-model-routing").disabled, false);
   assert.equal(document.getElementById("sf-models").closest('details').hidden, false);
+  providerSelect.value = "chatgpt";
+  providerSelect.dispatchEvent(new window.Event("change"));
+  assert.equal(providerSelect.selectedOptions[0].textContent, "ChatGPT订阅");
+  assert.equal(document.getElementById("sf-name").value, "ChatGPT订阅");
+  assert.match(document.getElementById("sf-provider-note").textContent, /Plus \/ Pro/);
+  document.getElementById("sf-cancel").click();
+  document.getElementById("stations-add").click();
   document.getElementById("sf-name").value = "gamma";
   assert.equal(document.getElementById("sf-priority-auto").checked, true);
   assert.equal(document.getElementById("sf-priority").disabled, true);

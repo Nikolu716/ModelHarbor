@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 
+from app import __version__
 from app.config import GatewayConfig, StationConfig
 from app.errors import UpstreamError
 from app.health import HealthMonitor
@@ -171,4 +172,4 @@ class GoRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.station.cfg.probe_chat)
         self.assertFalse(self.station.cfg.probe_balance)
         headers = inference_headers(self.station.cfg, {"user-agent": "python-httpx/1", "session-id": "s"})
-        self.assertEqual(headers["user-agent"], "ModelHarbor/1.0 via python-httpx/1")
+        self.assertEqual(headers["user-agent"], "ModelHarbor/" + __version__ + " via python-httpx/1")

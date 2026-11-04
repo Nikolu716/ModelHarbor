@@ -28,6 +28,8 @@ from .notifier import Notifier
 from .proxy import OpenAIProxy
 from .state import Registry
 from .stations import StationStore
+from .station_rename import recover_rename
+from . import __version__
 from .stats import EventLog
 from .web.admin import create_admin_router
 from .visual_tests import VisualTestStore, VisualTestRunner, VisualTestScheduler
@@ -152,6 +154,7 @@ class AccountRuntime:
     def __init__(self, manager, account_id):
         self.id = account_id
         directory = str(manager.store.directory(account_id))
+        recover_rename(directory)
         self.gateway = manager.original_gateway if account_id == 'default' else copy.deepcopy(manager.template)
         self.gateway.data_dir = directory
         access = AccessControlStore(directory)
@@ -189,7 +192,7 @@ class AccountRuntime:
         self.monitor_task = None
         visual_store = VisualTestStore(directory)
         self.visual_scheduler = VisualTestScheduler(self.registry, VisualTestRunner(self.registry, self.gateway, visual_store), visual_store)
-        self.app = FastAPI(title='ModelHarbor account', docs_url=None, redoc_url=None, openapi_url=None)
+        self.app = FastAPI(title='ModelHarbor account', version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
         self.app.include_router(self.proxy.api)
         self.app.include_router(self.proxy.google_api)
         self.app.include_router(create_admin_router(
@@ -221,6 +224,7 @@ class AccountRuntime:
 
     def pause(self):
         self.inactive.set()
+        self.registry.chatgpt.pause()
         self.visual_scheduler.deactivate()
         self.registry._activity_changed()  # Wake old SSE listeners so they reconnect to the new account.
         task = self.monitor_task
@@ -343,6 +347,7 @@ class AccountManager:
             runtime.juice.persist(retention_days=runtime.gateway.data_retention_days)
             await runtime.registry.close_clients()
             await runtime.notifier.close()
+            await runtime.registry.chatgpt.close()
 
 
 def create_account_router(manager):

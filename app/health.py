@@ -19,6 +19,7 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
+from . import __version__
 from .config import GatewayConfig
 from .errors import UpstreamError, classify_error
 from .notifier import Notifier
@@ -62,10 +63,16 @@ class HealthMonitor:
         self.notifier = notifier or Notifier()
         self._prev_status: dict[str, str] = {}
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()
+
+    def wake(self) -> None:
+        """Wake metadata scheduling after a saved configuration change."""
+        self._wake.set()
 
     async def run(self) -> None:
         """主循环：按各站探测间隔循环探测。"""
         while not self._stop.is_set():
+            self._wake.clear()
             try:
                 await self._probe_all()
             except asyncio.CancelledError:
@@ -74,7 +81,9 @@ class HealthMonitor:
                 print(f"[health] 探测循环异常: {e}")
             # 每轮之间等待最小间隔，整体以最短探测间隔驱动
             try:
-                await asyncio.sleep(self._tick())
+                await asyncio.wait_for(self._wake.wait(), timeout=self._tick())
+            except TimeoutError:
+                pass
             except asyncio.CancelledError:
                 break
             except Exception as e:  # 间隔计算异常也不允许杀死循环
@@ -87,6 +96,8 @@ class HealthMonitor:
                      for s in self.registry.states.values() if s.enabled]
         if any(s.enabled and s.cfg.provider == "opencode" and s.cfg.opencode_plan == "go" for s in self.registry.states.values()):
             intervals.append(GO_USAGE_INTERVAL)
+        if any(s.enabled and s.cfg.provider == "chatgpt" for s in self.registry.states.values()):
+            intervals.append(900)
         return min(intervals) if intervals else max(
             MODEL_REFRESH_MIN_INTERVAL, self.gateway.probe_interval)
 
@@ -99,11 +110,15 @@ class HealthMonitor:
     async def _probe_all(self) -> None:
         now = time.time()
         tasks = []
+        usage_profiles = set()
         for st in self.registry.states.values():
             if not st.enabled:
                 continue
             if st.cfg.provider == "opencode" and st.cfg.opencode_plan == "go" and now >= st.go_usage_next_at:
                 tasks.append(self.refresh_go_usage(st))
+            if st.cfg.provider == "chatgpt" and st.cfg.chatgpt_account not in usage_profiles:
+                usage_profiles.add(st.cfg.chatgpt_account)
+                tasks.append(self.registry.chatgpt.refresh_usage(st.cfg.chatgpt_account))
             if now < st.rate_limit_until:
                 continue
             interval = self._station_probe_interval(st)
@@ -160,7 +175,7 @@ class HealthMonitor:
                 # Fixed origin and no configured client/session headers on the quota endpoint.
                 async with client.stream("GET", GO_USAGE_URL, headers={
                         "Authorization": "Bearer " + cfg.api_key, "Accept": "application/json",
-                        "User-Agent": "ModelHarbor/1.0"}, follow_redirects=False,
+                        "User-Agent": "ModelHarbor/" + __version__}, follow_redirects=False,
                         timeout=httpx.Timeout(connect=self.gateway.connect_timeout, read=10, write=10, pool=5)) as response:
                     if response.status_code == 429:
                         status, error = "rate_limited", "上游用量接口限流，保留上次数据"
@@ -272,6 +287,8 @@ class HealthMonitor:
             self._prev_status[st.cfg.name] = cur
 
     def _quota_recovery_due(self, st: StationState, now: float) -> bool:
+        if st.cfg.provider == "chatgpt":
+            return False
         if not self.gateway.quota_auto_recover:
             return False
         if not st.enabled or not st.quota_exhausted:
@@ -408,7 +425,9 @@ class HealthMonitor:
         """One generation at a time; manual checks also respect upstream backoff."""
         now = time.time()
         reason = ""
-        if st.cfg.provider == "opencode" and st.cfg.opencode_plan == "go":
+        if st.cfg.provider == "chatgpt":
+            reason = "ChatGPT 订阅不发送后台 ping；请通过业务请求或手动智商测试验证"
+        elif st.cfg.provider == "opencode" and st.cfg.opencode_plan == "go":
             reason = "Go 套餐用于编程任务，不发送通用 ping 生成探测；可手动发起智商测试或正常编程请求"
         elif not st.enabled or self._stop.is_set():
             reason = "站点已停用，未发送生成请求"
@@ -544,7 +563,7 @@ class HealthMonitor:
         4xx 为配置类错误（协议/模型不匹配），只记录不熔断站点；
         5xx/超时/连接失败才累计熔断。
         """
-        if not self.gateway.generation_probe_enabled or not st.cfg.probe_chat:
+        if st.cfg.provider == "chatgpt" or not self.gateway.generation_probe_enabled or not st.cfg.probe_chat:
             return
         if not st.selected_probe_model:
             return
@@ -693,6 +712,7 @@ class HealthMonitor:
             retry_after = 0.0
             found = None
             api_paths, unavailable = {}, {}
+            display_names = {}
             started = time.perf_counter()
             try:
                 async with sem:
@@ -720,6 +740,10 @@ class HealthMonitor:
                         status = "unsupported"
                 else:
                     parsed_models = self._parse_models(response.content)
+                    if cfg.provider == "chatgpt":
+                        api_paths = {model: ["/responses"] for model in parsed_models}
+                        display_names = {item["id"]: item["display_name"] for item in json.loads(response.content)["data"]
+                                         if isinstance(item.get("display_name"), str) and item.get("display_name")}
                     if cfg.provider == "opencode":
                         api_paths, unavailable = opencode_capabilities(json.loads(response.content)["data"], cfg.opencode_plan)
                     found = parsed_models
@@ -749,6 +773,7 @@ class HealthMonitor:
             if found is not None:
                 st.probed_models = found
                 st.model_api_paths = api_paths
+                st.model_display_names = display_names
                 st.model_unavailable = unavailable
                 st.probed_model_order = list(dict.fromkeys(
                     item.strip() for item in self._parse_model_order(response.content)
@@ -773,16 +798,26 @@ class HealthMonitor:
     async def _fetch_catalog(self, st, cfg):
         """Fetch bounded native catalog pages, never a URL returned by upstream."""
         items, seen, params = [], set(), {}
+        from .chatgpt import authorized_headers
+        headers = await authorized_headers(self.registry, cfg, inference_headers(cfg, catalog=True))
         for _ in range(10):
             client = self.registry.ensure_client(st)
             try:
                 response = await client.get(
-                    cfg.models_url, params=params, headers=inference_headers(cfg, catalog=True),
+                    cfg.models_url, params=params, headers=headers,
                     timeout=httpx.Timeout(connect=self.gateway.connect_timeout, read=10, write=10, pool=10),
                     follow_redirects=False)
             except httpx.PoolTimeout:
                 self.registry.reset_client(st, expected_client=client)
                 raise
+            if response.is_success and cfg.provider == "chatgpt":
+                if len(response.content) > 2_000_000:
+                    raise ValueError("Catalog too large")
+                models = response.json().get("models")
+                if not isinstance(models, list) or any(not isinstance(item, dict) for item in models):
+                    raise ValueError("Invalid ChatGPT model catalog")
+                return httpx.Response(200, json={"data": [{"id": item["slug"], "display_name": item.get("display_name")}
+                    for item in models if item.get("visibility") == "list" and isinstance(item.get("slug"), str) and item["slug"]]})
             if not response.is_success or cfg.provider not in ("anthropic", "gemini"):
                 return response
             if len(response.content) > 2_000_000:
@@ -854,3 +889,4 @@ class HealthMonitor:
 
     async def stop(self) -> None:
         self._stop.set()
+        self._wake.set()

@@ -121,6 +121,18 @@ def classify_error(station: str, status_code: int, payload: bytes | str = "") ->
     """根据状态码 + 响应体判断错误类型。"""
     message = _extract_message(payload)
     lowered = message.lower()
+    try:
+        data = json.loads(payload)
+        error = data.get("error") or (data.get("response") or {}).get("error") or {}
+        code = error.get("code") if isinstance(error, dict) else None
+    except (ValueError, TypeError, AttributeError):
+        code = None
+    if isinstance(code, str) and code.startswith(("subscription_sharing_", "chatpass_v2_")):
+        quota = code == "subscription_sharing_usage_limit_exceeded"
+        transient = code in {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable"}
+        invalid_body = code == "subscription_sharing_unsupported_capability"
+        return UpstreamError(station, status_code, f"{message} ({code})", retryable=not invalid_body,
+                             quota=quota, deterministic=not transient)
     quota = _is_quota_error(status_code, lowered)
     if quota:
         # Funding/entitlement cannot recover through immediate retries. Other

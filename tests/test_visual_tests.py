@@ -152,7 +152,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.calls), 1)
         payload = json.loads(self.calls[0].content)
         self.assertEqual(payload['model'], 'second')
-        self.assertEqual(payload['max_completion_tokens'], 4096)
+        self.assertEqual(payload['max_completion_tokens'], 12000)
         self.assertTrue(payload['stream'])
         self.assertFalse(payload['store'])
         self.assertTrue(result['ok'])
@@ -212,7 +212,7 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(self.calls[-1].content)
         self.assertNotIn('reasoning_effort', payload)
         self.assertNotIn('max_completion_tokens', payload)
-        self.assertEqual(payload['max_tokens'], 4096)
+        self.assertEqual(payload['max_tokens'], 12000)
 
     async def test_blocked_and_invalid_requests_never_call_upstream(self):
         for changes in ({'model': 'missing'}, {'model': 7}, {'reasoning_effort': 'invalid'},

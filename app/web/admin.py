@@ -8,7 +8,9 @@ import asyncio
 import dataclasses
 import json
 import math
+import sqlite3
 import time
+import uuid
 from datetime import date
 from urllib.parse import urlsplit
 
@@ -34,6 +36,7 @@ from ..health import HealthMonitor
 from ..notifier import Notifier
 from ..state import Registry
 from ..stations import StationStore
+from ..station_rename import rename_account_station
 from ..visual_tests import VisualTestStore, VisualTestRunner, VisualTestScheduler, create_visual_test_router
 from ..stats import EVENT_PAGE_MAXLEN, EventLog
 from ..service_settings import (
@@ -77,10 +80,71 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         if not is_deployment_client(host):
             raise HTTPException(403, "服务设置仅允许从部署机器操作")
 
+    def _wake_monitor():
+        wake = getattr(monitor, "wake", None)
+        if wake:
+            wake()
+
     @api.get("/capabilities")
     async def capabilities(request: Request):
         return {"can_manage_service": is_deployment_client(
             request.client.host if request.client else None)}
+
+    @api.post("/chatgpt/login")
+    async def chatgpt_login(body: dict | None = None):
+        try:
+            return await registry.chatgpt.start_login((body or {}).get("profile"))
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @api.get("/chatgpt/login/{login_id}")
+    async def chatgpt_login_status(login_id: str):
+        try:
+            return registry.chatgpt.login_view(login_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @api.post("/chatgpt/profile/{profile}/logout")
+    async def chatgpt_logout(profile: str):
+        try:
+            return await registry.chatgpt.logout(profile)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @api.post("/chatgpt/profile/{profile}/codex-login")
+    async def chatgpt_codex_login(profile: str):
+        try:
+            return await registry.chatgpt.codex_account(profile).begin_login()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @api.get("/chatgpt/profile/{profile}/usage")
+    async def chatgpt_usage(profile: str, refresh: bool = False):
+        try:
+            bridge = registry.chatgpt.codex_account(profile)
+            if bridge.login and bridge.login.get("status") == "completed":
+                return await bridge.refresh()
+            if bridge.login and bridge.login.get("status") == "pending":
+                return bridge.login
+            return await bridge.refresh() if refresh else bridge.view()
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @api.post("/chatgpt/profile/{profile}/reset-credit")
+    async def chatgpt_reset_credit(profile: str, body: dict):
+        if set(body) - {"credit_id", "confirmed", "idempotency_key"} or body.get("confirmed") is not True:
+            raise HTTPException(400, "使用重置卡前必须由用户确认")
+        credit_id = body.get("credit_id")
+        if credit_id is not None and (not isinstance(credit_id, str) or not 1 <= len(credit_id) <= 512):
+            raise HTTPException(400, "重置卡编号无效")
+        try:
+            idempotency_key = str(uuid.UUID(body.get("idempotency_key", "")))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(400, "需要有效的重置操作标识") from exc
+        try:
+            return await registry.chatgpt.codex_account(profile).consume(credit_id, idempotency_key)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
 
     def _persist(stations: list[StationConfig]) -> bool:
         """Persist the complete station set before reporting success."""
@@ -123,7 +187,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         if len(base_url) > 2048:
             raise HTTPException(400, "Base URL 过长")
 
-        if not isinstance(cfg.api_key, str) or not cfg.api_key.strip():
+        if cfg.provider != "chatgpt" and (not isinstance(cfg.api_key, str) or not cfg.api_key.strip()):
             raise HTTPException(400, "API Key 不能为空")
         if len(cfg.api_key.strip()) > 4096:
             raise HTTPException(400, "API Key 过长")
@@ -198,7 +262,11 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             "provider": cfg.provider,
             "opencode_plan": cfg.opencode_plan,
             "go_usage": st.go_usage_view(),
+            "chatgpt_account": cfg.chatgpt_account,
+            "chatgpt": registry.chatgpt.store.view(cfg.chatgpt_account) if cfg.provider == "chatgpt" else None,
+            "chatgpt_usage": registry.chatgpt.usage_view(cfg.chatgpt_account) if cfg.provider == "chatgpt" else None,
             "model_api_paths": st.protocol_view(),
+            "model_display_names": dict(st.model_display_names),
             "model_unavailable": dict(st.model_unavailable),
             "detected_models": sorted(st.probed_models),
             "probe_model_candidates": st.probe_model_candidates,
@@ -532,6 +600,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         if st.enabled:
             # 重新启用后允许立即探测
             st.last_probe_at = 0.0
+            _wake_monitor()
         print(f"[admin] {name} -> {'启用' if st.enabled else '禁用'}")
         return {"name": name, "enabled": st.enabled}
 
@@ -692,6 +761,8 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         body.setdefault("model_routing", "catalog")
         body.setdefault("priority_auto", "priority" not in body)
         cfg = _validated_station(body.get("name"), _station_body(body))
+        if cfg.provider == "chatgpt" and cfg.chatgpt_account and not registry.chatgpt.store.view(cfg.chatgpt_account)["connected"]:
+            raise HTTPException(400, "请先完成 ChatGPT 官方授权")
         name = cfg.name
         if any(existing.casefold() == name.casefold()
                for existing in registry.states):
@@ -708,6 +779,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                     print(f"[stations] 新增运行态失败且持久化回滚失败: {rollback_error}")
             raise HTTPException(500, "站点运行时加载失败，配置已回滚") from exc
         st.last_probe_at = 0.0  # 健康监控下一轮自动探测，不阻塞保存反馈
+        _wake_monitor()
         print(f"[admin] 新增站点: {name}")
         return {
             "name": name,
@@ -722,23 +794,27 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         current = registry.get(name)
         if current is None:
             raise HTTPException(404, f"站点不存在: {name}")
-        requested_name = body.get("name")
-        if requested_name is not None and requested_name != name:
-            raise HTTPException(400, "站点名称不可直接修改，请新建后删除旧站点")
+        requested_name = body.get("name", name)
         changes = _station_body(body)
-        if not changes:
+        if not changes and "name" not in body:
             raise HTTPException(400, "没有可更新的字段")
         candidate_values = {
             field: getattr(current.cfg, field) for field in station_fields
         }
         candidate_values.update(changes)
-        candidate = _validated_station(name, candidate_values)
+        candidate = _validated_station(requested_name, candidate_values)
+        renaming = candidate.name != name
+        if renaming and any(existing != name and existing.casefold() == candidate.name.casefold()
+                            for existing in registry.states):
+            raise HTTPException(409, "渠道名称已存在")
+        if candidate.provider == "chatgpt" and candidate.chatgpt_account != current.cfg.chatgpt_account and not registry.chatgpt.store.view(candidate.chatgpt_account)["connected"]:
+            raise HTTPException(400, "请先完成 ChatGPT 官方授权")
         normalized_changes = {
             field: getattr(candidate, field)
             for field in station_fields
             if getattr(candidate, field) != getattr(current.cfg, field)
         }
-        if not normalized_changes:
+        if not normalized_changes and not renaming:
             return {
                 "name": name,
                 "ok": True,
@@ -747,9 +823,9 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                 "unchanged": True,
             }
         transport_fields = {
-            "base_url", "api_key", "headers", "timeout", "max_concurrency", "provider", "opencode_plan",
+            "base_url", "api_key", "headers", "timeout", "max_concurrency", "provider", "opencode_plan", "chatgpt_account",
         }
-        if transport_fields.intersection(normalized_changes):
+        if renaming or transport_fields.intersection(normalized_changes):
             activity = registry.route_activity_snapshot()
             active = next((item for item in activity["active_stations"]
                            if item["station"] == name), None)
@@ -758,16 +834,30 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                     409,
                     f"站点仍有 {active['inflight']} 个请求进行中，请稍后修改连接配置",
                 )
-        persisted = _persist(_configs_with(candidate))
-        st = registry.update_station(name, normalized_changes)
-        if st.enabled:
+        if renaming:
+            if (name in visual_runner.busy or current.models_discovery_lock.locked()
+                    or current.go_usage_lock.locked()
+                    or current.semaphore is not None and current.semaphore._value < current.cfg.max_concurrency):
+                raise HTTPException(409, "渠道正在处理请求或测试，请稍后修改名称")
+            try:
+                rename_account_station(registry, eventlog, store, visual_store, visual_runner, name, candidate)
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            except (OSError, sqlite3.Error) as exc:
+                raise HTTPException(500, "渠道名称保存失败，已回滚关联数据") from exc
+            persisted = store is not None
+        else:
+            persisted = _persist(_configs_with(candidate))
+        st = registry.update_station(candidate.name, normalized_changes) if normalized_changes else current
+        if st.enabled and normalized_changes:
             st.last_probe_at = 0.0
-        print(f"[admin] 更新站点: {name}")
+            _wake_monitor()
+        print(f"[admin] 更新站点: {name} -> {candidate.name}")
         return {
-            "name": name,
+            "name": candidate.name,
             "ok": True,
             "persisted": persisted,
-            "probe_scheduled": st.enabled,
+            "probe_scheduled": st.enabled and bool(normalized_changes),
         }
 
     @api.delete("/stations/{name}")

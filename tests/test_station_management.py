@@ -5,6 +5,9 @@ import asyncio
 import json
 import tempfile
 import unittest
+import time
+from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -14,6 +17,8 @@ from app.state import Registry
 from app.stations import StationStore
 from app.stats import EventLog
 from app.web.admin import create_admin_router
+from app.visual_tests import VisualTestStore
+from app.juice import JuiceRegistry
 
 
 class RecordingMonitor:
@@ -54,12 +59,16 @@ class StationManagementTests(unittest.TestCase):
         self.registry = Registry(self.gateway, [self.alpha])
         self.store = StationStore(self.tempdir.name)
         self.monitor = RecordingMonitor()
+        self.log = EventLog(self.tempdir.name)
+        self.log.load()
+        self.registry.bind_statistics(self.log)
+        self.registry.juice_registry = JuiceRegistry(persist_path=str(Path(self.tempdir.name) / "juice.json"))
         app = FastAPI()
         app.include_router(create_admin_router(
             registry=self.registry,
             gateway=self.gateway,
             monitor=self.monitor,
-            eventlog=EventLog(self.tempdir.name),
+            eventlog=self.log,
             store=self.store,
         ))
         self.client = TestClient(app)
@@ -154,6 +163,90 @@ class StationManagementTests(unittest.TestCase):
         self.assertTrue(stored['alpha'].priority_auto)
         self.assertEqual(stored['alpha'].priority, 1)
         self.assertEqual(self.client.put('/admin/stations/alpha', json={'priority_auto': 'false'}).status_code, 400)
+
+    def seed_rename_data(self):
+        st = self.registry.get("alpha")
+        st.probed_models = {"detected-model"}
+        st.probed_model_order = ["detected-model"]
+        st._persist_state()
+        self.registry.ensure_client(st)
+        self.log.add("alpha", "configured-model", True, 100, tokens=23, client_ip="192.0.2.1")
+        self.registry.model_mappings.save([dict(id="alias", name="alias", enabled=True,
+            source_model="requested-model", source_ips=[], targets=[dict(station="alpha", model="configured-model")])], self.registry)
+        visual = VisualTestStore(self.tempdir.name)
+        visual.save_result(st, dict(id="preview-1", station="alpha", model="configured-model", created_at=time.time(),
+            ok=True, kind="svg", latency_ms=50, usage=None, http_status=200, artifact="<svg></svg>"))
+        visual.save_schedule("alpha", dict(enabled=False, settings=None, interval_seconds=3600))
+        fp = self.registry.juice_registry.get("alpha", "configured-model")
+        fp.updated_at = time.time()
+        fp.samples = 4
+        self.registry.juice_registry.persist()
+        self.store.save(self.registry.stations)
+        return st, visual
+
+    def test_rename_preserves_state_references_history_and_preview_after_reload(self):
+        st, visual = self.seed_rename_data()
+        client = st.client
+        response = self.client.put("/admin/stations/alpha", json={"name": "My ChatGPT"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["name"], "My ChatGPT")
+        self.assertFalse(response.json()["probe_scheduled"])
+        self.assertIsNone(self.registry.get("alpha"))
+        self.assertIs(self.registry.get("My ChatGPT"), st)
+        self.assertIs(st.client, client)
+        self.assertEqual(st.probed_models, {"detected-model"})
+        self.assertEqual(self.registry.model_mappings.rules[0]["targets"][0]["station"], "My ChatGPT")
+        self.assertEqual(self.log.events[-1]["station"], "My ChatGPT")
+        self.assertEqual(self.log.events[-1]["tokens"], 23)
+        reloaded = EventLog(self.tempdir.name)
+        reloaded.load()
+        self.assertTrue(reloaded.storage_view()["ok"])
+        self.assertEqual(reloaded.events[-1]["station"], "My ChatGPT")
+        self.assertIn("My ChatGPT", reloaded._runtime)
+        self.assertNotIn("alpha", reloaded._runtime)
+        self.assertEqual(self.store.load()[0].name, "My ChatGPT")
+        self.assertEqual(visual.result(st)["station"], "My ChatGPT")
+        self.assertEqual(visual.result(st)["artifact"], "<svg></svg>")
+        self.assertIn("My ChatGPT", visual.schedules())
+        juice = JuiceRegistry(persist_path=self.registry.juice_registry.persist_path)
+        self.assertEqual(juice.get("My ChatGPT", "configured-model").samples, 4)
+        self.assertFalse((Path(self.tempdir.name) / ".station-rename").exists())
+
+    def test_rename_disk_failure_rolls_back_all_related_data(self):
+        st, visual = self.seed_rename_data()
+        with patch.object(self.store, "save", side_effect=OSError("disk full")):
+            response = self.client.put("/admin/stations/alpha", json={"name": "new-name"})
+        self.assertEqual(response.status_code, 500)
+        self.assertIs(self.registry.get("alpha"), st)
+        self.assertEqual(self.log.events[-1]["station"], "alpha")
+        self.assertEqual(self.registry.model_mappings.rules[0]["targets"][0]["station"], "alpha")
+        self.assertEqual(visual.result(st)["station"], "alpha")
+        self.assertEqual(self.store.load()[0].name, "alpha")
+        self.log.add("alpha", "configured-model", True, 20)
+        self.assertTrue(self.log.storage_view()["ok"])
+
+    def test_rename_rejects_duplicates_invalid_names_and_live_requests(self):
+        self.client.post("/admin/stations", json=self.station_body())
+        for value, status in (("BETA", 409), ("", 400), ("x" * 81, 400), ("bad\nname", 400)):
+            response = self.client.put("/admin/stations/alpha", json={"name": value})
+            self.assertEqual(response.status_code, status)
+        route = self.registry.begin_route("alpha", "configured-model")
+        try:
+            self.assertEqual(self.client.put("/admin/stations/alpha", json={"name": "renamed"}).status_code, 409)
+        finally:
+            self.registry.end_route(route, "success")
+
+    def test_unfinished_rename_recovers_before_loading_configuration(self):
+        from app.station_rename import _prepare, recover_rename
+        st, visual = self.seed_rename_data()
+        journal = _prepare(self.tempdir.name)
+        self.store.path.write_text('{"stations":[]}', encoding="utf-8")
+        self.registry.model_mappings.path.write_text('{"rules":[]}', encoding="utf-8")
+        visual.delete_result("alpha")
+        recover_rename(self.tempdir.name)
+        self.assertEqual(self.store.load()[0].name, "alpha")
+        self.assertEqual(visual.result(st)["id"], "preview-1")
+        self.assertFalse(journal.exists())
 
     def test_model_refresh_is_separate_from_generation_and_exposes_safe_metadata(self):
         response = self.client.post('/admin/station/alpha/models/refresh')

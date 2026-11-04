@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
+from app import __version__
 from app.config import AppConfig, load_config
 from app.service_settings import ServiceSettingsStore
 
@@ -60,7 +61,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
             await manager.stop()
             print("[ModelHarbor] stopped; account statistics saved")
 
-    app = FastAPI(title="ModelHarbor", lifespan=lifespan)
+    app = FastAPI(title="ModelHarbor", version=__version__, lifespan=lifespan)
     @app.exception_handler(sqlite3.Error)
     @app.exception_handler(OSError)
     async def storage_error(request: Request, exc):
@@ -103,7 +104,7 @@ def build_app(cfg: AppConfig) -> FastAPI:
 
     @app.get("/healthz", include_in_schema=False)
     async def healthz():
-        return {"ok": True, "ts": time.time()}
+        return {"ok": True, "version": __version__, "ts": time.time()}
 
     return app
 

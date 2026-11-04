@@ -483,7 +483,7 @@ class VisualTestRunner:
             raise HTTPException(400, "不支持的测试字段")
         prompt = body.get("prompt", BUILTIN["prompt"])
         model = body.get("model") or st.selected_probe_model
-        limit = body.get("max_output_tokens", 4096)
+        limit = None if st.cfg.provider == "chatgpt" else body.get("max_output_tokens", 12000)
         protocol = body.get("protocol", "auto")
         effort = body.get("reasoning_effort", "auto")
         template_name = body.get("template_name", "临时提示词")
@@ -493,11 +493,11 @@ class VisualTestRunner:
             raise HTTPException(400, "请先读取站点模型，或在站点配置中补充模型")
         if model not in st.probe_model_candidates:
             raise HTTPException(400, "所选模型不在本站模型目录中，请刷新目录或手动补充")
-        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        if st.cfg.provider != "chatgpt" and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
             raise HTTPException(400, "输出 Token 上限需为正整数，模型支持范围由上游校验")
         if protocol not in ("auto", "responses", "chat_completions", "chat_completions_legacy", "messages", "generate_content"):
             raise HTTPException(400, "不支持的测试协议")
-        if st.cfg.provider in ("opencode", "anthropic", "gemini") and protocol != "auto":
+        if st.cfg.provider in ("opencode", "anthropic", "gemini", "chatgpt") and protocol != "auto":
             path = {"responses": "/responses", "messages": "/messages", "generate_content": "/generateContent"}.get(protocol, "/chat/completions")
             if not st.supports_model(model, path):
                 raise HTTPException(400, "所选协议与此模型不符，请使用自动协议")
@@ -531,6 +531,8 @@ class VisualTestRunner:
         self.next_allowed[name] = now + 15
 
     async def run(self, st, body, client_ip, *, source="manual", _reserved=False):
+        if st.cfg.provider == "chatgpt" and source != "manual":
+            raise HTTPException(400, "ChatGPT 订阅仅支持手动智商测试，不发送后台定时生成请求")
         settings = self.validate(st, body)
         if not _reserved:
             self._reserve(st)
@@ -594,12 +596,21 @@ class VisualTestRunner:
                 client = self.registry.ensure_client(st)
                 from .providers import inference_headers
                 headers = inference_headers(cfg, test_session=f"modelharbor-visual-{result['id']}", path=path)
+                if cfg.provider == "chatgpt":
+                    from .chatgpt import subscription_request, authorized_headers
+                    payload.pop("max_output_tokens", None)
+                    payload = subscription_request(payload)
+                    headers = await authorized_headers(self.registry, cfg, headers)
                 async with client.stream("POST", inference_url(cfg, path, model), json=payload, headers=headers,
                                          follow_redirects=False, timeout=httpx.Timeout(connect=self.gateway.connect_timeout,
                                          read=120, write=15, pool=5)) as response:
                     result["http_status"] = response.status_code
                     if response.status_code == 429:
-                        self.next_allowed[name] = time.time() + max(60, _retry_after_seconds(response.headers.get("retry-after")))
+                        wait = max(60, _retry_after_seconds(response.headers.get("retry-after")))
+                        self.next_allowed[name] = time.time() + wait
+                        if cfg.provider == "chatgpt":
+                            st.mark_rate_limited(wait, reason="手动智商测试收到上游限流", source="visual_test",
+                                                 wait_source="upstream" if response.headers.get("retry-after") else "gateway")
                     if not 200 <= response.status_code < 300:
                         result["error"] = f"上游返回 HTTP {response.status_code}；未重试或切换线路"
                         error_raw = bytearray()
@@ -611,6 +622,11 @@ class VisualTestRunner:
                             error_data = json.loads(error_raw)
                             error_data = error_data.get("error", error_data)
                             detail = error_data.get("message", "") if isinstance(error_data, dict) else ""
+                            if cfg.provider == "chatgpt" and isinstance(error_data, dict):
+                                from .errors import classify_error
+                                upstream_error = classify_error(name, response.status_code, json.dumps({"error": error_data}))
+                                if upstream_error.quota:
+                                    st.mark_quota_exhausted(upstream_error)
                             if isinstance(detail, str) and detail:
                                 for secret in [cfg.api_key, *cfg.headers.values()]:
                                     if secret:
@@ -625,6 +641,14 @@ class VisualTestRunner:
                                 raise ValueError("上游响应超过 2 MB，已停止读取")
                             raw.extend(chunk)
                         content, usage, truncated, error = decode_response(bytes(raw), response.headers.get("content-type", ""))
+                        if cfg.provider == "chatgpt":
+                            from .chatgpt import completed_response
+                            completed, subscription_error = completed_response(bytes(raw))
+                            if subscription_error:
+                                error = subscription_error.get("message") or subscription_error.get("code") or "ChatGPT 响应未完成"
+                                if subscription_error.get("code") == "subscription_sharing_usage_limit_exceeded":
+                                    from .errors import classify_error
+                                    st.mark_quota_exhausted(classify_error(name, 200, json.dumps({"error": subscription_error})))
                         result["diagnostics"] = response_diagnostics(bytes(raw), response.headers.get("content-type", ""))
                         raw_response = raw.decode("utf-8", errors="replace")
                         for secret in [cfg.api_key, *cfg.headers.values()]:
@@ -655,7 +679,7 @@ class VisualTestRunner:
             result["error"] = str(exc) if type(exc) is ValueError else "上游返回格式无法解析"
         finally:
             self.busy.discard(name)
-            self.next_allowed[name] = max(self.next_allowed.get(name, 0), time.time() + 15)
+            self.next_allowed[name] = max(self.next_allowed.get(name, 0), time.time() + (60 if cfg.provider == "chatgpt" else 15))
         result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
         if self.registry.get(name) is not st or st.cfg is not cfg:
             raise HTTPException(409, "测试期间站点配置已变更，旧结果未保存；上游可能已计费")
@@ -694,6 +718,8 @@ class VisualTestScheduler:
             raise HTTPException(400, "请明确设置是否开启自动测试")
         old = self.store.schedules().get(st.cfg.name, {})
         enabled = body["enabled"]
+        if enabled and st.cfg.provider == "chatgpt":
+            raise HTTPException(400, "ChatGPT 订阅仅支持手动智商测试，不开启定时生成")
         interval = body.get("interval_seconds", old.get("interval_seconds", 3600))
         if type(interval) is not int or not 300 <= interval <= 604800:
             raise HTTPException(400, "自动测试间隔需为 300–604800 秒（5 分钟至 7 天）")
@@ -743,6 +769,10 @@ class VisualTestScheduler:
             st = self.registry.get(name)
             if st is None:
                 self.store.delete_schedule(name)
+                continue
+            if st.cfg.provider == "chatgpt":
+                plan["paused_reason"] = "ChatGPT 订阅仅手动测试，自动计划已暂停"
+                self.store.save_schedule(name, plan)
                 continue
             if station_signature(st) != plan["signature"]:
                 plan["paused_reason"] = "站点连接或协议配置已变更，请确认参数并重新保存自动测试计划"

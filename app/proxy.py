@@ -51,7 +51,17 @@ SSE_HEADERS = {
 }
 
 
-class _MappedBody(dict):
+class _RequestBody(dict):
+    """Keep subscription attempts scoped to one client request, across rounds."""
+    def __init__(self, body):
+        super().__init__(body)
+        self.subscription_attempts = getattr(body, "subscription_attempts", set())
+
+    def copy(self):
+        return _RequestBody(self)
+
+
+class _MappedBody(_RequestBody):
     """Pin a rule snapshot to one request, including retries and streaming."""
     def __init__(self, body, mapping):
         super().__init__(body)
@@ -483,6 +493,7 @@ class _StreamUsageParser:
         self.error_payload = None
         self._anthropic_usage: dict = {}
         self.messages_finished = False
+        self.responses_finished = False
         self.gemini_candidates: set[int] = set()
         self.gemini_finished: set[int] = set()
 
@@ -512,6 +523,8 @@ class _StreamUsageParser:
             kind = obj.get("type")
             if kind == "message_stop":
                 self.messages_finished = True
+            if kind == "response.completed":
+                self.responses_finished = True
             for position, candidate in enumerate(obj.get("candidates") or []):
                 index = candidate.get("index", position)
                 self.gemini_candidates.add(index)
@@ -877,6 +890,7 @@ class OpenAIProxy:
         model = body.get("model")
         if not isinstance(model, str) or not model.strip():
             return _error_response(400, "model 必须是非空字符串", "invalid_request_error")
+        body = _RequestBody(body)
         if path == '/responses':
             self.namespace_memory.restore(body)
         try:
@@ -919,7 +933,7 @@ class OpenAIProxy:
             total_attempts += getattr(result, "_zg_attempts", 0)
             if getattr(result, "status_code", 0) != 502:
                 # 参数类 400（如 reasoning effort 不被该站支持）：剥离参数降级重试一次
-                if result.status_code == 400 and _is_param_error(result):
+                if result.status_code == 400 and not body.subscription_attempts and _is_param_error(result):
                     degraded = _strip_reasoning(body)
                     if degraded is not None:
                         try:
@@ -1060,6 +1074,9 @@ class OpenAIProxy:
 
         sent_attempts = 0
         for idx, st in enumerate(candidates):
+            subscription = st.cfg.chatgpt_account or st.cfg.name
+            if st.cfg.provider == "chatgpt" and subscription in getattr(body, "subscription_attempts", ()):
+                continue
             if (sent_attempts if mapping else idx) >= self.gateway.max_attempts:
                 break
             try:
@@ -1067,7 +1084,8 @@ class OpenAIProxy:
                 routed_body = {**body, 'model': model} if mapping else body
                 signature = st.connection_signature()
                 target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
-                headers = _build_headers(st, client_headers, target_path)
+                from .chatgpt import authorized_headers
+                headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
                 url = inference_url(st.cfg, target_path, model)
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
                 local_errors.append(str(exc))
@@ -1080,6 +1098,8 @@ class OpenAIProxy:
                 has_transient = True  # 下一轮可能不忙
                 continue
             sent_attempts += 1
+            if st.cfg.provider == "chatgpt" and hasattr(body, "subscription_attempts"):
+                body.subscription_attempts.add(subscription)
             route_id = self.registry.begin_route(st.cfg.name, model, client_ip, **log_mapping)
             route_outcome = "failed"
             route_error = ""
@@ -1146,6 +1166,20 @@ class OpenAIProxy:
                     switched = bool(attempts)
                     detail = "成功" + (f" (经{len(attempts)}次切换)" if switched else "")
                     body_bytes = b"".join(chunks)
+                    if st.cfg.provider == "chatgpt":
+                        from .chatgpt import completed_response
+                        try:
+                            completed, subscription_error = completed_response(body_bytes)
+                        except (ValueError, TypeError, AttributeError):
+                            completed, subscription_error = None, {"message": "ChatGPT 返回了无效的 Responses 事件流"}
+                        if subscription_error:
+                            err = self._handle_failure(st, classify_error(st.cfg.name, 200, json.dumps({"error": subscription_error})),
+                                                       model=model, path=target_path, signature=signature)
+                            route_error = str(err)
+                            attempts.append(str(err))
+                            has_transient |= not err.deterministic
+                            continue
+                        body_bytes = json.dumps(completed, ensure_ascii=False).encode()
                     if _looks_like_error(body_bytes):
                         err = self._handle_failure(st, classify_error(st.cfg.name, 200, body_bytes),
                                                    model=model, path=target_path, signature=signature)
@@ -1190,7 +1224,7 @@ class OpenAIProxy:
                     return (Response(
                         content=body_bytes,
                         status_code=resp.status_code,
-                        media_type=resp.headers.get("content-type", "application/json"),
+                        media_type="application/json" if st.cfg.provider == "chatgpt" else resp.headers.get("content-type", "application/json"),
                     ), False)
                 # 非 2xx：读错误体（该响应尚未被迭代，可安全 aread）
                 payload = await resp.aread()
@@ -1265,6 +1299,9 @@ class OpenAIProxy:
 
         sent_attempts = 0
         for idx, st in enumerate(candidates):
+            subscription = st.cfg.chatgpt_account or st.cfg.name
+            if st.cfg.provider == "chatgpt" and subscription in getattr(body, "subscription_attempts", ()):
+                continue
             if (sent_attempts if mapping else idx) >= self.gateway.max_attempts:
                 break
             try:
@@ -1272,7 +1309,8 @@ class OpenAIProxy:
                 routed_body = {**body, 'model': model} if mapping else body
                 signature = st.connection_signature()
                 target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
-                headers = _build_headers(st, client_headers, target_path)
+                from .chatgpt import authorized_headers
+                headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
                 url = inference_url(st.cfg, target_path, model)
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
                 local_errors.append(str(exc))
@@ -1286,6 +1324,8 @@ class OpenAIProxy:
                 continue
 
             sent_attempts += 1
+            if st.cfg.provider == "chatgpt" and hasattr(body, "subscription_attempts"):
+                body.subscription_attempts.add(subscription)
             route_id = self.registry.begin_route(st.cfg.name, model, client_ip, **log_mapping)
             route_outcome = "failed"
             route_error = ""
@@ -1469,6 +1509,8 @@ class OpenAIProxy:
                                 if parsed_tokens is not None:
                                     stream_tokens = parsed_tokens
                                 incomplete = (
+                                    st.cfg.provider == "chatgpt" and not usage_parser.responses_finished
+                                    or
                                     target_path == MESSAGES and not usage_parser.messages_finished
                                     or target_path in GEMINI_PATHS and (
                                         not usage_parser.gemini_candidates
