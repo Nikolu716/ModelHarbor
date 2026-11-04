@@ -7,6 +7,9 @@ const root = path.resolve(__dirname, "..", "app", "web", "static");
 const dom = new JSDOM(fs.readFileSync(path.join(root, "index.html"), "utf8"), {runScripts: "outside-only", url: "http://localhost/dashboard"});
 const w = dom.window, d = w.document, calls = [], copied = [], notices = [], timers = new Map(), intervals = [];
 let timerId = 0;
+let heldUsage = null;
+const popups = [];
+w.open = (...args) => { popups.push(args); return null; };
 w.ResizeObserver = class { observe() {} disconnect() {} };
 w.setInterval = callback => { intervals.push(callback); return intervals.length; };
 w.setTimeout = callback => { timers.set(++timerId, callback); return timerId; };
@@ -16,7 +19,7 @@ w.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
 w.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new w.Event("close")); };
 const subscription = {name: "ChatGPT", provider: "chatgpt", enabled: true, chatgpt_account: "own-profile",
   effective_models: ["gpt-test"], probe_model_candidates: ["gpt-test"], model_api_paths: {"gpt-test": ["/responses"]},
-  chatgpt: {connected: true}, chatgpt_usage: {status: "connected", updated_at: 1900000000, windows: [
+  chatgpt: {connected: true, email: "plus@example.test"}, chatgpt_usage: {status: "connected", updated_at: 1900000000, windows: [
     {name: "<img src=x>", window: "primary", used_percent: 20, duration_mins: 300, resets_at: 1900001000},
     {name: "Codex", window: "secondary", used_percent: 35, duration_mins: 10080}], reset_credits: {availableCount: 2}}};
 w.STATIONS = [subscription, {name: "Other", provider: "openai", enabled: true, effective_models: ["other-model"], probe_model_candidates: ["other-model"]}];
@@ -29,12 +32,14 @@ w.refreshStations = async () => true;
 w.render = () => {};
 w.api = async (url, method = "GET", _reload, body) => {
   calls.push({url, method, body});
-  if (url.includes("/usage")) return subscription.chatgpt_usage;
+  if (url.includes("/usage")) return heldUsage || subscription.chatgpt_usage;
+  if (url.endsWith("/codex-login")) return {status: "pending", user_code: "TEST-1234", expires_at: Date.now() / 1000 + 600};
   if (url === "/admin/visual-tests/prompts") return [{id: "builtin", name: "Draw", prompt: "Draw an SVG", builtin: true}];
   return method === "POST" ? {running: true} : {result: null, running: false, schedule: {enabled: false}};
 };
 w.ModelHarborChatGPT = {consume: async () => {}};
 w.eval(fs.readFileSync(path.join(root, "chatgpt-quota.js"), "utf8"));
+w.eval(fs.readFileSync(path.join(root, "chatgpt.js"), "utf8"));
 w.eval(fs.readFileSync(path.join(root, "visual-tests.js"), "utf8"));
 const settle = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
 async function open(name) {
@@ -75,6 +80,42 @@ async function main() {
   assert.equal(d.querySelectorAll("#chatgptUsageWindows img").length, 0);
   assert.equal(d.getElementById("chatgptUsageCreditCount").textContent, "2 张可用");
   assert.equal(d.getElementById("chatgptUsageCredits").querySelector("button").textContent, "使用");
+  assert.equal(d.getElementById("chatgptUsageIdentity").textContent, "plus@example.test");
+  assert.equal(d.getElementById("chatgptUsageConnect").textContent, "重新授权用量");
+  const connectedUsage = subscription.chatgpt_usage;
+  const hasAuthorizationRequest = () => calls.some(call => call.url.endsWith("/codex-login"));
+  let finishRead;
+  heldUsage = new Promise(resolve => { finishRead = resolve; });
+  const currentCard = d.querySelector("#chatgptUsageWindows section");
+  d.getElementById("chatgptUsageRefresh").click();
+  assert.equal(d.getElementById("chatgptUsageDialog").getAttribute("aria-busy"), "true");
+  assert.ok(d.getElementById("chatgptUsageBadge").classList.contains("is-loading"));
+  assert.ok(d.getElementById("chatgptUsageBadge").textContent.includes("正在读取"));
+  assert.equal(d.querySelector("#chatgptUsageWindows section"), currentCard);
+  assert.equal(hasAuthorizationRequest(), false, "refresh must never start a new login");
+  finishRead(connectedUsage); heldUsage = null; await settle();
+  assert.equal(d.getElementById("chatgptUsageDialog").getAttribute("aria-busy"), "false");
+  d.getElementById("chatgptUsageConnect").click();
+  assert.equal(d.getElementById("chatgptUsageReauth").hidden, false);
+  assert.equal(hasAuthorizationRequest(), false, "re-authorization needs an explicit second action");
+  assert.equal(popups.length, 0);
+  d.getElementById("chatgptUsageReauthCancel").click();
+  assert.equal(d.getElementById("chatgptUsageReauth").hidden, true);
+  assert.equal(hasAuthorizationRequest(), false);
+  d.getElementById("chatgptUsageConnect").click();
+  d.getElementById("chatgptUsageReauthConfirm").click(); await settle();
+  assert.equal(hasAuthorizationRequest(), true);
+  assert.equal(popups.length, 0, "quota authorization must not open an about:blank tab");
+  d.getElementById("chatgptUsageClose").click();
+  subscription.chatgpt_usage = connectedUsage;
+  d.getElementById("sf-chatgpt-account").value = subscription.chatgpt_account;
+  w.ModelHarborChatGPT.update();
+  const authorizationsBeforeEditor = calls.filter(call => call.url.endsWith("/codex-login")).length;
+  d.getElementById("sf-chatgpt-usage-link").click(); await settle();
+  assert.equal(d.getElementById("chatgptUsageDialog").open, true);
+  assert.equal(d.getElementById("sf-chatgpt-usage-link").textContent, "查看订阅用量");
+  assert.equal(calls.filter(call => call.url.endsWith("/codex-login")).length, authorizationsBeforeEditor);
+  assert.equal(popups.length, 0);
   // The countdown must not rebuild connected quota cards or reset-credit controls.
   const creditButton = d.getElementById("chatgptUsageCredits").querySelector("button");
   for (const tick of intervals) tick();
@@ -92,9 +133,13 @@ async function main() {
   const copy = d.getElementById("chatgptUsageCopy");
   Object.defineProperty(w.navigator, "clipboard", {configurable: true, value: {writeText: async text => copied.push(text)}});
   w.isSecureContext = true;
-  copy.click(); await settle();
+  copy.click();
+  assert.equal(copy.textContent.trim(), "复制中…");
+  assert.ok(d.getElementById("chatgptUsageCopyFeedback").textContent.includes("正在复制"));
+  await settle();
   assert.equal(copied.at(-1), "TEST-1234");
   assert.equal(copy.textContent.trim(), "已复制");
+  assert.ok(d.getElementById("chatgptUsageCopyFeedback").textContent.includes("验证码已复制"));
   // LAN HTTP and denied Clipboard API permissions both use a helper inside the modal.
   d.execCommand = command => {
     assert.equal(command, "copy");
@@ -115,6 +160,10 @@ async function main() {
   copy.click(); await settle();
   assert.equal(w.getSelection().toString(), "TEST-1234");
   assert.equal(notices.at(-1).error, true);
+  assert.ok(d.getElementById("chatgptUsageCopyFeedback").textContent.includes("浏览器未允许复制"));
+  assert.equal(copy.textContent.trim(), "复制验证码");
+  for (const tick of intervals) tick();
+  assert.equal(w.getSelection().toString(), "TEST-1234");
   d.getElementById("chatgptUsageClose").click();
   assert.equal(timers.size, 0, "closing the dialog must stop authorization polling");
   quota.querySelector("button").click(); await settle();

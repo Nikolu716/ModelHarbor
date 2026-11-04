@@ -60,7 +60,7 @@ def verify_static() -> None:
     assert re.search(r'/static/dashboard\.css\?v=\d+', html)
     assert re.search(r'/static/dashboard\.js\?v=\d+', html)
     assert '/static/visual-tests.js?v=12' in html
-    assert '/static/chatgpt-quota.js?v=3' in html
+    assert '/static/chatgpt-quota.js?v=4' in html
     assert '/static/visual-tests.css?v=9' in html
     assert '/static/analytics.js?v=8' in html
     assert '/static/brand-logo-source.png?v=4' in html

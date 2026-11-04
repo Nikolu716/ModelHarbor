@@ -3,6 +3,7 @@
   const el = id => document.getElementById(id);
   let selected = "", profile = "", data = null, busy = false, epoch = 0;
   let pollTimer = 0, pollFailures = 0, copyBusy = false, copiedCode = "", copiedUntil = 0;
+  let identity = "", confirming = false, operation = "", copyError = "";
   const windows = value => (Array.isArray(value?.windows) ? value.windows : []).filter(item => item && typeof item === "object");
   const number = value => typeof value === "number" && Number.isFinite(value);
   const percentage = value => number(value) ? new Intl.NumberFormat("zh-CN", {maximumFractionDigits: 1}).format(value) + "%" : "—";
@@ -62,11 +63,16 @@
     el("chatgptUsageDevice").hidden = !waiting;
     el("chatgptUsageDevice").classList.toggle("is-expired", elapsed);
     el("chatgptDeviceTitle").textContent = elapsed ? "验证码已过期" : "连接 Codex 用量";
-    if (el("chatgptUsageCode").textContent !== code) el("chatgptUsageCode").textContent = code;
+    if (el("chatgptUsageCode").textContent !== code) {
+      el("chatgptUsageCode").textContent = code;
+      copiedCode = ""; copiedUntil = 0; copyError = "";
+    }
     const copied = code && copiedCode === code && Date.now() < copiedUntil;
     el("chatgptUsageCopy").disabled = !code || elapsed || copyBusy;
     el("chatgptUsageCopy").classList.toggle("is-copied", Boolean(copied));
-    el("chatgptUsageCopy").querySelector("span").textContent = copied ? "已复制" : "复制验证码";
+    el("chatgptUsageCopy").querySelector("span").textContent = copyBusy ? "复制中…" : copied ? "已复制" : "复制验证码";
+    el("chatgptUsageCopyFeedback").textContent = copyBusy ? "正在复制验证码…" : copyError || (copied ? "验证码已复制，可前往官方页面粘贴。" : "");
+    el("chatgptUsageCopyFeedback").classList.toggle("is-error", Boolean(copyError));
     el("chatgptUsageLogin").hidden = elapsed;
     el("chatgptUsageWaiting").classList.toggle("is-expired", elapsed);
     const seconds = Math.max(0, Math.ceil((data?.expires_at || 0) - Date.now() / 1000));
@@ -77,17 +83,30 @@
   function renderControls() {
     const waiting = pending(), elapsed = expired(), connected = data?.status === "connected";
     const badge = el("chatgptUsageBadge");
-    badge.textContent = waiting ? elapsed ? "验证码过期" : "等待授权" : connected ? "已连接" : data?.error ? "读取失败" : "待连接";
-    badge.classList.toggle("is-connected", connected);
+    const account = identity || data?.email || "";
+    el("chatgptUsageIdentity").textContent = account;
+    el("chatgptUsageIdentity").title = account;
+    badge.textContent = busy ? operation === "authorize" ? "正在获取验证码…" : "正在读取用量…"
+      : waiting ? elapsed ? "验证码过期" : "等待官方授权" : connected ? "用量已连接" : data?.error ? "读取失败" : "尚未授权读取用量";
+    badge.classList.toggle("is-connected", connected && !busy);
+    badge.classList.toggle("is-loading", busy);
+    el("chatgptUsageDialog").setAttribute("aria-busy", String(busy));
+    el("chatgptUsageLoading").hidden = !busy || Boolean(windows(data).length) || waiting;
+    el("chatgptUsageLoading").lastElementChild.textContent = operation === "authorize" ? "正在获取官方验证码…" : "正在读取订阅用量…";
+    el("chatgptUsageEmpty").hidden = busy || Boolean(windows(data).length) || waiting;
+    el("chatgptUsageReauth").hidden = !confirming;
+    el("chatgptUsageReauthConfirm").disabled = busy;
     el("chatgptUsageFooter").hidden = waiting && !elapsed;
     const wait = Math.max(0, Math.ceil((data?.manual_refresh_at || 0) - Date.now() / 1000));
-    el("chatgptUsageRefresh").hidden = waiting || !windows(data).length && !connected;
+    el("chatgptUsageRefresh").hidden = waiting || !windows(data).length && !connected && !data?.error;
     el("chatgptUsageRefresh").disabled = busy || !profile || wait > 0;
     el("chatgptUsageRefresh").textContent = busy ? "读取中…" : wait > 0 ? wait + " 秒后可刷新" : "刷新用量";
     el("chatgptUsageConnect").disabled = busy || !profile;
+    el("chatgptUsageConnect").hidden = confirming;
     el("chatgptUsageConnect").classList.toggle("primary", !connected);
     el("chatgptUsageConnect").classList.toggle("secondary", connected);
-    el("chatgptUsageConnect").textContent = busy ? "连接中…" : elapsed ? "重新获取验证码" : connected ? "重新连接" : "连接用量";
+    el("chatgptUsageConnect").textContent = busy ? "处理中…" : elapsed ? "重新获取验证码" : connected || data?.updated_at || windows(data).length ? "重新授权用量" : "授权读取用量";
+    el("chatgptUsageConnect").title = "需要在官方页面验证账号；日常查询请使用刷新用量";
   }
   function schedulePoll() {
     clearTimeout(pollTimer);
@@ -108,7 +127,7 @@
   async function copyCode() {
     const code = pending() ? data?.user_code : "", revision = epoch;
     if (!code || expired() || copyBusy) return;
-    copyBusy = true; renderDevice();
+    copyBusy = true; copyError = ""; renderDevice();
     try {
       if (navigator.clipboard?.writeText && window.isSecureContext) {
         try { await navigator.clipboard.writeText(code); } catch { copyFallback(code); }
@@ -119,9 +138,11 @@
       }
     } catch {
       if (epoch === revision) {
+        copiedCode = ""; copiedUntil = 0;
+        copyError = "浏览器未允许复制，验证码已选中，请按 Ctrl+C 或手动复制。";
         const range = document.createRange(); range.selectNodeContents(el("chatgptUsageCode"));
         const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
-        showToast("复制未成功，验证码已选中，请手动复制", true);
+        showToast(copyError, true);
       }
     } finally { copyBusy = false; if (epoch === revision) renderDevice(); }
   }
@@ -152,7 +173,8 @@
   async function refresh(manual) {
     if (busy || !profile) return;
     const id = profile, revision = epoch;
-    busy = true; renderDetail();
+    if (manual) confirming = false;
+    busy = true; operation = "read"; renderControls();
     try {
       const usage = await api("/admin/chatgpt/profile/" + encodeURIComponent(id) + "/usage" + (manual ? "?refresh=true" : ""));
       if (epoch === revision) { pollFailures = 0; update(id, usage); render(true); }
@@ -161,12 +183,20 @@
         pollFailures++; data = {...data, error: error.message};
         if (manual) showToast(error.message, true);
       }
-    } finally { if (epoch === revision) { busy = false; renderDetail(); schedulePoll(); } }
+    } finally { if (epoch === revision) { busy = false; operation = ""; renderDetail(); schedulePoll(); } }
   }
-  async function connect() {
+  function connect() {
+    if (busy || !profile) return;
+    if (!pending() && (data?.status === "connected" || data?.updated_at || windows(data).length)) {
+      confirming = true; renderControls(); el("chatgptUsageReauthConfirm").focus();
+      return;
+    }
+    beginAuthorization();
+  }
+  async function beginAuthorization() {
     if (busy || !profile) return;
     const id = profile, revision = epoch;
-    busy = true; renderDetail();
+    busy = true; operation = "authorize"; confirming = false; renderControls();
     try {
       const login = await api("/admin/chatgpt/profile/" + encodeURIComponent(id) + "/codex-login", "POST", true, {});
       if (epoch !== revision) return;
@@ -174,23 +204,33 @@
     } catch (error) {
       if (epoch === revision) data = {...data, error: error.message};
       showToast(error.message, true);
-    } finally { if (epoch === revision) { busy = false; renderDetail(); schedulePoll(); } }
+    } finally { if (epoch === revision) { busy = false; operation = ""; renderDetail(); schedulePoll(); } }
+  }
+  function open(station) {
+    if (!station?.chatgpt_account) return;
+    selected = station.name; profile = station.chatgpt_account; data = station.chatgpt_usage; epoch++; busy = false;
+    identity = station.chatgpt?.email || ""; confirming = false; operation = "";
+    pollFailures = 0; copiedCode = ""; copyError = "";
+    clearTimeout(pollTimer);
+    renderDetail();
+    if (!el("chatgptUsageDialog").open) el("chatgptUsageDialog").showModal();
+    refresh(false);
   }
   document.addEventListener("click", event => {
     const button = event.target.closest("[data-chatgpt-usage]");
     if (!button) return;
     const station = (statusData?.stations || []).find(item => item.name === button.dataset.chatgptUsage);
     if (!station) return;
-    selected = station.name; profile = station.chatgpt_account || ""; data = station.chatgpt_usage; epoch++; busy = false;
-    pollFailures = 0; copiedCode = "";
-    renderDetail(); el("chatgptUsageDialog").showModal(); refresh(false);
+    open(station);
   });
   el("chatgptUsageRefresh").addEventListener("click", () => refresh(true));
   el("chatgptUsageConnect").addEventListener("click", connect);
+  el("chatgptUsageReauthConfirm").addEventListener("click", beginAuthorization);
+  el("chatgptUsageReauthCancel").addEventListener("click", () => { confirming = false; renderControls(); el("chatgptUsageConnect").focus(); });
   el("chatgptUsageCopy").addEventListener("click", copyCode);
   el("chatgptUsageClose").addEventListener("click", () => el("chatgptUsageDialog").close());
   el("chatgptUsageDialog").addEventListener("close", () => { epoch++; busy = false; clearTimeout(pollTimer); });
   setInterval(() => { if (el("chatgptUsageDialog").open) { renderDevice(); renderControls(); } }, 1000);
-  window.ModelHarborChatGPTQuota = {markup, update};
+  window.ModelHarborChatGPTQuota = {markup, update, open};
   render(true);
 })();

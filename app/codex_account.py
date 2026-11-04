@@ -125,7 +125,7 @@ class CodexAccount:
         except (ChatGPTAuthError, OSError):
             self.failures += 1
             self.next_refresh_at = time.time() + min(14400, USAGE_INTERVAL * 2 ** min(self.failures, 4))
-            self.cache.update(status="error", error="暂时无法读取订阅用量，保留上次数据；可在详情中重新连接")
+            self.cache.update(status="error", error="暂时无法读取订阅用量，保留上次数据；请稍后刷新，只有授权失效时才需要重新授权用量")
 
     async def start(self):
         async with self.start_lock:

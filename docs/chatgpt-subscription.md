@@ -14,6 +14,8 @@ Usage and earned rate-limit reset credits are optional and separate from model a
 
 The channel table uses compact quota progress bars, with reset times and credits in a detail dialog. Connected profiles refresh metadata every 15 minutes; failed reads back off and retain cached data across restarts. Only windows returned by the account are shown.
 
+Opening usage or refreshing it reuses the existing authorization. **Reauthorize usage** starts a separate device-code login only after confirmation; it is intended for expired authorization, not routine updates. The dialog identifies the linked ChatGPT account, shows loading feedback, and lets you copy the verification code before opening the official login page.
+
 Using a reset credit always requires a browser confirmation. The redemption uses an idempotency key, and ModelHarbor refreshes account limits afterward. The upstream decides whether a reset is eligible and returns the outcome; the gateway does not manufacture credits or quota.
 
 The optional usage bridge requires an OpenAI-signed `codex.exe` installed beneath `Program Files`, with its path set in `MODELHARBOR_CODEX_PATH`. For an NSSM Windows service, an administrator can install the signed executable found with the Codex CLI and restart the gateway:

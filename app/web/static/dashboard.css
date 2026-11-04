@@ -1411,8 +1411,20 @@ button.heat-cell:hover,button.heat-cell:focus-visible { outline:1px solid #676dc
 .chatgpt-usage-dialog>header { align-items:flex-start; gap:16px; }
 .subscription-title-row { display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; }
 .subscription-title-row h2 { margin-top:5px; }
-.subscription-status-badge { padding:3px 8px; border:1px solid var(--line); border-radius:6px; color:var(--muted); font-size:10px; white-space:nowrap; }
-.subscription-status-badge.is-connected { color:var(--ok); border-color:#d9e9de; background:var(--ok-soft); }
+.subscription-account-identity { min-width:0; max-width:100%; overflow-wrap:anywhere; padding:3px 8px; border:1px solid var(--line); border-radius:6px; color:var(--text-soft); font-size:11px; }
+.subscription-account-identity:empty { display:none; }
+.subscription-status-badge { display:inline-flex; align-items:center; gap:6px; margin-top:8px; color:var(--muted); font-size:10px; white-space:nowrap; }
+.subscription-status-badge:empty { display:none; }
+.subscription-status-badge.is-connected { color:var(--ok); }
+.subscription-status-badge.is-loading::before,.subscription-usage-loading>span:first-child { content:""; display:inline-block; flex:none; width:12px; height:12px; border:1.5px solid var(--line-strong); border-top-color:var(--text-soft); border-radius:50%; animation:subscription-spin .8s linear infinite; }
+@keyframes subscription-spin { to { transform:rotate(360deg); } }
+.subscription-usage-loading { display:flex; align-items:center; gap:8px; margin:0; padding:16px 24px; color:var(--muted); font-size:12px; }
+.subscription-copy-feedback { min-height:17px; margin:-9px 0 12px; color:var(--ok); font-size:11px; }
+.subscription-copy-feedback.is-error { color:var(--danger); }
+.subscription-reauth { margin:0 24px 20px; padding:16px; border:1px solid var(--line-strong); border-radius:10px; background:var(--surface-raised); }
+.subscription-reauth h3 { margin:0 0 7px; font-size:13px; font-weight:600; }
+.subscription-reauth p { color:var(--muted); font-size:12px; line-height:1.8; }
+.subscription-reauth>div { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; margin-top:14px; }
 .subscription-device { padding:24px; }
 .subscription-device-intro h3,.subscription-usage-empty h3 { margin:0 0 6px; font-size:15px; font-weight:600; }
 .subscription-device-intro p,.subscription-usage-empty p { color:var(--muted); font-size:12px; line-height:1.8; }
@@ -1438,7 +1450,7 @@ button.heat-cell:hover,button.heat-cell:focus-visible { outline:1px solid #676dc
 .subscription-usage-help>p { margin-top:9px !important; }
 .subscription-usage-actions { flex:none; }
 .subscription-usage-actions .button { font-size:11px; }
-@media(prefers-reduced-motion:reduce) { .subscription-device-wait>span:first-child { animation:none; } }
+@media(prefers-reduced-motion:reduce) { .subscription-device-wait>span:first-child,.subscription-status-badge.is-loading::before,.subscription-usage-loading>span:first-child { animation:none; } }
 @media(max-width:540px) {
   .chatgpt-usage-dialog>header { padding:18px 16px; }
   .subscription-device,.subscription-usage-empty { padding:20px 16px; }
@@ -1446,6 +1458,8 @@ button.heat-cell:hover,button.heat-cell:focus-visible { outline:1px solid #676dc
   .subscription-device-code strong { font-size:22px; letter-spacing:1px; }
   .subscription-device-code .button { padding:8px; }
   .chatgpt-usage-dialog>.go-usage-status { padding-left:16px; padding-right:16px; }
+  .subscription-usage-loading { padding-left:16px; padding-right:16px; }
+  .subscription-reauth { margin-left:16px; margin-right:16px; }
 }
 @media(max-width:540px) { .chatgpt-usage-dialog>footer { flex-wrap:wrap; } .chatgpt-usage-dialog>footer p { flex-basis:100%; } .subscription-credits { margin-left:16px; margin-right:16px; } }
 @media(max-width:620px) { .chatgpt-connection { grid-template-columns:minmax(0,1fr); align-items:start; gap:12px; } .chatgpt-connection .button { justify-self:start; } #editor-connection.is-chatgpt { grid-template-areas:"provider" "name" "url" "auth" "note"; } }

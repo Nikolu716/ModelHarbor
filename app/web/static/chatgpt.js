@@ -3,7 +3,6 @@
   const el = id => document.getElementById(id);
   let loginBusy = false;
   let usageBusy = false;
-  let usageLoginId = "";
   let usageProfile = "";
 
   function redemptionStorageKey(profile, creditId) {
@@ -47,7 +46,7 @@
     el("sf-chatgpt-login").disabled = loginBusy;
     el("sf-chatgpt-login").textContent = loginBusy ? "等待官方授权…" : profile ? "重新授权 / 切换账号" : "Continue with ChatGPT";
     el("sf-chatgpt-usage-link").disabled = !linked?.connected || usageBusy;
-    el("sf-chatgpt-usage-link").textContent = usageBusy ? "等待 Codex 授权…" : "连接用量与重置卡";
+    el("sf-chatgpt-usage-link").textContent = "查看订阅用量";
   }
 
   function renderUsage(data) {
@@ -57,18 +56,17 @@
     const windows = Array.isArray(data?.windows) ? data.windows : [];
     el("sf-chatgpt-usage-status").textContent = data?.status === "connected"
       ? (Number.isFinite(credits?.availableCount) ? `Codex 用量已连接 · ${credits.availableCount} 张可用重置卡` : "Codex 用量已连接 · 重置卡数量未提供")
-      : data?.status === "pending" ? `请在浏览器使用验证码 ${data.user_code} 登录同一个 ChatGPT 账号。`
-        : data?.status === "disconnected" ? "请先连接 Codex 用量与重置卡。" : "尚未读取 Codex 用量";
+      : data?.status === "pending" ? "用量授权进行中，点击「查看订阅用量」复制验证码并继续。"
+        : data?.status === "disconnected" ? "可在「查看订阅用量」中授权读取额度，不影响模型调用。" : "尚未读取 Codex 用量";
     el("sf-chatgpt-windows").replaceChildren(...windows.map(item => {
       const line = document.createElement("div");
       const percent = Number(item.used_percent);
       const duration = Number(item.duration_mins);
-      line.textContent = `${item.name || "Codex"} · ${item.window === "secondary" ? "周窗口" : "短时窗口"} · ${Number.isFinite(percent) ? `${percent}% 已用` : "用量未提供"}${Number.isFinite(duration) ? ` · ${duration} 分钟` : ""}${item.resets_at ? ` · 重置 ${new Date(item.resets_at * 1000).toLocaleString()}` : ""}`;
+      const windowLabel = duration === 10080 ? "7 天" : Number.isFinite(duration) && duration > 0
+        ? duration % 60 === 0 ? duration / 60 + " 小时" : duration + " 分钟" : "用量窗口";
+      line.textContent = `${item.name || "Codex"} · ${windowLabel} · ${Number.isFinite(percent) ? `${percent}% 已用` : "用量未提供"}${item.resets_at ? ` · 重置 ${new Date(item.resets_at * 1000).toLocaleString()}` : ""}`;
       return line;
     }));
-    const code = el("sf-chatgpt-device-code");
-    code.hidden = data?.status !== "pending";
-    code.querySelector("strong").textContent = data?.user_code || "";
     const rows = Array.isArray(credits?.credits)
       ? credits.credits.filter(item => item && item.status === "available") : [];
     const creditRows = rows.map(item => {
@@ -112,43 +110,11 @@
     }
   }
 
-  async function connectUsage() {
+  function connectUsage() {
     if (usageBusy) return;
-    usageBusy = true; update();
-    const popup = window.open("about:blank", "_blank");
-    try {
-      const profile = el("sf-chatgpt-account").value;
-      let existing = null;
-      try { existing = await api(`/admin/chatgpt/profile/${encodeURIComponent(profile)}/usage?refresh=true`); }
-      catch { /* A new installation has no Codex account session yet. */ }
-      if (existing?.status === "connected") {
-        if (popup && !popup.closed) popup.close();
-        renderUsage(existing);
-        return;
-      }
-      const result = await api(`/admin/chatgpt/profile/${encodeURIComponent(profile)}/codex-login`, "POST", true, {});
-      usageLoginId = "pending";
-      renderUsage(result);
-      if (popup) popup.location.replace(result.verification_url);
-      const popupCode = `${result.user_code || ""}`;
-      if (popupCode) showToast(`在官方 Codex 页面输入验证码：${popupCode}`);
-      const deadline = Math.min(Number(result.expires_at) * 1000, Date.now() + 15 * 60_000);
-      while (usageLoginId && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const data = await api(`/admin/chatgpt/profile/${encodeURIComponent(profile)}/usage?refresh=true`);
-        if (data.status === "connected") { renderUsage(data); break; }
-        if (data.status === "pending") renderUsage(data);
-      }
-      usageBusy = false;
-      await loadUsage(true);
-    } catch (error) {
-      if (popup && !popup.closed) popup.close();
-      el("sf-chatgpt-usage").hidden = false;
-      el("sf-chatgpt-usage-status").textContent = error.message;
-      showToast(error.message, true);
-    } finally {
-      usageLoginId = ""; usageBusy = false; update();
-    }
+    const profile = el("sf-chatgpt-account").value;
+    const station = (typeof STATIONS === "undefined" ? [] : STATIONS).find(item => item.chatgpt_account === profile);
+    if (station) window.ModelHarborChatGPTQuota?.open(station);
   }
 
   async function consume(creditId, title, profile = el("sf-chatgpt-account").value) {
