@@ -1450,6 +1450,9 @@ button.heat-cell:hover,button.heat-cell:focus-visible { outline:1px solid #676dc
 .subscription-usage-help>p { margin-top:9px !important; }
 .subscription-usage-actions { flex:none; }
 .subscription-usage-actions .button { font-size:11px; }
+#chatgptUsageConnect { background:var(--danger); border-color:var(--danger); color:#fff; }
+#chatgptUsageConnect:hover:not(:disabled) { background:#963944; border-color:#963944; }
+#chatgptUsageConnect:focus-visible { outline:3px solid rgb(179 69 80 / 30%); outline-offset:3px; }
 @media(prefers-reduced-motion:reduce) { .subscription-device-wait>span:first-child,.subscription-status-badge.is-loading::before,.subscription-usage-loading>span:first-child { animation:none; } }
 @media(max-width:540px) {
   .chatgpt-usage-dialog>header { padding:18px 16px; }
