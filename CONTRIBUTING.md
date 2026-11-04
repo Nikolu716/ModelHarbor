@@ -21,6 +21,7 @@ The dashboard safety test also requires Node.js:
 npm ci --prefix tests
 node tests/verify_dashboard_ui.js
 node tests/verify_subscription_ui.js
+node tests/verify_codex_binding_ui.js
 ```
 
 Do not use real provider keys or send paid requests in tests. Prefer the local

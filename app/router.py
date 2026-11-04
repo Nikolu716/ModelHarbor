@@ -22,6 +22,7 @@ class RoutePermit:
     semaphore: asyncio.Semaphore
     recovery: bool = False
     released: bool = False
+    quota_revision: int = 0
 
 
 class Router:
@@ -69,7 +70,7 @@ class Router:
         # One real request can validate an expired breaker, even with a low
         # score. No extra generation, and no concurrent recovery stampede.
         now = time.time()
-        recovering = [st for st in ordered if st.status == STATUS_DOWN
+        recovering = [st for st in ordered if (st.status == STATUS_DOWN or st.native_usage_limited)
                       and not st.recovery_inflight
                       and now >= st.recovery_attempt_at + max(1.0, self.gateway.cool_down)]
         if recovering:
@@ -91,7 +92,8 @@ class Router:
                 return None
             await sem.acquire()
         now = time.time()
-        recovery = st.status == STATUS_DOWN
+        native_recovery = st.native_usage_limited
+        recovery = st.status == STATUS_DOWN or native_recovery
         if not self.registry.is_routeable(st, now) or (recovery and (
                 st.recovery_inflight or st.generation_probe_lock.locked()
                 or now < st.recovery_attempt_at + max(1.0, self.gateway.cool_down))):
@@ -100,7 +102,11 @@ class Router:
         if recovery:
             st.recovery_inflight = True
             st.recovery_attempt_at = now
-        return RoutePermit(sem, recovery)
+            if native_recovery:
+                st.quota_resume_at = max(st.quota_resume_at, now + st.native_retry_interval())
+                st.quota_wait_source = "gateway"
+                st._persist_state()
+        return RoutePermit(sem, recovery, quota_revision=st.quota_revision)
 
     def release(self, st: StationState, permit: RoutePermit) -> None:
         if not permit.released:

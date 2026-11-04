@@ -166,6 +166,14 @@ function formatHitRate(rate, known = true) {
 
 function quotaRecoveryHint(station, gateway = {}) {
   if (!station.quota_exhausted) return "";
+  if (station.protection?.recovery_mode === "passive") {
+    const until = Math.max(finiteNumber(station.protection.until), finiteNumber(station.quota_resume_at));
+    if (station.protection.recovery_inflight) return "正在用一个真实请求验证恢复，其他请求暂不进入此渠道。";
+    return until > Date.now() / 1000
+      ? `Codex 使用限制，等待至 ${new Date(until * 1000).toLocaleString()}；${station.protection.wait_source === "upstream" ? "依据上游等待时间" : "上游未提供恢复时间，网关逐步延长等待"}。不发送后台生成请求。`
+      : "等待已结束，下一个真实请求将单独验证恢复；成功后恢复调度，仍受限则延长等待。";
+  }
+  if (station.provider === "chatgpt") return ["codex_cli", "codex_relay"].includes(station.chatgpt_mode) ? "Codex 返回使用限制，已暂停此渠道；查看官方用量后可手动验证一次，不进行后台重试。" : "订阅共享接口返回使用限制，已暂停此渠道；Codex 剩余额度不能确认该接口恢复。请查看官方用量后手动验证一次，不进行后台重试。";
   const auto = gateway.quota_auto_recover !== false;
   const error = station.quota_probe_error || station.quota_error || "";
   if (!auto || (!gateway.generation_probe_enabled || !station.probe_chat)
@@ -248,7 +256,9 @@ function statusInfo(station) {
   const source = { request: "业务请求", generation_probe: "生成测试", connection_probe: "连接检查" }[protection.source] || "请求";
   const code = protection.status_code ? `HTTP ${protection.status_code}` : "连接失败 / 超时";
   if (!station.enabled) return { className: "unknown", label: "已停用", detail: "管理员停用，不参与路由" };
-  if (station.quota_exhausted) return { className: "quota", label: "配额保护", detail: protection.reason || station.quota_error || "上游报告额度不可用" };
+  if (station.quota_exhausted) return { className: "quota", label: protection.recovery_mode === "passive"
+    ? protection.recovery_inflight ? "恢复验证中" : remaining > 0 ? "用量限制 · 等待恢复" : "待真实请求验证"
+    : station.provider === "chatgpt" ? "订阅接入受限" : "配额保护", detail: station.provider === "chatgpt" ? quotaRecoveryHint(station) : protection.reason || station.quota_error || "上游报告额度不可用" };
   if (protection.kind === "rate_limited" && remaining > 0 || finiteNumber(station.rate_limit_until) > now) {
     const wait = remaining || Math.ceil(station.rate_limit_until - now);
     return { className: "cooling", label: `限流冷却 · ${wait} 秒`,
@@ -795,8 +805,9 @@ function stationActions(station) {
   let action = "probe", label = "连接检查";
   let title = "读取连接状态，不发送生成请求，也不解除生成故障保护";
   if (station.quota_exhausted) {
-    action = "reset"; label = "检查额度";
-    title = "按站点策略验证额度恢复；生成检查可能产生用量";
+    action = station.provider === "chatgpt" ? "subscription-usage" : "reset";
+    label = station.provider === "chatgpt" ? "查看限制" : "检查额度";
+    title = station.provider === "chatgpt" ? "查看官方用量与限制原因，或手动验证一次；打开详情不发送生成请求" : "按站点策略验证额度恢复；生成检查可能产生用量";
   } else if (kind === "recovering" && !go) {
     action = "generation-probe"; label = "验证恢复";
     title = "用站点配置的探测模型发送一次生成请求，可能产生用量；成功后解除熔断";
@@ -2225,6 +2236,10 @@ async function refresh(force = false) {
 }
 
 async function runStationAction(action, stationName) {
+  if (action === "subscription-usage") {
+    window.ModelHarborChatGPTQuota?.open((statusData?.stations || []).find(item => item.name === stationName));
+    return;
+  }
   const key = `${action}:${stationName}`;
   if (pendingActions.has(key)) return;
   pendingActions.add(key);
@@ -2615,12 +2630,14 @@ function renderStationModels() {
   const discovery = station?.model_discovery || {};
   const changedConnection = station && ($("sf-base-url").value.trim() !== station.base_url
     || $("sf-api-key").value.trim() || $("sf-provider").value !== (station.provider || 'openai')
-    || $("sf-opencode-plan").value !== (station.opencode_plan || 'balance'));
+    || $("sf-provider").value === 'opencode' && $("sf-opencode-plan").value !== (station.opencode_plan || 'balance')
+    || $("sf-provider").value === 'chatgpt' && ($("sf-chatgpt-account").value !== station.chatgpt_account
+      || $("sf-chatgpt-mode").value !== (station.chatgpt_mode || 'shared')));
   const labels = { pending: "等待发现", loading: "正在读取模型列表", ready: "已发现", off: "自动发现已关闭", error: "读取失败", rate_limited: "限流冷却中", auth_error: "鉴权失败", unsupported: "接口不支持", invalid_response: "返回格式不支持" };
   let status = !station ? "保存并启用站点后自动发现模型。"
     : `${labels[discovery.status] || "等待发现"}${discovery.updated_at ? ` · 更新于 ${formatAge(discovery.updated_at)}` : ""}${discovery.error ? ` · ${discovery.error}` : ""}`;
   if (station && !station.enabled) status += " · 站点已停用，不发送发现请求";
-  if (changedConnection) status = "连接或套餐尚未保存；下方仍为原配置的缓存，保存后重新发现。";
+  if (changedConnection) status = "连接、账号或套餐尚未保存；下方仍为原配置的缓存，保存后重新发现。";
   const wait = Math.max(0, Math.ceil((discovery.checked_at || 0) + 60 - Date.now() / 1000));
   const limited = (discovery.status === "rate_limited" && discovery.next_refresh_at > Date.now() / 1000)
     || discovery.retry_after_until > Date.now() / 1000;
@@ -2709,6 +2726,7 @@ function updateProvider(changed = false) {
   $("editor-connection").classList.toggle('is-chatgpt', chatgpt);
   $("sf-chatgpt-connection").hidden = !chatgpt;
   $("sf-api-key").closest('label').hidden = chatgpt;
+  $("sf-base-url").closest('label').hidden = chatgpt;
   $("sf-api-key").required = !chatgpt && !editingStation;
   if (chatgpt) {
     $("sf-base-url").value = 'https://api.openai.com/v1';
@@ -2723,13 +2741,18 @@ function updateProvider(changed = false) {
     $("sf-probe-chat").disabled = true;
     $("sf-models").closest('details').hidden = true;
     $("sf-provider-note").hidden = false;
-    $("sf-provider-note").textContent = '通过官方授权使用 Plus / Pro 订阅。当前接入 Responses 协议；客户端需携带完整上下文。不发送后台 ping。首次授权请在部署机器的浏览器完成。';
+    $("sf-provider-note").textContent = $("sf-chatgpt-mode").value === 'codex_relay'
+      ? '绑定 Codex 账号后即可调用，模型目录与用量自动读取。客户端继续使用网关 /v1/responses，支持完整历史、工具调用与实时流式输出。工具由客户端执行，不发送后台生成探测。'
+      : $("sf-chatgpt-mode").value === 'codex_cli'
+      ? '绑定 Codex 账号后通过本机官方 CLI 调用。支持 /v1/responses 文本和手动智商测试，暂不支持客户端工具、图片或原生结构化输出；CLI 有额外上下文开销。'
+      : '通过官方授权使用 Plus / Pro 订阅。当前接入 Responses 协议；客户端需携带完整上下文。不发送后台 ping。首次授权请在部署机器的浏览器完成。';
     if (changed && !$("sf-name").value) $("sf-name").value = 'ChatGPT订阅';
   }
   window.ModelHarborChatGPT?.update();
   updateModelRouting();
 }
 $("sf-provider").addEventListener('change', () => { updateProvider(true); renderStationModels(); });
+$("sf-chatgpt-mode").addEventListener('change', () => { updateProvider(); renderStationModels(); });
 $("sf-opencode-plan").addEventListener('change', () => { updateProvider(); renderStationModels(); });
 $("sf-model-routing").addEventListener('change', updateModelRouting);
 $("sf-route-models").addEventListener('input', updateModelRouting);
@@ -2838,7 +2861,7 @@ function renderStations() {
     return `
       <tr class="${station.enabled ? "" : "is-disabled"}" data-station-row="${escapeHtml(name)}">
         <td><span class="managed-station-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
-          ${station.quota_exhausted ? '<span class="station-warning">上游额度不可用</span>' : ""}</td>
+          ${station.quota_exhausted ? `<span class="station-warning">${station.provider === "chatgpt" ? "订阅接入受限" : "上游额度不可用"}</span>` : ""}</td>
         <td class="station-url-cell" title="${escapeHtml(station.base_url || "")}">${escapeHtml(station.base_url || "-")}</td>
         <td class="station-models-cell"><button type="button" class="catalog-link" data-manage-action="models" data-station="${escapeHtml(name)}" title="${escapeHtml(modelsLabel)}">${escapeHtml(scopeLabel)}</button></td>
         <td title="${station.priority_auto ? "按同模型、同协议的综合健康度自动调度；速度占比采用账号评分策略" : "同健康度档位内优先分流，不改变健康分"}">${station.priority_auto ? `自动${station.rank ? ` · #${station.rank}` : ""}` : formatCount(station.priority)}</td>
@@ -2848,7 +2871,7 @@ function renderStations() {
           <button class="button station-action" type="button" data-manage-action="edit" data-station="${escapeHtml(name)}"${disabled}>编辑</button>
           <button class="button station-action" type="button" data-manage-action="toggle" data-station="${escapeHtml(name)}"${disabled}${busy(toggleBusy)}>${toggleBusy ? "处理中..." : (station.enabled ? "停用" : "启用")}</button>
           <button class="button station-action" type="button" data-manage-action="probe" data-station="${escapeHtml(name)}"${disabled}${busy(probeBusy)}>${probeBusy ? "检查中..." : "连接检查"}</button>
-          ${station.quota_exhausted ? `<button class="button station-action" type="button" data-manage-action="reset" data-station="${escapeHtml(name)}"${disabled}${busy(resetBusy)}>${resetBusy ? "探测中..." : "立即探测"}</button>` : ""}
+          ${station.quota_exhausted ? `<button class="button station-action" type="button" data-manage-action="${station.provider === "chatgpt" ? "subscription-usage" : "reset"}" data-station="${escapeHtml(name)}"${disabled}${busy(resetBusy)}>${station.provider === "chatgpt" ? "查看限制" : resetBusy ? "探测中..." : "立即探测"}</button>` : ""}
           <button class="button station-action is-destructive" type="button" data-manage-action="delete" data-station="${escapeHtml(name)}"${disabled}${busy(deleteBusy)}>${deleteBusy ? "删除中..." : "删除"}</button>
         </div></td>
       </tr>`;
@@ -2859,6 +2882,7 @@ function renderStations() {
 
 function fillStationForm(station) {
   if (stationSubmitting) return;
+  window.ModelHarborCodexBinding?.reset();
   editingStation = station.name;
   $("sf-name").value = station.name;
   $("sf-name").disabled = false;
@@ -2869,6 +2893,7 @@ function fillStationForm(station) {
   $("sf-models").value = (station.models || []).join(", ");
   $("sf-provider").value = station.provider || 'openai';
   $("sf-chatgpt-account").value = station.chatgpt_account || '';
+  $("sf-chatgpt-mode").value = station.chatgpt_mode || 'shared';
   $("sf-opencode-plan").value = station.opencode_plan || 'balance';
   $("sf-model-routing").value = station.model_routing || (station.accepts_any_model ? 'passthrough' : 'catalog');
   $("sf-route-models").value = (station.route_models || []).join(', ');
@@ -2894,6 +2919,7 @@ function fillStationForm(station) {
 }
 
 function resetStationForm({ keepStatus = false } = {}) {
+  window.ModelHarborCodexBinding?.reset();
   editingStation = null;
   $("sf-name").value = "";
   $("sf-name").disabled = false;
@@ -2904,6 +2930,7 @@ function resetStationForm({ keepStatus = false } = {}) {
   $("sf-models").value = "";
   $("sf-provider").value = 'openai';
   $("sf-chatgpt-account").value = '';
+  $("sf-chatgpt-mode").value = 'codex_relay';
   $("sf-opencode-plan").value = 'go';
   $("sf-model-routing").value = 'catalog';
   $("sf-route-models").value = '';
@@ -2940,6 +2967,8 @@ function setStationSubmitting(busy) {
 $("station-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (stationSubmitting) return;
+  const bindingError = window.ModelHarborCodexBinding?.validate();
+  if (bindingError) { setStationFormStatus(bindingError, true); showToast(bindingError, true); return; }
   if (!event.currentTarget.checkValidity()) {
     event.currentTarget.reportValidity();
     return;
@@ -2951,6 +2980,7 @@ $("station-form").addEventListener("submit", async (event) => {
     models: $("sf-models").value.split(/[,，]/).map(x => x.trim()).filter(Boolean),
     provider: $("sf-provider").value,
     chatgpt_account: $("sf-provider").value === 'chatgpt' ? $("sf-chatgpt-account").value : '',
+    chatgpt_mode: $("sf-chatgpt-mode").value,
     opencode_plan: $("sf-opencode-plan").value,
     model_routing: $("sf-model-routing").value,
     route_models: routeRules(),
@@ -3006,6 +3036,10 @@ $("station-form").addEventListener("submit", async (event) => {
 });
 
 async function runManagedStationAction(action, stationName) {
+  if (action === "subscription-usage") {
+    window.ModelHarborChatGPTQuota?.open(STATIONS.find(item => item.name === stationName));
+    return;
+  }
   const key = `${action}:${stationName}`;
   if (stationPendingActions.has(key)) return;
   stationPendingActions.add(key);

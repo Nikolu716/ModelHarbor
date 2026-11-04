@@ -5,7 +5,7 @@
 - 推理地址：固定为 https://opencode.ai/inference/go/openai/v1。
 - 模型目录：https://opencode.ai/inference/go/v1/models；读取目录不生成内容，也不能证明剩余额度或区域权限可用。
 - Go 的文本模型支持 Responses、Chat Completions、Anthropic Messages 和 Gemini GenerateContent，协议转换由 OpenCode Console 执行。网关保留客户端协议、工具调用和请求参数，不降级为纯文本。
-- 网关只透传明确允许的会话头（x-opencode-session、session-id、thread-id）及真实 User-Agent。缺少稳定会话 ID 时在本地返回 400，不发送上游请求、不扣站点健康分。不同会话不会共享静态会话 ID。
+- 网关只透传明确允许的会话头（x-opencode-session、session-id、thread-id）及真实 User-Agent。兼容 ZCode 原生 x-session-id：缺少前两种会话头时，将其转换为 x-opencode-session，保留真实对话 ID。缺少稳定会话 ID 时在本地返回 400，不发送上游请求、不扣站点健康分。不同会话不会共享静态会话 ID。
 - 普通 HTTP 库的 User-Agent 会加上真实网关标识 ModelHarbor/1.0 via，不伪装 OpenCode 客户端。
 - Go 禁止通用 ping 生成探测。手动智商测试使用独立测试会话；自动测试仍须用户主动启用。
 - 界面显示 Go 订阅及上游额度（5 小时、本周、本订阅周期）；不把缺失余额显示为 $0.00。网关不会把失败的 Go 请求改投该站的余额 API。

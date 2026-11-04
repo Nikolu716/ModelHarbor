@@ -511,26 +511,66 @@ class VisualTestRunner:
         return dict(model=model, prompt=prompt.strip(), template_name=template_name,
                     max_output_tokens=limit, protocol=protocol, reasoning_effort=effort)
 
-    def _reserve(self, st):
+    def _reserve(self, st, *, quota_retry=False):
         now, name = time.time(), st.cfg.name
+        if st.native_usage_limited:
+            st.reconcile_usage_wait(self.registry.chatgpt.usage_view(st.cfg.chatgpt_account), now)
         if not self.accepting:
             raise HTTPException(409, "账号已切换，请刷新页面")
         if not st.enabled:
             raise HTTPException(409, "站点已停用，未发送请求")
-        if st.quota_exhausted:
+        if st.quota_exhausted and not (quota_retry and st.cfg.provider == "chatgpt"):
             raise HTTPException(409, "站点额度不可用，请先确认额度恢复")
-        wait = max(st.rate_limit_until, self.next_allowed.get(name, 0)) - now
+        last_retry = max(st.quota_at, st.quota_probe_at) + 60 if quota_retry else 0
+        wait = max(st.rate_limit_until, st.quota_resume_at if st.native_usage_limited else 0,
+                   self.next_allowed.get(name, 0), last_retry) - now
         if wait > 0:
             raise HTTPException(429, f"请等待 {math.ceil(wait)} 秒再测试", headers={"Retry-After": str(math.ceil(wait))})
         if st.status == "down" and now - st.down_since < self.gateway.cool_down:
             raise HTTPException(409, "站点仍在熔断冷却中，请稍后测试")
         sem = self.registry.ensure_semaphore(st)
-        if name in self.busy or len(self.busy) >= 2 or sem.locked():
+        if (name in self.busy or len(self.busy) >= 2 or sem.locked() or st.recovery_inflight
+                or st.generation_probe_lock.locked()
+                or st.native_usage_limited and self.registry.subscription_recovery_busy(st)):
             raise HTTPException(409, "测试正在进行或站点并发已满，请稍后重试")
         self.busy.add(name)
         self.next_allowed[name] = now + 15
 
-    async def run(self, st, body, client_ip, *, source="manual", _reserved=False):
+    async def retry_subscription(self, st, client_ip):
+        """One explicit recovery request; keep the last visual artifact intact."""
+        if st.cfg.provider != "chatgpt" or not st.quota_exhausted:
+            raise HTTPException(409, "仅对接入受限的 ChatGPT 订阅执行手动验证")
+        settings = self.validate(st, {"prompt": "Reply with only OK.", "template_name": "手动验证订阅接入"})
+        self._reserve(st, quota_retry=True)
+        name, task = st.cfg.name, asyncio.current_task()
+        self.tasks[name] = task
+        st.quota_probe_at = time.time()
+        native_recovery = st.native_usage_limited
+        if native_recovery:
+            st.recovery_inflight = True
+            st.quota_resume_at = max(st.quota_resume_at, st.quota_probe_at + st.native_retry_interval())
+            st.quota_wait_source = "gateway"
+        st._persist_state()
+        try:
+            result = await self.run(st, settings, client_ip, _reserved=True, _save_result=False)
+            if st.quota_exhausted:
+                st.quota_probe_at = time.time()
+                st.quota_probe_error = result["error"]
+                st._persist_state()
+        finally:
+            if native_recovery:
+                st.recovery_inflight = False
+            self.busy.discard(name)
+            if self.tasks.get(name) is task:
+                self.tasks.pop(name, None)
+        return {key: result.get(key) for key in ("ok", "model", "http_status", "error", "error_code", "request_id")} | {
+            "recovered": not st.quota_exhausted, "quota_exhausted": st.quota_exhausted,
+            "quota_error": st.quota_error, "quota_at": st.quota_at,
+            "next_allowed_at": max(self.next_allowed.get(st.cfg.name, 0), st.rate_limit_until, st.quota_resume_at),
+            "protection": st.protection_view(self.gateway, time.time()),
+        }
+
+    async def run(self, st, body, client_ip, *, source="manual", _reserved=False, _save_result=True):
         if st.cfg.provider == "chatgpt" and source != "manual":
             raise HTTPException(400, "ChatGPT 订阅仅支持手动智商测试，不发送后台定时生成请求")
         settings = self.validate(st, body)
@@ -540,6 +580,7 @@ class VisualTestRunner:
             settings[k] for k in ("model", "prompt", "template_name", "max_output_tokens", "protocol", "reasoning_effort"))
         now, name = time.time(), st.cfg.name
         sem = self.registry.ensure_semaphore(st)
+        quota_revision = st.quota_revision
         cfg = st.cfg
         if protocol == "auto":
             protocol = cfg.wire_api if cfg.wire_api in ("responses", "chat_completions") else (
@@ -588,7 +629,8 @@ class VisualTestRunner:
                       reasoning_effort=effort, effective_reasoning_effort=effective_effort,
                       prompt=prompt, template_name=template_name, max_output_tokens=limit,
                       created_at=now, client_ip=client_ip, source=source, ok=False, http_status=None,
-                      usage=None, raw_text="", artifact="", kind="", error="", truncated=False)
+                      usage=None, raw_text="", artifact="", kind="", error="", truncated=False,
+                      error_code="", request_id="")
         started = time.perf_counter()
         cancelled = False
         try:
@@ -599,12 +641,20 @@ class VisualTestRunner:
                 if cfg.provider == "chatgpt":
                     from .chatgpt import subscription_request, authorized_headers
                     payload.pop("max_output_tokens", None)
-                    payload = subscription_request(payload)
+                    if cfg.chatgpt_mode == "codex_cli":
+                        from .codex_inference import text_request
+                        payload = text_request(payload)
+                    elif cfg.chatgpt_mode == "codex_relay":
+                        from .codex_relay import relay_request
+                        payload = relay_request(payload)
+                    else:
+                        payload = subscription_request(payload)
                     headers = await authorized_headers(self.registry, cfg, headers)
                 async with client.stream("POST", inference_url(cfg, path, model), json=payload, headers=headers,
                                          follow_redirects=False, timeout=httpx.Timeout(connect=self.gateway.connect_timeout,
                                          read=120, write=15, pool=5)) as response:
                     result["http_status"] = response.status_code
+                    result["request_id"] = response.headers.get("x-request-id", "")
                     if response.status_code == 429:
                         wait = max(60, _retry_after_seconds(response.headers.get("retry-after")))
                         self.next_allowed[name] = time.time() + wait
@@ -623,8 +673,10 @@ class VisualTestRunner:
                             error_data = error_data.get("error", error_data)
                             detail = error_data.get("message", "") if isinstance(error_data, dict) else ""
                             if cfg.provider == "chatgpt" and isinstance(error_data, dict):
+                                result["error_code"] = error_data.get("code") or error_data.get("type") or ""
                                 from .errors import classify_error
                                 upstream_error = classify_error(name, response.status_code, json.dumps({"error": error_data}))
+                                upstream_error.retry_after_s = _retry_after_seconds(response.headers.get("retry-after"))
                                 if upstream_error.quota:
                                     st.mark_quota_exhausted(upstream_error)
                             if isinstance(detail, str) and detail:
@@ -645,10 +697,13 @@ class VisualTestRunner:
                             from .chatgpt import completed_response
                             completed, subscription_error = completed_response(bytes(raw))
                             if subscription_error:
+                                result["error_code"] = subscription_error.get("code") or subscription_error.get("type") or ""
                                 error = subscription_error.get("message") or subscription_error.get("code") or "ChatGPT 响应未完成"
-                                if subscription_error.get("code") == "subscription_sharing_usage_limit_exceeded":
-                                    from .errors import classify_error
-                                    st.mark_quota_exhausted(classify_error(name, 200, json.dumps({"error": subscription_error})))
+                                from .errors import classify_error
+                                classified = classify_error(name, 200, json.dumps({"error": subscription_error}))
+                                classified.retry_after_s = _retry_after_seconds(response.headers.get("retry-after"))
+                                if classified.quota:
+                                    st.mark_quota_exhausted(classified)
                         result["diagnostics"] = response_diagnostics(bytes(raw), response.headers.get("content-type", ""))
                         raw_response = raw.decode("utf-8", errors="replace")
                         for secret in [cfg.api_key, *cfg.headers.values()]:
@@ -683,7 +738,13 @@ class VisualTestRunner:
         result["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
         if self.registry.get(name) is not st or st.cfg is not cfg:
             raise HTTPException(409, "测试期间站点配置已变更，旧结果未保存；上游可能已计费")
-        self.store.save_result(st, result)
+        # A successful metadata read, an HTTP 200, or a partial SSE response is
+        # not proof of recovery. Subscription success requires response.completed.
+        # Do not clear a newer failure from a concurrent business request.
+        if cfg.provider == "chatgpt" and result["ok"] and st.quota_exhausted and st.quota_revision == quota_revision:
+            st.reset_quota()
+        if _save_result:
+            self.store.save_result(st, result)
         if cancelled:
             raise asyncio.CancelledError
         result["preview_html"] = preview_document(result["artifact"]) if result["artifact"] else ""

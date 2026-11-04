@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 from dataclasses import dataclass
 
 # 这些 HTTP 状态码视为站点侧问题，可切换下一站重试
@@ -70,6 +72,10 @@ class UpstreamError(Exception):
     retryable: bool = True
     quota: bool = False
     deterministic: bool = False
+    code: str = ""
+    resets_at: float = 0.0
+    retry_after_s: float = 0.0
+    limit_id: str = ""
 
     def __str__(self) -> str:
         code = self.status_code or "-"
@@ -85,7 +91,7 @@ def _extract_message(payload: bytes | str) -> str:
         return "(空响应体)"
     try:
         data = json.loads(payload)
-        err = data.get("error")
+        err = data.get("error") or (data.get("response") or {}).get("error")
         if isinstance(err, dict):
             msg = err.get("message")
             if msg:
@@ -124,15 +130,27 @@ def classify_error(station: str, status_code: int, payload: bytes | str = "") ->
     try:
         data = json.loads(payload)
         error = data.get("error") or (data.get("response") or {}).get("error") or {}
-        code = error.get("code") if isinstance(error, dict) else None
+        code = (error.get("code") or error.get("type")) if isinstance(error, dict) else None
     except (ValueError, TypeError, AttributeError):
-        code = None
+        code, error = None, {}
+    if code == "usage_limit_reached":
+        # Native Codex can report a usage limit inside an already-open stream.
+        def positive(value):
+            return float(value) if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and value > 0 else 0.0
+        reset = positive(error.get("resets_at") or error.get("reset_at"))
+        delay = positive(error.get("resets_in_seconds") or error.get("reset_in_seconds"))
+        if delay:
+            reset = max(reset, time.time() + delay)
+        return UpstreamError(station, status_code, f"{message} ({code})",
+                             retryable=True, quota=True, deterministic=True, code=code,
+                             resets_at=reset, retry_after_s=positive(error.get("retry_after_seconds")),
+                             limit_id=str(error.get("limit_id") or error.get("rate_limit_id") or "")[:128])
     if isinstance(code, str) and code.startswith(("subscription_sharing_", "chatpass_v2_")):
         quota = code == "subscription_sharing_usage_limit_exceeded"
         transient = code in {"subscription_sharing_usage_unavailable", "subscription_sharing_user_unavailable"}
         invalid_body = code == "subscription_sharing_unsupported_capability"
         return UpstreamError(station, status_code, f"{message} ({code})", retryable=not invalid_body,
-                             quota=quota, deterministic=not transient)
+                             quota=quota, deterministic=not transient, code=code)
     quota = _is_quota_error(status_code, lowered)
     if quota:
         # Funding/entitlement cannot recover through immediate retries. Other

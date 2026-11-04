@@ -20,6 +20,7 @@ import httpx
 from .config import GatewayConfig, StationConfig
 from . import juice
 from .errors import UpstreamError
+from .codex_limits import native_usage_error, metadata_wait, RETRY_INTERVAL, MAX_RETRY_INTERVAL
 from .http_cleanup import close_resource, protect_response
 from . import scoring
 
@@ -79,6 +80,12 @@ class StationState:
     quota_probe_at: float = 0.0
     quota_probe_error: str = ""
     quota_probe_backoff: float = 0.0
+    quota_code: str = ""
+    quota_limit_id: str = ""
+    quota_resume_at: float = 0.0
+    quota_wait_source: str = ""
+    quota_recovery_attempts: int = 0
+    quota_revision: int = 0
     last_probe_quota: bool = False
 
     # 429 限流短冷却（到点前不路由该站）
@@ -148,6 +155,8 @@ class StationState:
     def connection_signature(self):
         cfg = self.cfg
         values = [cfg.api_base, cfg.api_key, cfg.headers, cfg.provider, cfg.opencode_plan, cfg.wire_api, cfg.chatgpt_account]
+        if cfg.provider == "chatgpt" and cfg.chatgpt_mode != "shared":
+            values.append(cfg.chatgpt_mode)
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
     def durable_view(self):
@@ -155,7 +164,8 @@ class StationState:
                  'status', 'consecutive_failures', 'down_since', 'breaker_reason', 'breaker_source',
                  'breaker_status_code', 'ema_latency', 'ttft_ema', 'last_used_at',
                  'quota_exhausted', 'quota_error', 'quota_at', 'quota_source', 'quota_probe_at',
-                 'quota_probe_error', 'quota_probe_backoff', 'rate_limit_until', 'rate_limit_reason',
+                 'quota_probe_error', 'quota_probe_backoff', 'quota_code', 'quota_limit_id',
+                 'quota_resume_at', 'quota_wait_source', 'quota_recovery_attempts', 'quota_revision', 'rate_limit_until', 'rate_limit_reason',
                  'rate_limit_source', 'rate_limit_wait_source', 'go_usage_status', 'go_usage_error',
                  'go_usage_updated_at', 'go_usage_checked_at', 'go_usage_next_at', 'go_usage_retry_at', 'go_usage_failures')
         return {'signature': self.connection_signature(), 'saved_at': time.time(),
@@ -208,6 +218,12 @@ class StationState:
             self.legacy_score_samples = len(old_samples) if isinstance(old_samples, list) else 0
         if not 0 <= age < 86400:
             self.ema_latency = self.ttft_ema = None
+        # Older versions persisted native usage limits without a recovery date.
+        # Migrate relative to the actual failure, never postpone on every restart.
+        if self.native_usage_limited and not self.quota_resume_at:
+            self.quota_resume_at = max(self.quota_at + RETRY_INTERVAL, self.rate_limit_until)
+            self.quota_recovery_attempts = 1
+            self.quota_wait_source = "gateway"
         self._update_score()
 
     def _persist_state(self):
@@ -309,6 +325,8 @@ class StationState:
         elif self.quota_exhausted:
             kind, reason = "quota", self.quota_error
             source = self.quota_source
+            if self.native_usage_limited:
+                until = max(self.quota_resume_at, self.rate_limit_until)
         elif now < self.rate_limit_until:
             kind, reason = "rate_limited", self.rate_limit_reason or "上游返回 HTTP 429"
             source, until = self.rate_limit_source, self.rate_limit_until
@@ -324,8 +342,11 @@ class StationState:
             "until": until, "remaining_seconds": max(0, int(until - now + 0.999)),
             "failure_count": self.consecutive_failures,
             "threshold": gateway.fail_threshold,
-            "status_code": self.breaker_status_code if kind in {"breaker", "recovering"} else (429 if kind == "rate_limited" else None),
-            "wait_source": self.rate_limit_wait_source if kind == "rate_limited" else "",
+            "status_code": self.breaker_status_code if kind in {"breaker", "recovering"} else (429 if kind == "rate_limited" or self.native_usage_limited else None),
+            "wait_source": self.quota_wait_source if self.native_usage_limited else self.rate_limit_wait_source if kind == "rate_limited" else "",
+            "recovery_mode": "passive" if self.native_usage_limited else "",
+            "recovery_ready": self.native_usage_limited and now >= until and not self.recovery_inflight,
+            "recovery_inflight": self.recovery_inflight,
         }
 
     def recover_health(self) -> None:
@@ -393,7 +414,7 @@ class StationState:
 
     def record_success(self, latency_s: float, switched: bool = False, *, model: str = '',
                        path: str = '', stream: bool = False, counted: bool = False,
-                       signature: str | None = None) -> None:
+                       signature: str | None = None, quota_revision: int | None = None) -> None:
         if not counted:
             self.calls += 1
         if switched:
@@ -401,6 +422,8 @@ class StationState:
         if signature is not None and signature != self.connection_signature():
             self._persist_state()
             return
+        if self.native_usage_limited and quota_revision is not None and quota_revision == self.quota_revision:
+            self.reset_quota()
         # 成功即恢复健康
         self.recover_health()
         # EMA 平滑延迟
@@ -489,13 +512,40 @@ class StationState:
         self._persist_state()
 
     # ---------- 资金/配额与限流 ----------
+    @property
+    def native_usage_limited(self) -> bool:
+        return self.quota_exhausted and native_usage_error(self.cfg, self.quota_code, self.quota_error)
+
+    def native_retry_interval(self) -> float:
+        return min(MAX_RETRY_INTERVAL, RETRY_INTERVAL * 2 ** min(5, max(0, self.quota_recovery_attempts - 1)))
+
+    def reconcile_usage_wait(self, usage, now):
+        if not self.native_usage_limited:
+            return
+        until = metadata_wait(usage, self.quota_at, self.quota_limit_id, now)
+        if until > self.quota_resume_at:
+            self.quota_resume_at, self.quota_wait_source = until, "upstream"
+            self._persist_state()
+
     def mark_quota_exhausted(self, err: UpstreamError,
                              source: str = "request") -> None:
         """资金/配额问题：从路由排除，并由后台按来源自动探测恢复。"""
         first = not self.quota_exhausted
+        self.quota_revision += 1
         self.quota_exhausted = True
         self.quota_error = str(err)
         self.quota_at = time.time()
+        self.quota_code, self.quota_limit_id = err.code, err.limit_id
+        if self.native_usage_limited:
+            self.quota_recovery_attempts = min(6, self.quota_recovery_attempts + 1)
+            upstream_until = max(err.resets_at, self.quota_at + err.retry_after_s if err.retry_after_s else 0)
+            self.quota_wait_source = "upstream" if upstream_until > self.quota_at else "gateway"
+            self.quota_resume_at = (max(self.quota_at + 60, upstream_until) if upstream_until > self.quota_at
+                                    else self.quota_at + self.native_retry_interval())
+        else:
+            self.quota_resume_at = 0.0
+            self.quota_wait_source = ""
+            self.quota_recovery_attempts = 0
         if first or not self.quota_source:
             self.quota_source = source if source in {"models", "chat", "request"} else "request"
         if first:
@@ -528,6 +578,9 @@ class StationState:
         self.quota_probe_at = 0.0
         self.quota_probe_error = ""
         self.quota_probe_backoff = 0.0
+        self.quota_code = self.quota_limit_id = self.quota_wait_source = ""
+        self.quota_resume_at = 0.0
+        self.quota_recovery_attempts = 0
         self.last_probe_quota = False
         self.rate_limit_until = 0.0
         self.rate_limit_reason = self.rate_limit_source = self.rate_limit_wait_source = ""
@@ -789,7 +842,7 @@ class Registry:
         st = self.states[name]
         previous_signature = st.connection_signature()
         connection_changed = any(k in changes and changes[k] != getattr(st.cfg, k)
-                                 for k in ("base_url", "api_key", "provider", "opencode_plan", "chatgpt_account"))
+                                 for k in ("base_url", "api_key", "provider", "opencode_plan", "chatgpt_account", "chatgpt_mode"))
         st.cfg = dataclasses.replace(st.cfg, **changes)
         if previous_signature != st.connection_signature():
             st.health_samples.clear()
@@ -808,7 +861,7 @@ class Registry:
             st.enabled = st.cfg.enabled
             st._update_score()
         if any(k in changes for k in (
-                "base_url", "api_key", "headers", "probe_models", "provider", "opencode_plan", "chatgpt_account")):
+                "base_url", "api_key", "headers", "probe_models", "provider", "opencode_plan", "chatgpt_account", "chatgpt_mode")):
             st.probed_models.clear()
             st.probed_model_order.clear()
             st.model_api_paths.clear()
@@ -821,7 +874,8 @@ class Registry:
             st.models_discovery_error = ""
             st.models_discovery_failures = 0
         if any(k in changes for k in ("base_url", "api_key", "headers",
-                                      "timeout", "max_concurrency", "provider", "opencode_plan")):
+                                      "timeout", "max_concurrency", "provider", "opencode_plan",
+                                      "chatgpt_account", "chatgpt_mode")):
             if st.client is not None:
                 self.reset_client(st)
             if "max_concurrency" in changes:
@@ -845,7 +899,15 @@ class Registry:
                 write=30.0,
                 pool=10.0,
             )
+            transport = None
+            if state.cfg.provider == "chatgpt" and state.cfg.chatgpt_mode == "codex_cli":
+                from .codex_inference import CodexCLITransport
+                transport = CodexCLITransport(self.chatgpt, state.cfg)
+            elif state.cfg.provider == "chatgpt" and state.cfg.chatgpt_mode == "codex_relay":
+                from .codex_relay import CodexRelayTransport
+                transport = CodexRelayTransport(self.chatgpt, state.cfg)
             state.client = httpx.AsyncClient(
+                transport=transport,
                 timeout=timeout,
                 event_hooks={"response": [self._protect_response]},
                 limits=httpx.Limits(
@@ -928,6 +990,11 @@ class Registry:
         self._retired_clients.clear()
 
     # ---------- 健康/路由 ----------
+    def subscription_recovery_busy(self, state: StationState) -> bool:
+        return any(st.recovery_inflight and st.cfg.provider == "chatgpt"
+                   and st.cfg.chatgpt_account == state.cfg.chatgpt_account
+                   for st in self.states.values())
+
     def is_routeable(self, state: StationState, now: float | None = None) -> bool:
         """是否可作为路由候选：启用 + 无资金问题 + 未熔断（冷却中除外）。"""
         now = now or time.time()
@@ -935,8 +1002,13 @@ class Registry:
             state._update_score()
         if not state.enabled:
             return False
-        if state.quota_exhausted:
-            return False  # 余额不足/订阅到期：等额度恢复探测确认后再加入路由
+        if state.native_usage_limited:
+            state.reconcile_usage_wait(self.chatgpt.usage_view(state.cfg.chatgpt_account), now)
+            if (now < state.quota_resume_at or self.subscription_recovery_busy(state)
+                    or state.generation_probe_lock.locked()):
+                return False
+        elif state.quota_exhausted:
+            return False
         if now < state.rate_limit_until:
             return False  # 429 短冷却中
         if state.status == STATUS_DOWN:
@@ -966,6 +1038,8 @@ class Registry:
         route_activity = self.route_activity_snapshot(now)
         stations = []
         for st in self.states.values():
+            if st.native_usage_limited:
+                st.reconcile_usage_wait(self.chatgpt.usage_view(st.cfg.chatgpt_account), now)
             if st.score_refreshed_at and now - st.score_refreshed_at >= 1.0:
                 st._update_score()
             status = st.status
@@ -986,6 +1060,8 @@ class Registry:
                     "quota_probe_at": st.quota_probe_at,
                     "quota_probe_error": st.quota_probe_error,
                     "quota_probe_backoff": st.quota_probe_backoff,
+                    "quota_resume_at": st.quota_resume_at,
+                    "quota_code": st.quota_code,
                     "rate_limit_until": st.rate_limit_until,
                     "health_score": round(st.health_score, 1) if st.health_score is not None else None,
                     "health_score_breakdown": dict(st.score_breakdown),
@@ -1019,9 +1095,10 @@ class Registry:
                     "provider": st.cfg.provider,
                     "opencode_plan": st.cfg.opencode_plan,
                     "go_usage": st.go_usage_view(),
-                    "chatgpt": self.chatgpt.store.view(st.cfg.chatgpt_account) if st.cfg.provider == "chatgpt" else None,
+                    "chatgpt": self.chatgpt.profile_view(st.cfg.chatgpt_account, st.cfg.chatgpt_mode) if st.cfg.provider == "chatgpt" else None,
                     "chatgpt_usage": self.chatgpt.usage_view(st.cfg.chatgpt_account) if st.cfg.provider == "chatgpt" else None,
                     "chatgpt_account": st.cfg.chatgpt_account,
+                    "chatgpt_mode": st.cfg.chatgpt_mode,
                     "model_api_paths": st.protocol_view(),
                     "model_display_names": dict(st.model_display_names),
                     "probe_model_candidates": list(st.probe_model_candidates),

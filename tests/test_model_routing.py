@@ -11,7 +11,7 @@ from app import __version__
 from app.config import GatewayConfig, StationConfig
 from app.errors import UpstreamError
 from app.health import HealthMonitor
-from app.providers import inference_headers, opencode_capabilities
+from app.providers import MissingOpenCodeSession, inference_headers, opencode_capabilities
 from app.proxy import OpenAIProxy
 from app.state import Registry
 from app.stats import EventLog
@@ -104,6 +104,50 @@ class GoRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.requests), 8)
         for request in self.requests:
             self.assertEqual(request.headers["session-id"], "s-" + json.loads(request.content)["input"])
+
+    async def test_zcode_session_works_for_chat_json_and_stream(self):
+        for stream in (False, True):
+            body = {"model": "glm-test", "messages": [{"role": "user", "content": "Hello"}], "stream": stream}
+            response = await self.proxy._dispatch(Request(body, {
+                "X-Session-Id": "zcode-conversation", "user-agent": "ZCode/0.16.5",
+                "x-request-id": "changes-each-request", "authorization": "Bearer gateway-private",
+            }), "/chat/completions")
+            self.assertEqual(response.status_code, 200)
+            if stream:
+                _ = b"".join([part async for part in response.body_iterator])
+            sent = self.requests[-1]
+            self.assertEqual(sent.headers["x-opencode-session"], "zcode-conversation")
+            self.assertEqual(sent.headers["user-agent"], "ZCode/0.16.5")
+            self.assertEqual(sent.headers["authorization"], "Bearer fake-provider-key")
+            self.assertEqual(json.loads(sent.content), body)
+            self.assertNotIn("x-session-id", sent.headers)
+            self.assertNotIn("x-request-id", sent.headers)
+        self.assertEqual(self.registry.route_activity_snapshot()["inflight"], 0)
+
+    async def test_zcode_concurrent_sessions_remain_separate(self):
+        await asyncio.gather(*(self.proxy._dispatch(
+            Request({"model": "glm-test", "input": str(i)}, {"x-session-id": "zcode-" + str(i)}),
+            "/responses") for i in range(8)))
+        self.assertEqual(len(self.requests), 8)
+        for request in self.requests:
+            self.assertEqual(request.headers["x-opencode-session"], "zcode-" + json.loads(request.content)["input"])
+
+    def test_native_session_takes_precedence_over_zcode_alias(self):
+        for name in ("session-id", "x-opencode-session"):
+            headers = inference_headers(self.station.cfg, {name: "native-session", "x-session-id": "alias"})
+            self.assertEqual(headers[name], "native-session")
+            self.assertNotIn("x-session-id", headers)
+            if name == "session-id":
+                self.assertNotIn("x-opencode-session", headers)
+
+    def test_zcode_alias_does_not_allow_blank_or_configured_sessions(self):
+        self.station.cfg.headers = {"X-Session-Id": "static-must-not-reuse"}
+        for context in ({}, {"x-session-id": "   "}, {"x-request-id": "request-only"}):
+            with self.assertRaises(MissingOpenCodeSession):
+                inference_headers(self.station.cfg, context)
+        headers = inference_headers(self.station.cfg, {"x-session-id": "real-session"}, test_session="test-only")
+        self.assertEqual(headers["x-opencode-session"], "test-only")
+        self.assertNotIn("X-Session-Id", headers)
 
     async def test_missing_session_is_local_for_json_and_stream_with_no_health_penalty(self):
         for stream in (False, True):

@@ -1,7 +1,8 @@
 """Optional official Codex app-server bridge for account limits and reset credits.
 
-This process never runs a model turn. It uses its own protected CODEX_HOME and
-never reads, changes, or logs the developer's existing Codex credentials.
+This app-server process owns native authentication and reads account metadata.
+The optional protocol relay and CLI text adapter use this profile's protected
+CODEX_HOME. Neither path reads the developer's unrelated Codex credentials.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ def codex_executable():
                 continue
         return str(executable)
     raise ChatGPTAuthError(
-        "读取重置卡需要受信任的官方 Codex CLI。请将 OpenAI 签名的 codex.exe 安装到 Program Files，"
+        "此功能需要受信任的官方 Codex CLI。请将 OpenAI 签名的 codex.exe 安装到 Program Files，"
         "并设置 MODELHARBOR_CODEX_PATH 指向该文件。")
 
 
@@ -85,7 +86,7 @@ exit 1
 class CodexAccount:
     def __init__(self, directory, expected_email):
         self.directory = Path(directory).resolve()
-        self.expected_email = expected_email.casefold()
+        self.expected_email = expected_email.strip().casefold()
         self.process = None
         self.reader = None
         self.counter = 0
@@ -190,8 +191,12 @@ class CodexAccount:
                         else:
                             future.set_result(message.get("result") or {})
                 elif message.get("method") == "account/login/completed":
-                    success = (message.get("params") or {}).get("success", False)
-                    self.login = {"status": "completed" if success else "failed"}
+                    params = message.get("params") or {}
+                    if (self.login and self.login.get("status") in ("starting", "pending")
+                            and (not self.login.get("login_id") or not params.get("loginId")
+                                 or self.login['login_id'] == params['loginId'])):
+                        self.login.update(status="completed" if params.get("success") else "failed",
+                                          login_id=params.get("loginId") or self.login.get("login_id"))
         except (ValueError, OSError, asyncio.CancelledError):
             pass
         finally:
@@ -202,21 +207,76 @@ class CodexAccount:
     async def _account(self):
         response = await self.rpc("account/read", {"refreshToken": False})
         account = response.get("account") or {}
-        if account.get("type") != "chatgpt" or not account.get("email"):
-            raise ChatGPTAuthError("请先连接 Codex 用量与重置卡")
-        if account["email"].casefold() != self.expected_email:
+        if account.get("type") != "chatgpt" or not isinstance(account.get("email"), str) or not account["email"].strip():
+            raise ChatGPTAuthError("请先绑定 Codex 账号")
+        if self.expected_email and account["email"].strip().casefold() != self.expected_email:
             await self.rpc("account/logout")
             raise ChatGPTAuthError("Codex 登录账号与本站 ChatGPT 账号不同，请使用同一个账号")
         return account
+
+    async def inference_credentials(self):
+        """Read this profile's native token; only official Codex may refresh it."""
+        async with self.operation_lock:
+            await self._account()
+            def read():
+                try:
+                    record = json.loads((self.directory / "auth.json").read_text(encoding="utf-8"))
+                    tokens = record.get("tokens") or {}
+                    token, account_id = tokens.get("access_token"), tokens.get("account_id")
+                    if (record.get("auth_mode") not in (None, "chatgpt") or not isinstance(token, str)
+                            or not token or not isinstance(account_id, str) or not account_id):
+                        raise ValueError()
+                    import base64
+                    payload = token.split(".")[1]
+                    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+                    expiry = claims.get("exp", 0)
+                    import math
+                    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)) or not math.isfinite(expiry):
+                        raise ValueError()
+                    return token, account_id, expiry
+                except (OSError, ValueError, TypeError, IndexError, AttributeError):
+                    raise ChatGPTAuthError("Codex 登录凭据不可用，请在用量面板检查官方登录") from None
+            token, account_id, expiry = await asyncio.to_thread(read)
+            if expiry <= time.time() + 90:
+                # Never implement a second refresh-token lifecycle alongside CLI.
+                await self.rpc("account/read", {"refreshToken": True})
+                token, account_id, expiry = await asyncio.to_thread(read)
+                if expiry <= time.time():
+                    raise ChatGPTAuthError("Codex 授权已过期，请在用量面板重新授权")
+            return token, account_id
 
     async def begin_login(self):
         async with self.operation_lock:
             if self.login and self.login.get("status") == "pending" and self.login.get("expires_at", 0) > time.time():
                 return self.login
-            result = await self.rpc("account/login/start", {"type": "chatgptDeviceCode"})
-            self.login = {"status": "pending", "verification_url": result.get("verificationUrl"),
-                          "user_code": result.get("userCode"), "expires_at": time.time() + 900}
+            if self.login and self.login.get("status") == "pending" and self.login.get("login_id"):
+                await self.rpc("account/login/cancel", {"loginId": self.login['login_id']})
+            self.login = {"status": "starting"}
+            try:
+                result = await self.rpc("account/login/start", {"type": "chatgptDeviceCode"})
+                if (result.get("verificationUrl") != "https://auth.openai.com/codex/device"
+                        or not isinstance(result.get("userCode"), str) or not result['userCode'].strip()
+                        or not isinstance(result.get("loginId"), str) or not result['loginId']):
+                    raise ChatGPTAuthError("官方未返回有效的设备验证码，请检查 Codex CLI 后重试")
+            except BaseException:
+                self.login = None
+                raise
+            completed = self.login.get('status') if (self.login.get('status') in ('completed', 'failed')
+                and self.login.get('login_id') == result['loginId']) else 'pending'
+            self.login = {"status": completed, "verification_url": result['verificationUrl'],
+                          "user_code": result['userCode'], "login_id": result.get('loginId'),
+                          "expires_at": time.time() + 900}
             return self.login
+
+    async def cancel_login(self):
+        async with self.operation_lock:
+            if self.login and self.login.get('status') in ('starting', 'pending') and self.login.get('login_id'):
+                try:
+                    await asyncio.wait_for(self.rpc('account/login/cancel', {'loginId': self.login['login_id']}), 5)
+                except (ChatGPTAuthError, OSError, TimeoutError):
+                    pass
+            self.login = {'status': 'cancelled'}
+            await self.close()
 
     async def refresh(self):
         async with self.operation_lock:
@@ -227,19 +287,21 @@ class CodexAccount:
             account = await self._account()
             result = await self.rpc("account/rateLimits/read")
             buckets = result.get("rateLimitsByLimitId") or {"codex": result.get("rateLimits") or {}}
-            windows = []
+            windows, limits = [], []
             for name, bucket in buckets.items():
                 if not isinstance(bucket, dict):
                     continue
+                limit_id = bucket.get("limitId") or name
+                limits.append({"limit_id": limit_id, "reached_type": bucket.get("rateLimitReachedType")})
                 for key in ("primary", "secondary"):
                     value = bucket.get(key)
                     if isinstance(value, dict):
-                        windows.append({"name": bucket.get("limitName") or name, "window": key,
+                        windows.append({"name": bucket.get("limitName") or name, "limit_id": limit_id, "window": key,
                                         "used_percent": value.get("usedPercent"), "duration_mins": value.get("windowDurationMins"),
                                         "resets_at": value.get("resetsAt")})
             credits = result.get("rateLimitResetCredits")
             self.cache.update(status="connected", plan=account.get("planType"), email=account.get("email"),
-                              windows=windows, updated_at=time.time(), reset_credits=credits if isinstance(credits, dict) else None)
+                              windows=windows, limits=limits, updated_at=time.time(), reset_credits=credits if isinstance(credits, dict) else None)
             self.cache["checked_at"] = time.time()
             self.cache.pop("error", None)
             self.failures = 0

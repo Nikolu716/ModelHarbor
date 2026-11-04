@@ -81,6 +81,7 @@ def dataclass_to_dict(cfg: StationConfig) -> dict:
         "provider": cfg.provider,
         "opencode_plan": cfg.opencode_plan,
         "chatgpt_account": cfg.chatgpt_account,
+        "chatgpt_mode": cfg.chatgpt_mode,
         "priority": cfg.priority,
         "priority_auto": cfg.priority_auto,
         "weight": cfg.weight,

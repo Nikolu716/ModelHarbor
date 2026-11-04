@@ -34,18 +34,25 @@
 
   function update() {
     const profile = el("sf-chatgpt-account").value;
-    const linked = current();
     if (usageProfile && usageProfile !== profile) {
       usageProfile = "";
       el("sf-chatgpt-usage").hidden = true;
       el("sf-chatgpt-windows").replaceChildren();
       el("sf-chatgpt-credits").replaceChildren();
     }
+    if (el('sf-provider').value === 'chatgpt' && ['codex_relay', 'codex_cli'].includes(el('sf-chatgpt-mode').value)) {
+      window.ModelHarborCodexBinding?.update();
+      return;
+    }
+    const linked = current();
     el("sf-chatgpt-email").textContent = linked?.email || (profile ? "等待授权确认" : "");
-    el("sf-chatgpt-status").textContent = linked?.connected ? "已连接" : linked ? "需要重新授权" : profile ? "已授权 · 保存站点后生效" : "尚未授权";
+    const sharingConnected = linked?.shared_connected ?? linked?.connected;
+    el('sf-chatgpt-plan').hidden = true;
+    el('sf-chatgpt-help').textContent = '使用官方 OAuth 登录订阅共享接口；Codex 账号可通过接入方式单独绑定。';
+    el("sf-chatgpt-status").textContent = sharingConnected ? "已连接" : linked ? "需要重新授权" : profile ? "已授权 · 保存站点后生效" : "尚未授权";
     el("sf-chatgpt-login").disabled = loginBusy;
     el("sf-chatgpt-login").textContent = loginBusy ? "等待官方授权…" : profile ? "重新授权 / 切换账号" : "Continue with ChatGPT";
-    el("sf-chatgpt-usage-link").disabled = !linked?.connected || usageBusy;
+    el("sf-chatgpt-usage-link").disabled = !sharingConnected || usageBusy;
     el("sf-chatgpt-usage-link").textContent = "查看订阅用量";
   }
 
@@ -105,6 +112,7 @@
       renderUsage(data);
       update();
     } catch (error) {
+      if (profile !== el("sf-chatgpt-account").value) return;
       renderUsage({status: "error"});
       el("sf-chatgpt-usage-status").textContent = error.message;
     }
@@ -134,6 +142,9 @@
   }
 
   async function connect() {
+    if (el('sf-provider').value === 'chatgpt' && ['codex_relay', 'codex_cli'].includes(el('sf-chatgpt-mode').value)) {
+      return window.ModelHarborCodexBinding?.connect();
+    }
     if (loginBusy) return;
     loginBusy = true;
     update();

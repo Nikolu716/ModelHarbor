@@ -31,7 +31,7 @@ from .errors import (
 )
 from .router import Router, RoutePermit
 from .http_cleanup import close_resource, protect_response, CLOSE_TIMEOUT
-from .state import Registry, StationState
+from .state import Registry, StationState, STATUS_DOWN
 from .stats import EventLog
 from .wire import ChatStreamToResponsesTranslator, NamespaceMemory, chat_to_responses, prepare_request
 from .health import _retry_after_seconds
@@ -267,11 +267,20 @@ def _chunk_has_content(chunk: bytes) -> bool:
             return True
         if obj.get("type") == "response.output_text.done":
             return True
+        if obj.get("type") in {"response.function_call_arguments.delta", "response.function_call_arguments.done",
+                               "response.custom_tool_call_input.delta", "response.custom_tool_call_input.done",
+                               "response.completed", "response.failed", "response.incomplete"}:
+            return True
+        if (obj.get("type") in {"response.output_item.added", "response.output_item.done"}
+                and (obj.get("item") or {}).get("type") in {"function_call", "custom_tool_call", "tool_search_call"}):
+            return True
         # chat 流式 chunk
         choices = obj.get("choices")
         if isinstance(choices, list) and choices:
             delta = choices[0].get("delta")
             if isinstance(delta, dict):
+                if delta.get("tool_calls") or delta.get("function_call"):
+                    return True
                 content = delta.get("content")
                 if isinstance(content, str) and content:
                     return True
@@ -510,6 +519,8 @@ class _StreamUsageParser:
             response = obj.get('response') or {}
             response = response if isinstance(response, dict) else {}
             err = obj.get('error') or response.get('error')
+            if not err and obj.get('type') == 'error':
+                err = obj
             incomplete = response.get('incomplete_details') or {}
             expected_stop = (isinstance(incomplete, dict)
                              and incomplete.get('reason') in ('max_output_tokens', 'content_filter'))
@@ -701,7 +712,10 @@ class OpenAIProxy:
         if isinstance(result, JSONResponse) and result.status_code >= 400:
             payload = json.loads(result.body)
             message = (payload.get("error") or {}).get("message", "请求失败")
-            return JSONResponse(status_code=result.status_code, content=error_body(result.status_code, message, path))
+            response = JSONResponse(status_code=result.status_code, content=error_body(result.status_code, message, path))
+            if "retry-after" in result.headers:
+                response.headers["Retry-After"] = result.headers["retry-after"]
+            return response
         return result
 
     async def messages(self, request: Request):
@@ -731,16 +745,41 @@ class OpenAIProxy:
         rate-limited, or otherwise unhealthy.  An empty result therefore does
         not necessarily mean that the model is unsupported: it can also mean
         that every eligible station is temporarily unavailable.  Keep quota
-        exhausted and explicitly disabled stations out of this check because
-        those require operator action rather than blind retries.
+        exhausted and explicitly disabled stations out of this check. Native
+        subscription recovery is eligible only after its waiting period.
         """
         for st in self.registry.states.values():
-            if not st.enabled or st.quota_exhausted:
+            if not self._station_retryable(st):
                 continue
             if (self._station_matches_model(st, model, path)
                     or self._model_discovery_unresolved(st)):
                 return True
         return False
+
+    def _station_retryable(self, st: StationState) -> bool:
+        return st.enabled and (not st.quota_exhausted
+                               or st.native_usage_limited and self.registry.is_routeable(st))
+
+    def _native_usage_wait_response(self, stations) -> JSONResponse | None:
+        """A known usage wait is a 429, not an invalid model or retry loop."""
+        limited = [st for st in stations if st.enabled and st.native_usage_limited]
+        if not limited:
+            return None
+        now = time.time()
+        waits = []
+        for st in limited:
+            # Reconcile fresh official metadata before returning the wait.
+            self.registry.is_routeable(st, now)
+            until = max(st.quota_resume_at, st.rate_limit_until,
+                        st.recovery_attempt_at + max(1.0, self.gateway.cool_down))
+            if st.status == STATUS_DOWN:
+                until = max(until, st.down_since + self.gateway.cool_down)
+            waits.append(max(1, math.ceil(until - now)))
+        response = _error_response(
+            429, "匹配渠道受上游用量限制，正在等待恢复或验证；请按 Retry-After 稍后重试",
+            "rate_limit_error")
+        response.headers["Retry-After"] = str(min(waits))
+        return response
 
     @staticmethod
     def _station_matches_model(st: StationState, model: str, path: str | None = None) -> bool:
@@ -761,7 +800,7 @@ class OpenAIProxy:
             st for st in self.registry.states.values()
             if self._station_matches_model(st, model, path)
         ]
-        if any(st.enabled and not st.quota_exhausted for st in matching):
+        if any(self._station_retryable(st) for st in matching):
             return None
 
         # Immediately after startup, probed model lists are empty while the
@@ -775,6 +814,9 @@ class OpenAIProxy:
         ):
             return None
 
+        waiting = self._native_usage_wait_response(matching)
+        if waiting is not None:
+            return waiting
         if matching:
             return _error_response(
                 422,
@@ -792,12 +834,15 @@ class OpenAIProxy:
         matching = [self.registry.states[target['station']] for target in targets
                     if target['station'] in self.registry.states and supports_mapping(
                         self.registry.states[target['station']], target['model'], path)]
-        if any(st.enabled and not st.quota_exhausted for st in matching):
+        if any(self._station_retryable(st) for st in matching):
             return None
+        waiting = self._native_usage_wait_response(matching)
+        if waiting is not None:
+            return waiting
         return _error_response(422, '映射规则指定的渠道已停用、额度不可用、模型已移除或协议不兼容；请检查当前账号的模型映射', 'invalid_request_error')
 
     def _mapping_retryable(self, targets, path):
-        return any(st.enabled and not st.quota_exhausted and supports_mapping(st, targets[name], path)
+        return any(self._station_retryable(st) and supports_mapping(st, targets[name], path)
                    for name, st in self.registry.states.items() if name in targets)
 
     def _round_delay(self, round_index: int) -> float:
@@ -931,6 +976,13 @@ class OpenAIProxy:
                 return failure(
                     model, self._retry_timeout_response(max_retry_seconds), total_attempts)
             total_attempts += getattr(result, "_zg_attempts", 0)
+            if result.status_code == 502:
+                # A trial may just have renewed the usage wait, or another
+                # real request may have acquired the single recovery permit.
+                blocked = (self._mapping_precondition_error(mapping, path) if mapping is not None
+                           else self._routing_precondition_error(model, path))
+                if blocked is not None and blocked.status_code == 429:
+                    return failure(model, blocked, total_attempts)
             if getattr(result, "status_code", 0) != 502:
                 # 参数类 400（如 reasoning effort 不被该站支持）：剥离参数降级重试一次
                 if result.status_code == 400 and not body.subscription_attempts and _is_param_error(result):
@@ -1036,6 +1088,8 @@ class OpenAIProxy:
         self._record_request_failure(st, err, **evidence)
         if evidence.get('signature') is not None and evidence['signature'] != st.connection_signature():
             return err
+        wait = _retry_after_seconds(retry_after)
+        err.retry_after_s = max(err.retry_after_s, wait)
         if err.quota:
             st.mark_quota_exhausted(err)
             if self.notifier is not None:
@@ -1043,7 +1097,6 @@ class OpenAIProxy:
                     "station_quota", st.cfg.name,
                     f"配额问题: {err.message[:120]}（请检查对应计费入口与额度，恢复方式以站点策略为准）"))
         if err.status_code == 429:
-            wait = _retry_after_seconds(retry_after)
             st.mark_rate_limited(max(self.gateway.rate_limit_cooldown, wait), reason=str(err),
                                 source='request', wait_source='upstream' if wait > self.gateway.rate_limit_cooldown else 'gateway')
         return err
@@ -1174,7 +1227,7 @@ class OpenAIProxy:
                             completed, subscription_error = None, {"message": "ChatGPT 返回了无效的 Responses 事件流"}
                         if subscription_error:
                             err = self._handle_failure(st, classify_error(st.cfg.name, 200, json.dumps({"error": subscription_error})),
-                                                       model=model, path=target_path, signature=signature)
+                                                       retry_after=resp.headers.get('retry-after'), model=model, path=target_path, signature=signature)
                             route_error = str(err)
                             attempts.append(str(err))
                             has_transient |= not err.deterministic
@@ -1182,7 +1235,7 @@ class OpenAIProxy:
                         body_bytes = json.dumps(completed, ensure_ascii=False).encode()
                     if _looks_like_error(body_bytes):
                         err = self._handle_failure(st, classify_error(st.cfg.name, 200, body_bytes),
-                                                   model=model, path=target_path, signature=signature)
+                                                   retry_after=resp.headers.get('retry-after'), model=model, path=target_path, signature=signature)
                         route_error = str(err)
                         attempts.append(str(err))
                         has_transient |= not err.deterministic
@@ -1208,7 +1261,7 @@ class OpenAIProxy:
                             attempts.append(f'[{st.cfg.name}] {route_error}')
                             has_transient = True
                             continue
-                    st.record_success(latency / 1000, switched=switched, model=model, path=target_path, signature=signature)
+                    st.record_success(latency / 1000, switched=switched, model=model, path=target_path, signature=signature, quota_revision=permit.quota_revision)
                     self.eventlog.add(st.cfg.name, model, True, latency,
                                       detail, attempts=len(attempts) + 1,
                                       client_ip=client_ip, route_id=route_id, **log_mapping,
@@ -1543,11 +1596,11 @@ class OpenAIProxy:
                             f"上游 {st.cfg.name} 流中断: {type(e).__name__}", path)
                     finally:
                         if stream_outcome == "success":
-                            st.record_success(latency / 1000, model=model, path=target_path, stream=True, counted=True, signature=signature)
+                            st.record_success(latency / 1000, model=model, path=target_path, stream=True, counted=True, signature=signature, quota_revision=permit.quota_revision)
                         elif stream_outcome == "stream_error":
                             err = (classify_error(st.cfg.name, 200, usage_parser.error_payload)
                                    if usage_parser.error_payload else connect_error(st.cfg.name, stream_error))
-                            self._handle_failure(st, err, model=model, path=target_path, stream=True,
+                            self._handle_failure(st, err, retry_after=resp.headers.get('retry-after'), model=model, path=target_path, stream=True,
                                                  counted=True, switched=False, signature=signature)
                         # Bookkeeping only: the upstream socket must be closed
                         # from an independent task, because this generator may

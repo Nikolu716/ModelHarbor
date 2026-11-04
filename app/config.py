@@ -141,6 +141,7 @@ class StationConfig:
     provider: str = "openai"  # openai-compatible or OpenCode's documented native endpoints.
     opencode_plan: str = "balance"  # balance / go; never fall back between billing sources.
     chatgpt_account: str = ""  # Opaque reference to a protected account-scoped OAuth record.
+    chatgpt_mode: str = "shared"  # shared / codex_cli / codex_relay; explicitly selected.
     priority: int = 5
     priority_auto: bool = False  # Legacy stations keep their manual score bias.
     weight: float = 1.0
@@ -202,6 +203,8 @@ class StationConfig:
             kw.setdefault("base_url", "https://api.openai.com/v1")
             kw.setdefault("api_key", "")
         cfg = cls(name=name, **kw)
+        if cfg.chatgpt_mode not in ("shared", "codex_cli", "codex_relay"):
+            raise ValueError("ChatGPT 接入模式必须是 shared、codex_cli 或 codex_relay")
         if cfg.provider not in ("openai", "opencode", "anthropic", "gemini", "chatgpt"):
             raise ValueError("不支持的站点接口类型")
         if cfg.provider == "chatgpt":

@@ -357,6 +357,12 @@ def prepare_request(st, path: str, body: dict, *, allow_tools: bool = False):
     if st.cfg.provider == "chatgpt":
         if path != "/responses":
             raise UnsupportedWireRequest("ChatGPT 订阅站点请使用 /v1/responses 接口。")
+        if st.cfg.chatgpt_mode == "codex_cli":
+            from .codex_inference import text_request
+            return path, text_request(inject_params(body, st.cfg.inject)), None
+        if st.cfg.chatgpt_mode == "codex_relay":
+            from .codex_relay import relay_request
+            return path, relay_request(inject_params(body, st.cfg.inject)), None
         from .chatgpt import subscription_request
         return path, subscription_request(inject_params(body, st.cfg.inject)), None
     if path == MESSAGES or path in GEMINI_PATHS:

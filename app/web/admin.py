@@ -111,6 +111,29 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @api.post("/chatgpt/codex/login")
+    async def bind_codex(body: dict | None = None):
+        if body:
+            raise HTTPException(400, "Codex 绑定不接收账号密码或已有渠道凭据，请在官方页面登录")
+        try:
+            return await registry.chatgpt.bindings.start()
+        except (ValueError, OSError) as exc:
+            raise HTTPException(400, str(exc) if isinstance(exc, ValueError) else "无法启动官方 Codex 登录") from exc
+
+    @api.get("/chatgpt/codex/login/{login_id}")
+    async def codex_binding_status(login_id: str):
+        try:
+            return await registry.chatgpt.bindings.status(login_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @api.delete("/chatgpt/codex/login/{login_id}")
+    async def cancel_codex_binding(login_id: str):
+        try:
+            return await registry.chatgpt.bindings.cancel(login_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
     @api.post("/chatgpt/profile/{profile}/codex-login")
     async def chatgpt_codex_login(profile: str):
         try:
@@ -263,7 +286,8 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             "opencode_plan": cfg.opencode_plan,
             "go_usage": st.go_usage_view(),
             "chatgpt_account": cfg.chatgpt_account,
-            "chatgpt": registry.chatgpt.store.view(cfg.chatgpt_account) if cfg.provider == "chatgpt" else None,
+            "chatgpt_mode": cfg.chatgpt_mode,
+            "chatgpt": registry.chatgpt.profile_view(cfg.chatgpt_account, cfg.chatgpt_mode) if cfg.provider == "chatgpt" else None,
             "chatgpt_usage": registry.chatgpt.usage_view(cfg.chatgpt_account) if cfg.provider == "chatgpt" else None,
             "model_api_paths": st.protocol_view(),
             "model_display_names": dict(st.model_display_names),
@@ -294,6 +318,11 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             "status": runtime["status"],
             "protection": runtime["protection"],
             "quota_exhausted": runtime["quota_exhausted"],
+            "quota_error": runtime["quota_error"],
+            "quota_at": runtime["quota_at"],
+            "quota_resume_at": runtime["quota_resume_at"],
+            "quota_probe_at": runtime["quota_probe_at"],
+            "quota_code": runtime["quota_code"],
             "last_probe_ok": runtime["last_probe_ok"],
             "last_probe_kind": runtime["last_probe_kind"],
             "last_probe_error": runtime["last_probe_error"],
@@ -653,13 +682,12 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
 
     @api.post("/station/{name}/reset")
     async def reset(name: str):
-        """立即探测额度是否恢复；仍无额度则保持排除并继续自动探测。
-
-        后台默认会自动探测，此接口只是立刻再探一次，无需再手动点。
-        """
+        """Manually check recovery according to the provider's probe policy."""
         st = registry.get(name)
         if st is None:
             raise HTTPException(404, f"中转站不存在: {name}")
+        if st.cfg.provider == "chatgpt":
+            raise HTTPException(409, "ChatGPT 订阅不发送后台探测。请打开用量详情，查看官方用量或手动验证一次订阅接入；刷新用量不会解除保护。")
         st.last_probe_at = 0.0
         if not st.enabled:
             st.reset_quota()
@@ -678,6 +706,15 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             "probe_ok": st.last_probe_ok,
             "probe_error": st.last_probe_error or st.quota_probe_error,
         }
+
+    @api.post("/station/{name}/subscription-retry")
+    async def retry_subscription(name: str, body: dict, request: Request):
+        if set(body) != {"confirmed"} or body.get("confirmed") is not True:
+            raise HTTPException(400, "请确认发送一次可能消耗订阅用量的验证请求")
+        st = registry.get(name)
+        if st is None:
+            raise HTTPException(404, f"中转站不存在: {name}")
+        return await visual_runner.retry_subscription(st, request.client.host if request.client else None)
 
     @api.get("/logs")
     async def logs(
@@ -761,8 +798,8 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         body.setdefault("model_routing", "catalog")
         body.setdefault("priority_auto", "priority" not in body)
         cfg = _validated_station(body.get("name"), _station_body(body))
-        if cfg.provider == "chatgpt" and cfg.chatgpt_account and not registry.chatgpt.store.view(cfg.chatgpt_account)["connected"]:
-            raise HTTPException(400, "请先完成 ChatGPT 官方授权")
+        if cfg.provider == "chatgpt" and not registry.chatgpt.profile_view(cfg.chatgpt_account, cfg.chatgpt_mode)["connected"]:
+            raise HTTPException(400, "请先完成 Codex 账号绑定" if cfg.chatgpt_mode != 'shared' else "请先完成 ChatGPT 官方授权")
         name = cfg.name
         if any(existing.casefold() == name.casefold()
                for existing in registry.states):
@@ -778,6 +815,8 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                 except OSError as rollback_error:
                     print(f"[stations] 新增运行态失败且持久化回滚失败: {rollback_error}")
             raise HTTPException(500, "站点运行时加载失败，配置已回滚") from exc
+        if cfg.provider == 'chatgpt' and cfg.chatgpt_mode != 'shared':
+            registry.chatgpt.bindings.claim_profile(cfg.chatgpt_account)
         st.last_probe_at = 0.0  # 健康监控下一轮自动探测，不阻塞保存反馈
         _wake_monitor()
         print(f"[admin] 新增站点: {name}")
@@ -807,8 +846,10 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         if renaming and any(existing != name and existing.casefold() == candidate.name.casefold()
                             for existing in registry.states):
             raise HTTPException(409, "渠道名称已存在")
-        if candidate.provider == "chatgpt" and candidate.chatgpt_account != current.cfg.chatgpt_account and not registry.chatgpt.store.view(candidate.chatgpt_account)["connected"]:
-            raise HTTPException(400, "请先完成 ChatGPT 官方授权")
+        if (candidate.provider == "chatgpt" and (candidate.chatgpt_account != current.cfg.chatgpt_account
+                or candidate.chatgpt_mode != current.cfg.chatgpt_mode or current.cfg.provider != 'chatgpt')
+                and not registry.chatgpt.profile_view(candidate.chatgpt_account, candidate.chatgpt_mode)["connected"]):
+            raise HTTPException(400, "请先完成 Codex 账号绑定" if candidate.chatgpt_mode != 'shared' else "请先完成 ChatGPT 官方授权")
         normalized_changes = {
             field: getattr(candidate, field)
             for field in station_fields
@@ -823,7 +864,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
                 "unchanged": True,
             }
         transport_fields = {
-            "base_url", "api_key", "headers", "timeout", "max_concurrency", "provider", "opencode_plan", "chatgpt_account",
+            "base_url", "api_key", "headers", "timeout", "max_concurrency", "provider", "opencode_plan", "chatgpt_account", "chatgpt_mode",
         }
         if renaming or transport_fields.intersection(normalized_changes):
             activity = registry.route_activity_snapshot()
@@ -849,6 +890,8 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
         else:
             persisted = _persist(_configs_with(candidate))
         st = registry.update_station(candidate.name, normalized_changes) if normalized_changes else current
+        if candidate.provider == 'chatgpt' and candidate.chatgpt_mode != 'shared':
+            registry.chatgpt.bindings.claim_profile(candidate.chatgpt_account)
         if st.enabled and normalized_changes:
             st.last_probe_at = 0.0
             _wake_monitor()

@@ -1,7 +1,8 @@
 """Official Sign in with ChatGPT for a locally hosted gateway.
 
 OAuth tokens live in protected, account-scoped runtime files, never StationConfig.
-Only the public Responses API is used for subscription inference.
+The default sharing route uses the public Responses API. Native modes require
+an explicit separate Codex login; sharing tokens never cross that boundary.
 """
 from __future__ import annotations
 
@@ -140,7 +141,8 @@ class CredentialStore:
             return {"profile": profile, "connected": False, "status": "disconnected"}
         connected = bool(record.get("access_token") and DIRECT_SCOPE in record.get("scopes", []))
         return {"profile": profile, "email": record.get("email", ""),
-                "connected": connected, "status": record.get("status", "connected" if connected else "permission_required"),
+                "connected": connected, "auth_type": record.get("auth_type", "shared"),
+                "status": "native_only" if record.get("auth_type") == "codex" else record.get("status", "connected" if connected else "permission_required"),
                 "expires_at": record.get("expires_at"), "usage_url": "https://chatgpt.com/settings/usage"}
 
 
@@ -153,12 +155,31 @@ class ChatGPTAccounts:
         self.jwks = None
         self.jwks_at = 0
         self.codex = {}
+        from .codex_bindings import CodexBindings
+        self.bindings = CodexBindings(self)
+
+    def profile_view(self, profile, mode="shared"):
+        view = self.store.view(profile)
+        empty = {**view, "codex_connected": False, "shared_connected": view['connected']}
+        if not profile:
+            return empty
+        try:
+            record = self.store.read(profile)
+            native = self.store.directory / ("codex-" + profile) / "auth.json"
+            connected = bool(record.get("email") and native.is_file())
+            result = {**empty, "codex_connected": connected,
+                      "plan": self.usage_view(profile).get("plan") or record.get("plan")}
+            if mode != 'shared':
+                result.update(connected=connected, status='connected' if connected else 'codex_login_required', auth_type='codex')
+            return result
+        except (ChatGPTAuthError, OSError):
+            return empty if mode == 'shared' else {**empty, "connected": False, "status": "codex_login_required", "auth_type": "codex"}
 
     def codex_account(self, profile):
         from .codex_account import CodexAccount
         account = self.store.read(profile)
-        if DIRECT_SCOPE not in account.get("scopes", []):
-            raise ChatGPTAuthError("请先连接已授权 ChatGPT 订阅的站点")
+        if not isinstance(account.get("email"), str) or not account["email"].strip():
+            raise ChatGPTAuthError("请先绑定 Codex 账号")
         if profile not in self.codex:
             self.store.prepare()
             directory = self.store.directory / ("codex-" + profile)
@@ -226,6 +247,9 @@ class ChatGPTAccounts:
             existing = self.store.read(profile)
         except ChatGPTAuthError:
             existing = {}
+        if existing.get("auth_type") == "codex":
+            # Switching to sharing OAuth must not overwrite a live native profile.
+            profile, existing = uuid.uuid4().hex, {}
         attempt = dict(id=uuid.uuid4().hex, profile=profile, status="pending", error="",
                        state=secrets.token_urlsafe(32), nonce=secrets.token_urlsafe(32),
                        verifier=secrets.token_urlsafe(64), expires_at=time.time() + 600,
@@ -414,9 +438,11 @@ class ChatGPTAccounts:
     def pause(self):
         for identifier in list(self.attempts):
             self.cancel(identifier)
+        self.bindings.pause()
 
     async def close(self):
         self.pause()
+        await self.bindings.close()
         for bridge in self.codex.values():
             await bridge.close()
 
@@ -424,6 +450,10 @@ class ChatGPTAccounts:
 async def authorized_headers(registry, cfg, headers):
     if cfg.provider != "chatgpt":
         return headers
+    if cfg.chatgpt_mode in ("codex_cli", "codex_relay"):
+        context = {key: value for key, value in headers.items()
+                   if key.lower() in {"session-id", "thread-id", "x-session-id", "x-codex-turn-state", "x-codex-turn-metadata"}}
+        return {**context, "Content-Type": "application/json", "Accept": "text/event-stream"}
     token = await registry.chatgpt.access_token(cfg.chatgpt_account)
     return {"Authorization": "Bearer " + token, "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream", "User-Agent": "ModelHarbor/" + __version__}
@@ -467,7 +497,8 @@ def completed_response(payload):
         event = json.loads(data)
         if event.get("type") in {"response.failed", "response.incomplete", "error"}:
             response = event.get("response") or event
-            return None, response.get("error") or {"code": "incomplete_response", "message": "ChatGPT 响应未完成"}
+            return None, response.get("error") or (event if event.get("type") == "error" else
+                {"code": "incomplete_response", "message": "ChatGPT 响应未完成"})
         if event.get("type") == "response.completed":
             completed = event.get("response")
     if not isinstance(completed, dict):

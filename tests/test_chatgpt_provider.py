@@ -175,7 +175,7 @@ class ChatGPTProviderTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_device_login_reuses_valid_code_and_renews_expired_code(self):
         bridge = self.registry.chatgpt.codex_account(self.profile)
-        bridge.rpc = AsyncMock(return_value={"verificationUrl": "https://auth.openai.com/codex/device", "userCode": "TEST-1234"})
+        bridge.rpc = AsyncMock(return_value={"verificationUrl": "https://auth.openai.com/codex/device", "userCode": "TEST-1234", "loginId": "device-test"})
         first = await bridge.begin_login()
         self.assertEqual((await bridge.begin_login())["user_code"], first["user_code"])
         self.assertEqual(bridge.rpc.await_count, 1)
@@ -183,7 +183,8 @@ class ChatGPTProviderTests(unittest.IsolatedAsyncioTestCase):
         bridge.rpc.return_value["userCode"] = "NEW-5678"
         renewed = await bridge.begin_login()
         self.assertEqual(renewed["user_code"], "NEW-5678")
-        self.assertEqual(bridge.rpc.await_count, 2)
+        self.assertEqual(bridge.rpc.await_count, 3)
+        self.assertEqual(bridge.rpc.await_args_list[1].args, ("account/login/cancel", {"loginId": "device-test"}))
         self.assertGreater(renewed["expires_at"], time.time())
 
     async def test_reset_credit_requires_explicit_confirmation_and_idempotency(self):
@@ -343,6 +344,111 @@ class ChatGPTProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"error", payload)
         self.assertEqual(self.station.failures, 1)
         self.assertEqual(self.registry.route_activity_snapshot()["inflight"], 0)
+
+    async def test_subscription_manual_retry_clears_only_on_completion_and_preserves_preview(self):
+        await self.monitor.discover_models(self.station, manual=True)
+        self.registry.bind_statistics(self.log)
+        store = VisualTestStore(self.temp.name)
+        runner = VisualTestRunner(self.registry, self.gateway, store)
+        previous = await runner.run(self.station, {}, None)
+        runner.next_allowed.clear()
+        self.station.mark_quota_exhausted(classify_error("Plus", 200, json.dumps({"error": {
+            "code": "subscription_sharing_usage_limit_exceeded", "message": "sharing limited"}})))
+        self.station.quota_at = self.station.quota_probe_at = time.time() - 61
+        self.calls.clear()
+        result = await runner.retry_subscription(self.station, "127.0.0.1")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["recovered"])
+        self.assertFalse(self.station.quota_exhausted)
+        self.assertFalse(self.station.durable_view()["values"]["quota_exhausted"])
+        self.assertFalse(self.log._runtime["Plus"]["values"]["quota_exhausted"])
+        self.assertEqual(len(self.calls), 1)
+        payload = json.loads(self.calls[0].content)
+        self.assertEqual(payload["input"], [{"role": "user", "content": "Reply with only OK."}])
+        self.assertNotIn("max_output_tokens", payload)
+        self.assertEqual(store.result(self.station)["id"], previous["id"])
+
+    async def test_subscription_retry_keeps_protection_for_partial_stream_and_limit(self):
+        await self.monitor.discover_models(self.station, manual=True)
+        self.registry.bind_statistics(self.log)
+        runner = VisualTestRunner(self.registry, self.gateway, VisualTestStore(self.temp.name))
+        self.station.mark_quota_exhausted(classify_error("Plus", 429, json.dumps({"error": {
+            "code": "subscription_sharing_usage_limit_exceeded", "message": "sharing limited"}})))
+        for events, code in [
+            (b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n', "incomplete_response"),
+            (b'data: {"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"still limited"}}}\n\n', "subscription_sharing_usage_limit_exceeded"),
+        ]:
+            self.events = events
+            self.station.quota_at = self.station.quota_probe_at = time.time() - 61
+            runner.next_allowed.clear()
+            self.calls.clear()
+            result = await runner.retry_subscription(self.station, None)
+            self.assertFalse(result["recovered"])
+            self.assertEqual(result["http_status"], 200)
+            self.assertEqual(result["error_code"], code)
+            self.assertTrue(self.station.quota_exhausted)
+            self.assertTrue(self.log._runtime["Plus"]["values"]["quota_exhausted"])
+            self.assertEqual(len(self.calls), 1)
+            self.assertIsNone(runner.store.result(self.station))
+            with self.assertRaises(HTTPException) as caught:
+                await runner.retry_subscription(self.station, None)
+            self.assertEqual(caught.exception.status_code, 429)
+
+    async def test_subscription_retry_api_requires_confirmation_enabled_station_and_wait(self):
+        from fastapi import FastAPI
+        from app.web.admin import create_admin_router
+        await self.monitor.discover_models(self.station, manual=True)
+        self.station.mark_quota_exhausted(classify_error("Plus", 429, json.dumps({"error": {
+            "code": "subscription_sharing_usage_limit_exceeded", "message": "sharing limited"}})))
+        app = FastAPI()
+        app.include_router(create_admin_router(self.registry, self.gateway, self.monitor, self.log))
+        self.calls.clear()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            endpoint = "/admin/station/Plus/subscription-retry"
+            for body in ({}, {"confirmed": False}, {"confirmed": 1}, {"confirmed": True, "extra": True}):
+                self.assertEqual((await client.post(endpoint, json=body)).status_code, 400)
+            self.assertEqual((await client.post(endpoint, json={"confirmed": True})).status_code, 429)
+            self.station.enabled = False
+            self.assertEqual((await client.post("/admin/station/Plus/reset")).status_code, 409)
+            self.assertTrue(self.station.quota_exhausted)
+            self.assertEqual((await client.post(endpoint, json={"confirmed": True})).status_code, 409)
+            self.station.enabled = True
+            self.station.quota_at = self.station.quota_probe_at = time.time() - 61
+            self.station.rate_limit_until = time.time() + 180
+            self.assertEqual((await client.post(endpoint, json={"confirmed": True})).status_code, 429)
+            self.assertEqual(self.calls, [])
+            self.station.rate_limit_until = 0
+            response = await client.post(endpoint, json={"confirmed": True})
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()["recovered"])
+            self.assertEqual(len(self.calls), 1)
+
+    async def test_subscription_retry_has_one_inflight_and_retains_newer_failure(self):
+        await self.monitor.discover_models(self.station, manual=True)
+        runner = VisualTestRunner(self.registry, self.gateway, VisualTestStore(self.temp.name))
+        err = classify_error("Plus", 429, json.dumps({"error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "limited"}}))
+        self.station.mark_quota_exhausted(err)
+        self.station.quota_at = self.station.quota_probe_at = time.time() - 61
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow(request):
+            self.calls.append(request)
+            entered.set()
+            await release.wait()
+            return httpx.Response(200, content=self.events, headers={"content-type": "text/event-stream"})
+        await self.station.client.aclose()
+        self.station.client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+        task = asyncio.create_task(runner.retry_subscription(self.station, None))
+        await entered.wait()
+        self.assertIn("Plus", runner.tasks)
+        with self.assertRaises(HTTPException):
+            await runner.retry_subscription(self.station, None)
+        self.station.mark_quota_exhausted(err)
+        release.set()
+        result = await task
+        self.assertFalse(result["recovered"])
+        self.assertTrue(self.station.quota_exhausted)
+        self.assertNotIn("Plus", runner.tasks)
+        self.assertNotIn("Plus", runner.busy)
 
 
 class ChatGPTOAuthTests(unittest.IsolatedAsyncioTestCase):

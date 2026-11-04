@@ -4,6 +4,10 @@
   let selected = "", profile = "", data = null, busy = false, epoch = 0;
   let pollTimer = 0, pollFailures = 0, copyBusy = false, copiedCode = "", copiedUntil = 0;
   let identity = "", confirming = false, operation = "", copyError = "";
+  let retryBusy = false, retryAfter = 0, retryStatus = "";
+  const selectedStation = () => (statusData?.stations || []).find(item => item.name === selected)
+    || (typeof STATIONS === "undefined" ? [] : STATIONS).find(item => item.name === selected);
+  const native = () => ["codex_relay", "codex_cli"].includes(selectedStation()?.chatgpt_mode);
   const windows = value => (Array.isArray(value?.windows) ? value.windows : []).filter(item => item && typeof item === "object");
   const number = value => typeof value === "number" && Number.isFinite(value);
   const percentage = value => number(value) ? new Intl.NumberFormat("zh-CN", {maximumFractionDigits: 1}).format(value) + "%" : "—";
@@ -25,7 +29,8 @@
     }).join("");
     const empty = '<span class="subscription-quota-empty">' + (station.chatgpt?.connected ? "连接用量" : "等待授权") + '</span>';
     return '<button type="button" class="go-quota-summary chatgpt-quota-summary" data-chatgpt-usage="' + escapeHtml(station.name) +
-      '" aria-label="查看 ' + escapeHtml(station.name) + ' 的 ChatGPT订阅用量"><span class="go-quota-caption"><span>ChatGPT订阅' +
+      '" aria-label="查看 ' + escapeHtml(station.name) + ' 的订阅用量参考"><span class="go-quota-caption"><span>' +
+      (station.chatgpt_mode === "codex_relay" ? 'Codex · 用量' : station.chatgpt_mode === "codex_cli" ? 'Codex CLI · 用量' : items.length && items.every(item => /^codex$/i.test(item.name)) ? 'Codex 用量参考' : '订阅用量参考') +
       (usage?.stale ? ' · 缓存' : '') + (items.length > 2 ? ' · +' + (items.length - 2) : '') +
       '</span><svg aria-hidden="true" viewBox="0 0 16 16" width="11" height="11"><path d="m6 4 4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="go-quota-values">' + (rows || empty) + '</span></button>';
   }
@@ -62,7 +67,7 @@
     const waiting = pending(), elapsed = expired(), code = waiting ? data?.user_code || "" : "";
     el("chatgptUsageDevice").hidden = !waiting;
     el("chatgptUsageDevice").classList.toggle("is-expired", elapsed);
-    el("chatgptDeviceTitle").textContent = elapsed ? "验证码已过期" : "连接 Codex 用量";
+    el("chatgptDeviceTitle").textContent = elapsed ? "验证码已过期" : native() ? "重新授权 Codex 账号" : "连接 Codex 用量";
     if (el("chatgptUsageCode").textContent !== code) {
       el("chatgptUsageCode").textContent = code;
       copiedCode = ""; copiedUntil = 0; copyError = "";
@@ -82,6 +87,19 @@
   }
   function renderControls() {
     const waiting = pending(), elapsed = expired(), connected = data?.status === "connected";
+    const isNative = native();
+    el("chatgptUsageTitle").textContent = isNative ? "Codex 账号用量" : "ChatGPT 订阅用量";
+    el("chatgptUsageEmpty").querySelector("h3").textContent = isNative ? "Codex 用量与重置卡" : "连接 Codex 用量参考";
+    el("chatgptUsageEmpty").querySelector("p").textContent = isNative
+      ? "使用此渠道绑定的 Codex 账号读取官方额度。绑定完成后无需再次授权；如果授权失效，可在这里重新授权同一账号。"
+      : "读取官方返回的额度窗口和重置卡；此信息不能单独确认订阅共享接口是否可用。";
+    el("chatgptUsageReauthTitle").textContent = isNative ? "重新授权此 Codex 账号" : "重新授权用量读取";
+    el("chatgptUsageReauth").querySelector("p").textContent = isNative
+      ? "此授权同时用于模型调用和用量查询，请登录当前绑定的同一个账号。日常查看额度使用「刷新用量」；更换账号请到编辑渠道中选择「更换绑定账号」，保存后生效。"
+      : "此操作需要在官方页面再次登录并输入验证码。日常查看额度请使用「刷新用量」。这只更新用量读取授权，不影响订阅共享接口的模型调用授权。";
+    el("chatgptUsageFooter").querySelector("details p").textContent = isNative
+      ? "来源为此渠道的官方 Codex 账户接口，包含其他客户端的使用，仅展示上游返回的窗口。7 天窗口不是自然周。每 15 分钟读取元数据，不调用模型；额度有余量不代表每个模型均可用。限制等待结束后，由单个真实请求确认恢复。"
+      : "来源为官方 Codex 账户接口，仅展示它返回的窗口。订阅共享接口还可能受到应用或其他限制；这里有剩余额度不保证共享接口可用，刷新或使用重置卡也不会直接解除网关保护。7 天窗口不是自然周。连接后每 15 分钟读取元数据，不调用模型。";
     const badge = el("chatgptUsageBadge");
     const account = identity || data?.email || "";
     el("chatgptUsageIdentity").textContent = account;
@@ -105,8 +123,62 @@
     el("chatgptUsageConnect").hidden = confirming;
     el("chatgptUsageConnect").classList.toggle("primary", !connected);
     el("chatgptUsageConnect").classList.toggle("secondary", connected);
-    el("chatgptUsageConnect").textContent = busy ? "处理中…" : elapsed ? "重新获取验证码" : connected || data?.updated_at || windows(data).length ? "重新授权用量" : "授权读取用量";
+    el("chatgptUsageConnect").textContent = busy ? "处理中…" : elapsed ? "重新获取验证码" : isNative ? "重新授权 Codex 账号" : connected || data?.updated_at || windows(data).length ? "重新授权用量" : "授权读取用量";
     el("chatgptUsageConnect").title = "需要在官方页面验证账号；日常查询请使用刷新用量";
+    renderRestriction();
+  }
+  function renderRestriction() {
+    const station = selectedStation(), limited = Boolean(station?.quota_exhausted);
+    const protection = station?.protection || {}, passive = limited && protection.recovery_mode === "passive";
+    const until = Math.max(station?.quota_resume_at || 0, protection.until || 0);
+    const ready = passive && until <= Date.now() / 1000;
+    el("chatgptUsageRestriction").hidden = !limited && !retryStatus;
+    el("chatgptUsageRestrictionTitle").textContent = passive ? protection.recovery_inflight ? "正在验证恢复" : ready ? "等待真实请求验证" : "Codex 用量限制 · 等待恢复" : limited ? "订阅接入受限" : "订阅接入已恢复";
+    el("chatgptUsageRestrictionHint").textContent = passive
+      ? protection.recovery_inflight ? "正在用一个真实请求确认恢复，其他请求暂不进入此渠道。"
+        : ready ? "下一个真实请求将单独验证恢复；完整成功后恢复调度，仍受限则延长等待。不会发送后台生成请求。"
+          : (protection.wait_source === "upstream" ? "遵守上游返回的等待时间" : "上游未提供恢复时间，网关采用逐步延长的等待") + "，可于 " + new Date(until * 1000).toLocaleString() + " 后尝试。下方额度不能保证特定模型当前可用。"
+      : !limited ? "完整生成验证已成功。" : ["codex_cli", "codex_relay"].includes(station?.chatgpt_mode)
+      ? "Codex 返回使用限制，网关已暂停此渠道。查看官方用量后可手动验证一次；不会后台重试。"
+      : "上游暂停了订阅共享接口的访问。下方 Codex 窗口仍有剩余，不代表此接口已恢复；网关不会据此推算恢复时间或后台重试。";
+    const detail = limited ? [station.quota_at ? new Date(station.quota_at * 1000).toLocaleString() : "", station.quota_error || "上游拒绝了订阅请求"].filter(Boolean).join(" · ") : "";
+    el("chatgptUsageRestrictionDetail").textContent = detail;
+    const wait = Math.max(0, Math.ceil(Math.max(retryAfter, passive ? until : 0) - Date.now() / 1000));
+    const button = el("chatgptUsageRetry");
+    button.hidden = !limited;
+    button.disabled = retryBusy || busy || !station?.enabled || wait > 0 || Boolean(protection.recovery_inflight);
+    button.textContent = retryBusy ? "正在验证…" : !station?.enabled ? "请先启用站点" : wait > 0 ? wait + " 秒后可验证" : "手动验证一次";
+    el("chatgptUsageRetryStatus").textContent = retryStatus;
+  }
+  async function retrySubscription() {
+    const station = selectedStation();
+    if (retryBusy || busy || !station?.enabled || !station.quota_exhausted || retryAfter > Date.now() / 1000) return;
+    if (!window.confirm("向此订阅发送一次简短的 OK 验证请求，可能消耗订阅用量；不会自动重试，也不会覆盖智商测试预览。继续吗？")) return;
+    const revision = epoch, name = selected, profileId = profile;
+    retryBusy = true; retryStatus = "正在等待上游完整响应…"; renderRestriction();
+    try {
+      const result = await api("/admin/station/" + encodeURIComponent(name) + "/subscription-retry", "POST", false, {confirmed: true});
+      if (epoch !== revision || selectedStation()?.chatgpt_account !== profileId) return;
+      for (const item of [...(typeof STATIONS === "undefined" ? [] : STATIONS), ...(statusData?.stations || [])]) {
+        if (item.name === name) Object.assign(item, {quota_exhausted: result.quota_exhausted, quota_error: result.quota_error, quota_at: result.quota_at,
+          quota_resume_at: result.next_allowed_at, ...(result.protection ? {protection: result.protection} : {})});
+      }
+      if (epoch === revision) {
+        retryAfter = result.next_allowed_at || Date.now() / 1000 + 60;
+        retryStatus = result.recovered ? "上游已完整返回成功，订阅路由保护已解除。" : "本次未恢复：" + (result.error_code || result.error || "上游仍拒绝访问")
+          + (result.request_id ? " · Request ID: " + result.request_id : "");
+        showToast(retryStatus, !result.recovered);
+      }
+      await refreshStations({force: true});
+      if (typeof window.refresh === "function") await window.refresh(true);
+      render(true);
+    } catch (error) {
+      if (epoch === revision) {
+        retryAfter = Date.now() / 1000 + 60;
+        retryStatus = "验证未确认：" + error.message + "。请稍后查看状态，未自动重试。";
+        showToast(retryStatus, true);
+      }
+    } finally { if (epoch === revision) { retryBusy = false; renderRestriction(); } }
   }
   function schedulePoll() {
     clearTimeout(pollTimer);
@@ -177,7 +249,13 @@
     busy = true; operation = "read"; renderControls();
     try {
       const usage = await api("/admin/chatgpt/profile/" + encodeURIComponent(id) + "/usage" + (manual ? "?refresh=true" : ""));
-      if (epoch === revision) { pollFailures = 0; update(id, usage); render(true); }
+      if (epoch === revision) {
+        pollFailures = 0; update(id, usage); render(true);
+        if (manual) {
+          await refreshStations({force: true});
+          if (typeof window.refresh === "function") await window.refresh(true);
+        }
+      }
     } catch (error) {
       if (epoch === revision) {
         pollFailures++; data = {...data, error: error.message};
@@ -187,7 +265,7 @@
   }
   function connect() {
     if (busy || !profile) return;
-    if (!pending() && (data?.status === "connected" || data?.updated_at || windows(data).length)) {
+    if (!pending() && (native() || data?.status === "connected" || data?.updated_at || windows(data).length)) {
       confirming = true; renderControls(); el("chatgptUsageReauthConfirm").focus();
       return;
     }
@@ -210,6 +288,7 @@
     if (!station?.chatgpt_account) return;
     selected = station.name; profile = station.chatgpt_account; data = station.chatgpt_usage; epoch++; busy = false;
     identity = station.chatgpt?.email || ""; confirming = false; operation = "";
+    retryBusy = false; retryStatus = ""; retryAfter = (station.quota_probe_at || station.quota_at || 0) + 60;
     pollFailures = 0; copiedCode = ""; copyError = "";
     clearTimeout(pollTimer);
     renderDetail();
@@ -224,6 +303,7 @@
     open(station);
   });
   el("chatgptUsageRefresh").addEventListener("click", () => refresh(true));
+  el("chatgptUsageRetry").addEventListener("click", retrySubscription);
   el("chatgptUsageConnect").addEventListener("click", connect);
   el("chatgptUsageReauthConfirm").addEventListener("click", beginAuthorization);
   el("chatgptUsageReauthCancel").addEventListener("click", () => { confirming = false; renderControls(); el("chatgptUsageConnect").focus(); });

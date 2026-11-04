@@ -207,6 +207,7 @@ async function main() {
   const script = fs.readFileSync(path.join(ROOT, "app", "web", "static", "dashboard.js"), "utf8");
   const quotaScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "chatgpt-quota.js"), "utf8");
   const chatgptScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "chatgpt.js"), "utf8");
+  const codexBindingScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "codex-binding.js"), "utf8");
   const analyticsScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "analytics.js"), "utf8");
   const dom = new JSDOM(html, { runScripts: "outside-only", url: "http://127.0.0.1:8000/dashboard" });
   const { window } = dom;
@@ -418,7 +419,7 @@ async function main() {
   if (!window.HTMLDialogElement.prototype.close) {
     window.HTMLDialogElement.prototype.close = function close() { this.open = false; };
   }
-  window.eval(`${script}\n${analyticsScript}\n${chatgptScript}\n${quotaScript}\n;globalThis.__testFormatters = {finiteNumber, formatBalance, formatLatency};globalThis.__testConsumeActivityEvent = consumeActivityEvent;globalThis.__testDrainActivityBuffer = drainActivityBuffer;globalThis.__testApi = api;globalThis.__testProtectionMarkup = protectionMarkup;globalThis.__testRefreshCapabilities = refreshCapabilities;`);
+  window.eval(`${script}\n${analyticsScript}\n${codexBindingScript}\n${chatgptScript}\n${quotaScript}\n;globalThis.__testFormatters = {finiteNumber, formatBalance, formatLatency};globalThis.__testConsumeActivityEvent = consumeActivityEvent;globalThis.__testDrainActivityBuffer = drainActivityBuffer;globalThis.__testApi = api;globalThis.__testProtectionMarkup = protectionMarkup;globalThis.__testRefreshCapabilities = refreshCapabilities;`);
   await settle();
 
   const document = window.document;
@@ -1108,7 +1109,9 @@ async function main() {
   providerSelect.dispatchEvent(new window.Event("change"));
   assert.equal(providerSelect.selectedOptions[0].textContent, "ChatGPT订阅");
   assert.equal(document.getElementById("sf-name").value, "ChatGPT订阅");
-  assert.match(document.getElementById("sf-provider-note").textContent, /Plus \/ Pro/);
+  assert.equal(document.getElementById("sf-chatgpt-mode").value, "codex_relay");
+  assert.match(document.getElementById("sf-provider-note").textContent, /绑定 Codex 账号/);
+  assert.equal(document.getElementById("sf-chatgpt-login").textContent, "绑定 Codex 账号");
   document.getElementById("sf-cancel").click();
   document.getElementById("stations-add").click();
   document.getElementById("sf-name").value = "gamma";

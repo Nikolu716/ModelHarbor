@@ -4,7 +4,11 @@ from __future__ import annotations
 from . import __version__
 
 OPENCODE_SESSION_HEADERS = ("x-opencode-session", "session-id")
-CLIENT_CONTEXT_HEADERS = (*OPENCODE_SESSION_HEADERS, "thread-id", "user-agent", "anthropic-version", "anthropic-beta")
+CLIENT_SESSION_ALIASES = ("x-session-id",)
+CODEX_CONTEXT_HEADERS = ("session-id", "x-session-id", "thread-id", "x-codex-turn-state", "x-codex-turn-metadata")
+CLIENT_CONTEXT_HEADERS = (*OPENCODE_SESSION_HEADERS, *CLIENT_SESSION_ALIASES,
+                          "thread-id", "user-agent", "anthropic-version", "anthropic-beta",
+                          "x-codex-turn-state", "x-codex-turn-metadata")
 
 
 class MissingOpenCodeSession(ValueError):
@@ -25,6 +29,8 @@ def inference_headers(cfg, client_headers=None, *, test_session: str | None = No
         **cfg.headers,
     }
     context = request_context(client_headers)
+    if cfg.provider == "chatgpt" and cfg.chatgpt_mode in ("codex_cli", "codex_relay"):
+        return {**headers, **{key: value for key, value in context.items() if key in CODEX_CONTEXT_HEADERS}}
     if cfg.provider in ("anthropic", "gemini"):
         headers = {k: v for k, v in headers.items() if k.lower() not in ("authorization", "x-api-key", "x-goog-api-key")}
         headers["x-api-key" if cfg.provider == "anthropic" else "x-goog-api-key"] = cfg.api_key
@@ -38,14 +44,20 @@ def inference_headers(cfg, client_headers=None, *, test_session: str | None = No
     if cfg.provider != "opencode" or catalog:
         return headers
     # A static configured session must never combine unrelated conversations.
+    context = {key: value for key, value in context.items() if key not in ("x-codex-turn-state", "x-codex-turn-metadata")}
     headers = {k: v for k, v in headers.items()
-               if k.lower() not in (*OPENCODE_SESSION_HEADERS, "thread-id", "user-agent")}
+               if k.lower() not in (*OPENCODE_SESSION_HEADERS, *CLIENT_SESSION_ALIASES, "thread-id", "user-agent")}
+    # ZCode sends its real conversation ID as x-session-id. Translate only
+    # when no native session header is present; never invent a shared ID.
+    client_session = context.pop("x-session-id", "").strip()
+    if client_session and not any(context.get(k, "").strip() for k in OPENCODE_SESSION_HEADERS):
+        context["x-opencode-session"] = client_session
     if test_session:
         context = {"x-opencode-session": test_session}
     if cfg.opencode_plan == "go" and not any(context.get(k, "").strip() for k in OPENCODE_SESSION_HEADERS):
         raise MissingOpenCodeSession(
             "OpenCode Go 需要稳定的对话会话 ID：请让客户端发送 x-opencode-session "
-            "或保留 Codex 原生 session-id；同一对话保持不变，不同对话使用不同值。未向上游发送请求。")
+            "或客户端原生 session-id / x-session-id；同一对话保持不变，不同对话使用不同值。未向上游发送请求。")
     headers.update(context)
     headers.setdefault("user-agent", "ModelHarbor/" + __version__)
     if headers["user-agent"].lower().startswith(("python-", "openai/", "go-http-client", "curl/", "httpx/")):
