@@ -18,6 +18,26 @@ from .wire import UnsupportedWireRequest
 CODEX_RESPONSES = "https://chatgpt.com/backend-api/codex/responses"
 
 
+def _sanitize_input_items(items):
+    """Drop client-only IDs from Responses message history.
+
+    Codex accepts server-issued message IDs (``msg_...``). Some clients add
+    local timing/TTFT IDs while restoring a conversation. Those IDs are not
+    valid upstream message IDs, but removing them is safe because the message
+    content remains intact. Other item IDs and tool ``call_id`` values must be
+    preserved for Responses history and function-call correlation.
+    """
+    sanitized = []
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "message" and "id" in item:
+            identifier = item.get("id")
+            if not isinstance(identifier, str) or not identifier.startswith("msg_"):
+                item = dict(item)
+                item.pop("id", None)
+        sanitized.append(item)
+    return sanitized
+
+
 def relay_request(body):
     """Keep Responses tools, history and encrypted reasoning intact."""
     if not isinstance(body, dict):
@@ -42,6 +62,7 @@ def relay_request(body):
     if isinstance(value, str):
         target["input"] = [{"role": "user", "content": value}]
     else:
+        target["input"] = _sanitize_input_items(target["input"])
         target["input"] = [({**item, "role": "developer"} if isinstance(item, dict)
                             and item.get("role") == "system" else item) for item in target["input"]]
     target.update(instructions=target.get("instructions") or "", store=False, stream=True)

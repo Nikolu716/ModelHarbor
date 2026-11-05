@@ -187,6 +187,25 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(len(self.seen), 1)
 
+    async def test_relay_does_not_send_invalid_message_id_upstream(self):
+        history = [{"type": "message", "id": f"msg_{i}", "role": "user", "content": f"turn {i}"}
+                   for i in range(105)]
+        history.extend([
+            {"type": "message", "id": "item_fake_ttft_dmn40jp760j7", "role": "assistant",
+             "status": "completed", "content": [{"type": "output_text", "text": "hello", "annotations": []}]},
+            {"type": "reasoning", "id": "rs_valid", "encrypted_content": "opaque"},
+        ])
+        response = await self.client.post("https://api.openai.com/v1/responses",
+                                          json={"model": "test-model", "input": history})
+        self.assertEqual(response.status_code, 200)
+        sent = json.loads(self.seen[0].content)
+        self.assertEqual(sent["input"][:105], history[:105])
+        self.assertEqual(len(sent["input"]), len(history))
+        self.assertNotIn("id", sent["input"][105])
+        self.assertEqual(sent["input"][105]["content"], history[105]["content"])
+        self.assertEqual(sent["input"][106], history[106])
+        self.assertEqual(len(self.seen), 1)
+
 
 class ProfileSwitchTests(unittest.IsolatedAsyncioTestCase):
     async def test_switching_profile_replaces_transport_and_uses_new_native_account(self):
@@ -248,6 +267,25 @@ class NativeCredentialsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_removes_invalid_ids_only_from_message_items(self):
+        source = {"model": "test", "input": [
+            {"type": "message", "id": "item_fake_ttft_dmn40jp760j7", "role": "user", "content": "hello"},
+            {"type": "message", "id": "msg_valid", "role": "assistant", "content": "hi"},
+            {"type": "reasoning", "id": "item_reasoning", "encrypted_content": "opaque"},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+        ]}
+        target = relay_request(source)
+        self.assertNotIn("id", target["input"][0])
+        self.assertEqual(target["input"][0]["content"], "hello")
+        self.assertEqual(target["input"][1]["id"], "msg_valid")
+        self.assertEqual(target["input"][2]["id"], "item_reasoning")
+        self.assertEqual(target["input"][3]["id"], "fc_1")
+        self.assertEqual(target["input"][3]["call_id"], "call_1")
+        self.assertEqual(target["input"][4]["call_id"], "call_1")
+        self.assertEqual(source["input"][0]["id"], "item_fake_ttft_dmn40jp760j7")
+        self.assertEqual(relay_request(target), target)
+
     def test_preserves_structured_output_namespaces_and_encrypted_history(self):
         source = {"model": "test", "input": [{"type": "reasoning", "encrypted_content": "opaque"},
             {"type": "custom_tool_call_output", "call_id": "c", "output": "ok"}],
