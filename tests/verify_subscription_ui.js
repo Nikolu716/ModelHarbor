@@ -369,6 +369,44 @@ async function main() {
   assert.match(d.getElementById("chatgptUsageRestrictionTitle").textContent, /验证失败 · 待重试/);
   assert.equal(d.querySelectorAll("#chatgptUsageRestriction img").length, 0);
   assert.equal(subscription.quota_exhausted, true);
+  // Circuit recovery is separate from a quota restriction but uses the same explicit one-shot flow.
+  subscription.quota_exhausted = false;
+  subscription.quota_at = subscription.quota_probe_at = subscription.quota_resume_at = 0;
+  subscription.status = "down";
+  subscription.protection = {kind: "breaker", until: Date.now() / 1000 + 60, reason: "request failed <img src=x>"};
+  const beforeCircuitRetry = retryCalls().length;
+  w.ModelHarborChatGPTQuota.open(subscription); await settle();
+  assert.equal(d.getElementById("chatgptUsageRestriction").hidden, false);
+  assert.equal(d.getElementById("chatgptUsageRestrictionTitle").textContent, "熔断冷却中");
+  assert.equal(retry.disabled, true);
+  subscription.protection.kind = "recovering";
+  subscription.protection.until = Date.now() / 1000 - 1;
+  for (const tick of intervals) tick();
+  assert.equal(d.getElementById("chatgptUsageRestrictionTitle").textContent, "待恢复验证");
+  assert.equal(retry.disabled, false);
+  assert.equal(retryCalls().length, beforeCircuitRetry);
+  retryConfirmed = false;
+  retry.click(); await settle();
+  assert.equal(retryCalls().length, beforeCircuitRetry);
+  retryConfirmed = true;
+  heldRetry = new Promise(resolve => {finishRetry = resolve;});
+  retry.click(); retry.click(); await settle();
+  assert.equal(retryCalls().length, beforeCircuitRetry + 1);
+  assert.equal(retry.disabled, true);
+  finishRetry({ok: false, recovered: false, quota_exhausted: false, status: "down",
+    protection: subscription.protection, error_code: "incomplete_response", next_allowed_at: Date.now() / 1000 + 60});
+  await settle();
+  assert.equal(subscription.status, "down");
+  assert.match(d.getElementById("chatgptUsageRetryStatus").textContent, /incomplete_response/);
+  assert.equal(retry.hidden, false);
+  assert.equal(retry.disabled, true);
+  heldRetry = {ok: true, recovered: true, quota_exhausted: false, status: "up", protection: {kind: "normal"}};
+  w.ModelHarborChatGPTQuota.open(subscription); await settle();
+  retry.click(); await settle();
+  assert.equal(subscription.status, "up");
+  assert.equal(d.getElementById("chatgptUsageRestrictionTitle").textContent, "订阅接入已恢复");
+  assert.equal(retry.hidden, true);
+  assert.equal(calls.some(call => call.url.endsWith("/generation-probe")), false);
   dom.window.close();
   console.log("subscription quota and visual-test interaction checks passed");
 }

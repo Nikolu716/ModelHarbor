@@ -255,6 +255,8 @@ function statusInfo(station) {
   const recovery = window.ModelHarborRecovery.view(station);
   if (recovery) return { className: "quota", label: recovery.label, detail: recovery.detail, reason: recovery.diagnostic };
   if (station.quota_exhausted) return { className: "quota", label: station.provider === "chatgpt" ? "订阅接入受限" : "配额保护", detail: station.provider === "chatgpt" ? quotaRecoveryHint(station) : protection.reason || station.quota_error || "上游报告额度不可用" };
+  if (protection.recovery_inflight) return {className: "cooling", label: "恢复验证中",
+    detail: "正在等待一次验证的完整响应，其他请求暂不进入此渠道", reason: protection.reason};
   if (protection.kind === "rate_limited" && remaining > 0 || finiteNumber(station.rate_limit_until) > now) {
     const wait = remaining || Math.ceil(station.rate_limit_until - now);
     return { className: "cooling", label: `限流冷却 · ${wait} 秒`,
@@ -838,8 +840,10 @@ function stationActions(station) {
     label = station.provider === "chatgpt" ? "查看限制" : "检查额度";
     title = station.provider === "chatgpt" ? "查看官方用量与限制原因，或手动验证一次；打开详情不发送生成请求" : "按站点策略验证额度恢复；生成检查可能产生用量";
   } else if (kind === "recovering" && !go) {
-    action = "generation-probe"; label = "验证恢复";
-    title = "用站点配置的探测模型发送一次生成请求，可能产生用量；成功后解除熔断";
+    action = station.provider === "chatgpt" ? "subscription-usage" : "generation-probe"; label = "验证恢复";
+    title = station.provider === "chatgpt"
+      ? "查看故障原因并确认手动验证一次；打开详情不发送生成请求"
+      : "用站点配置的探测模型发送一次生成请求，可能产生用量；成功后解除熔断";
   }
   return [
     actionButton(action, station, label, { primary: true, title, disabled: !station.enabled }),

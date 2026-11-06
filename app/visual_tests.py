@@ -552,11 +552,13 @@ class VisualTestRunner:
             raise HTTPException(409, "测试正在进行或站点并发已满，请稍后重试")
         self.busy.add(name)
         self.next_allowed[name] = now + 15
-        if quota_retry and st.native_usage_limited:
+        if st.cfg.provider == "chatgpt" and (quota_retry or st.status == "down"):
             st.recovery_inflight = True
             st.recovery_attempt_at = st.quota_probe_at = now
-            recovery = dict(revision=st.quota_revision, signature=st.connection_signature(), attempt_at=now)
-            st.begin_quota_recovery(now)
+            recovery = dict(revision=st.quota_revision, signature=st.connection_signature(),
+                            attempt_at=now, native_quota=st.native_usage_limited)
+            if recovery["native_quota"]:
+                st.begin_quota_recovery(now)
             return recovery
         return None
 
@@ -565,11 +567,13 @@ class VisualTestRunner:
             return
         if st.recovery_attempt_at == recovery["attempt_at"]:
             st.recovery_inflight = False
-        st.finish_quota_recovery(outcome, error, **recovery)
+        if recovery["native_quota"]:
+            st.finish_quota_recovery(outcome, error, revision=recovery["revision"],
+                                    signature=recovery["signature"], attempt_at=recovery["attempt_at"])
 
     async def retry_subscription(self, st, client_ip):
         """One explicit recovery request; keep the last visual artifact intact."""
-        if st.cfg.provider != "chatgpt" or not st.quota_exhausted:
+        if st.cfg.provider != "chatgpt" or not (st.quota_exhausted or st.status == "down"):
             raise HTTPException(409, "仅对接入受限的 ChatGPT 订阅执行手动验证")
         settings = self.validate(st, {"prompt": "Reply with only OK.", "template_name": "手动验证订阅接入"})
         recovery = self._reserve(st, quota_retry=True)
@@ -593,11 +597,14 @@ class VisualTestRunner:
             self.busy.discard(name)
             if self.tasks.get(name) is task:
                 self.tasks.pop(name, None)
+        protection = st.protection_view(self.gateway, time.time())
         return {key: result.get(key) for key in ("ok", "model", "http_status", "error", "error_code", "request_id")} | {
-            "recovered": not st.quota_exhausted, "quota_exhausted": st.quota_exhausted,
+            "recovered": result["ok"] and protection["kind"] == "normal",
+            "status": st.status, "quota_exhausted": st.quota_exhausted,
             "quota_error": st.quota_error, "quota_at": st.quota_at,
+            "quota_resume_at": st.quota_resume_at, "quota_probe_at": st.quota_probe_at,
             "next_allowed_at": self.next_allowed_at(st, quota_retry=st.quota_exhausted),
-            "protection": st.protection_view(self.gateway, time.time()),
+            "protection": protection,
         }
 
     async def run(self, st, body, client_ip, *, source="manual", _reserved=False, _save_result=True):
@@ -623,6 +630,7 @@ class VisualTestRunner:
         now, name = time.time(), st.cfg.name
         sem = self.registry.ensure_semaphore(st)
         quota_revision = st.quota_revision
+        health_revision = (st.consecutive_failures, st.down_since, st.last_error_at, st.rate_limit_until)
         cfg = st.cfg
         if protocol == "auto":
             protocol = cfg.wire_api if cfg.wire_api in ("responses", "chat_completions") else (
@@ -783,8 +791,12 @@ class VisualTestRunner:
         # A successful metadata read, an HTTP 200, or a partial SSE response is
         # not proof of recovery. Subscription success requires response.completed.
         # Do not clear a newer failure from a concurrent business request.
-        if cfg.provider == "chatgpt" and result["ok"] and st.quota_exhausted and st.quota_revision == quota_revision:
-            st.reset_quota()
+        if (cfg.provider == "chatgpt" and result["ok"] and st.quota_revision == quota_revision
+                and health_revision == (st.consecutive_failures, st.down_since, st.last_error_at, st.rate_limit_until)):
+            if st.quota_exhausted:
+                st.reset_quota()
+            elif st.status == "down":
+                st.record_probe(result["latency_ms"] / 1000)
         if _save_result:
             self.store.save_result(st, result)
         if cancelled:

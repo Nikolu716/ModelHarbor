@@ -8,6 +8,9 @@
   const selectedStation = () => (statusData?.stations || []).find(item => item.name === selected)
     || (typeof STATIONS === "undefined" ? [] : STATIONS).find(item => item.name === selected);
   const native = () => ["codex_relay", "codex_cli"].includes(selectedStation()?.chatgpt_mode);
+  const needsRecovery = station => Boolean(station?.quota_exhausted
+    || ["breaker", "recovering"].includes(station?.protection?.kind)
+    || ["down", "cooling"].includes(station?.status));
   const windows = value => (Array.isArray(value?.windows) ? value.windows : []).filter(item => item && typeof item === "object");
   const number = value => typeof value === "number" && Number.isFinite(value);
   const percentage = value => number(value) ? new Intl.NumberFormat("zh-CN", {maximumFractionDigits: 1}).format(value) + "%" : "—";
@@ -129,28 +132,34 @@
   }
   function renderRestriction() {
     const station = selectedStation(), limited = Boolean(station?.quota_exhausted);
+    const circuit = !limited && needsRecovery(station), restricted = limited || circuit;
     const protection = station?.protection || {}, passive = limited && protection.recovery_mode === "passive";
-    const until = Math.max(station?.quota_resume_at || 0, protection.until || 0);
+    const until = Math.max(station?.quota_resume_at || 0, protection.until || 0, station?.rate_limit_until || 0);
     const recovery = window.ModelHarborRecovery.view(station);
-    el("chatgptUsageRestriction").hidden = !limited && !retryStatus;
-    el("chatgptUsageRestrictionTitle").textContent = recovery ? recovery.label : limited ? "订阅接入受限" : "订阅接入已恢复";
+    el("chatgptUsageRestriction").hidden = !restricted && !retryStatus;
+    el("chatgptUsageRestrictionTitle").textContent = recovery ? recovery.label
+      : circuit ? protection.recovery_inflight ? "恢复验证中" : until > Date.now() / 1000 ? "熔断冷却中" : "待恢复验证"
+      : limited ? "订阅接入受限" : "订阅接入已恢复";
     el("chatgptUsageRestrictionHint").textContent = recovery
       ? recovery.detail + " 下方用量是官方窗口的参考，仍有剩余不代表已恢复；不会发送后台生成请求。"
+      : circuit ? "此前生成请求连续失败，网关暂停了此渠道。冷却结束后，可用下一次业务请求或手动验证一次；收到完整成功响应后解除熔断。刷新用量不会解除保护，也不会发送后台生成请求。"
       : !limited ? "完整生成验证已成功。" : ["codex_cli", "codex_relay"].includes(station?.chatgpt_mode)
       ? "Codex 返回使用限制，网关已暂停此渠道。查看官方用量后可手动验证一次；不会后台重试。"
       : "上游暂停了订阅共享接口的访问。下方 Codex 窗口仍有剩余，不代表此接口已恢复；网关不会据此推算恢复时间或后台重试。";
-    const detail = recovery ? recovery.diagnostic : limited ? [station.quota_at ? new Date(station.quota_at * 1000).toLocaleString() : "", station.quota_error || "上游拒绝了订阅请求"].filter(Boolean).join(" · ") : "";
+    const detail = recovery ? recovery.diagnostic : circuit ? protection.reason || station.last_error || "生成请求未完成"
+      : limited ? [station.quota_at ? new Date(station.quota_at * 1000).toLocaleString() : "", station.quota_error || "上游拒绝了订阅请求"].filter(Boolean).join(" · ") : "";
     el("chatgptUsageRestrictionDetail").textContent = detail;
-    const wait = Math.max(0, Math.ceil(Math.max(retryAfter, passive ? until : 0) - Date.now() / 1000));
+    const wait = Math.max(0, Math.ceil(Math.max(retryAfter, passive || circuit ? until : station?.rate_limit_until || 0) - Date.now() / 1000));
     const button = el("chatgptUsageRetry");
-    button.hidden = !limited;
+    button.hidden = !restricted;
     button.disabled = retryBusy || busy || !station?.enabled || wait > 0 || Boolean(protection.recovery_inflight);
-    button.textContent = retryBusy ? "正在验证…" : !station?.enabled ? "请先启用站点" : wait > 0 ? wait + " 秒后可验证" : "手动验证一次";
+    button.textContent = retryBusy || protection.recovery_inflight ? "正在验证…" : !station?.enabled ? "请先启用站点" : wait > 0 ? wait + " 秒后可验证" : "手动验证一次";
     el("chatgptUsageRetryStatus").textContent = retryStatus;
   }
   async function retrySubscription() {
     const station = selectedStation();
-    if (retryBusy || busy || !station?.enabled || !station.quota_exhausted || retryAfter > Date.now() / 1000) return;
+    if (retryBusy || busy || !station?.enabled || !needsRecovery(station)
+        || station.protection?.recovery_inflight || retryAfter > Date.now() / 1000) return;
     if (!window.confirm("向此订阅发送一次简短的 OK 验证请求，可能消耗订阅用量；不会自动重试，也不会覆盖智商测试预览。继续吗？")) return;
     const revision = epoch, name = selected, profileId = profile;
     retryBusy = true; retryStatus = "正在等待上游完整响应…"; renderRestriction();
@@ -159,7 +168,8 @@
       if (epoch !== revision || selectedStation()?.chatgpt_account !== profileId) return;
       for (const item of [...(typeof STATIONS === "undefined" ? [] : STATIONS), ...(statusData?.stations || [])]) {
         if (item.name === name) Object.assign(item, {quota_exhausted: result.quota_exhausted, quota_error: result.quota_error, quota_at: result.quota_at,
-          quota_resume_at: result.next_allowed_at, ...(result.protection ? {protection: result.protection} : {})});
+          quota_resume_at: result.quota_resume_at || 0, quota_probe_at: result.quota_probe_at || 0,
+          ...(result.status ? {status: result.status} : {}), ...(result.protection ? {protection: result.protection} : {})});
       }
       if (epoch === revision) {
         retryAfter = result.next_allowed_at || Date.now() / 1000 + 60;

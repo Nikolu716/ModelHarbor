@@ -524,6 +524,23 @@ async function main() {
   // Elapsed waits transition locally without fetching or rebuilding preview frames.
   const recoveryStation = statusFixture.stations[0];
   const originalRecoveryStation = {...recoveryStation};
+  Object.assign(recoveryStation, {provider: "chatgpt", chatgpt_account: "circuit-profile",
+    quota_exhausted: false, status: "cooling", protection: {kind: "recovering", until: Date.now() / 1000 - 1}});
+  await window.refresh(true);
+  const circuitActions = [...document.querySelectorAll("button[data-action][data-station]")]
+    .filter(button => button.dataset.station === maliciousStation && button.textContent === "验证恢复");
+  assert.ok(circuitActions.length > 0, "a cooling subscription has a recovery entry on the dashboard");
+  assert.ok(circuitActions.every(button => button.dataset.action === "subscription-usage"));
+  const circuitRequests = fetchCalls.length;
+  circuitActions[0].click(); await settle();
+  assert.equal(document.getElementById("chatgptUsageDialog").open, true);
+  assert.equal(document.getElementById("chatgptUsageRestriction").hidden, false);
+  assert.equal(document.getElementById("chatgptUsageRetry").hidden, false);
+  assert.equal(fetchCalls.slice(circuitRequests).some(call => call.method === "POST"), false,
+    "opening recovery details must never start a generic probe or inference");
+  document.getElementById("chatgptUsageClose").click();
+  for (const key of Object.keys(recoveryStation)) delete recoveryStation[key];
+  Object.assign(recoveryStation, originalRecoveryStation);
   const tickerNow = window.Date.now;
   let simulatedNow = tickerNow();
   window.Date.now = () => simulatedNow;

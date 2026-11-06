@@ -368,6 +368,89 @@ class ChatGPTProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("max_output_tokens", payload)
         self.assertEqual(store.result(self.station)["id"], previous["id"])
 
+    async def test_circuit_retry_api_requires_consent_and_recovers_only_after_completion(self):
+        from fastapi import FastAPI
+        from app.web.admin import create_admin_router
+        await self.monitor.discover_models(self.station, manual=True)
+        self.registry.bind_statistics(self.log)
+        store = VisualTestStore(self.temp.name)
+        previous = await VisualTestRunner(self.registry, self.gateway, store).run(self.station, {}, None)
+        err = classify_error("Plus", 503, '{"error":{"message":"unavailable"}}')
+        for _ in range(self.gateway.fail_threshold):
+            self.station.mark_transient_failure(err, self.gateway)
+        self.assertFalse(self.station.quota_exhausted)
+        before_calls = self.station.calls
+        app = FastAPI()
+        app.include_router(create_admin_router(self.registry, self.gateway, self.monitor, self.log))
+        self.calls.clear()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            path = "/admin/station/Plus/subscription-retry"
+            self.assertEqual((await client.post(path, json={})).status_code, 400)
+            self.assertEqual((await client.post(path, json={"confirmed": True})).status_code, 409)
+            self.assertEqual(self.calls, [])
+            self.station.down_since = time.time() - self.gateway.cool_down - 1
+            response = await client.post(path, json={"confirmed": True})
+        result = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["status"], "up")
+        self.assertEqual(result["protection"]["kind"], "normal")
+        self.assertFalse(result["protection"]["recovery_inflight"])
+        self.assertEqual(self.station.consecutive_failures, 0)
+        self.assertEqual(self.station.calls, before_calls)
+        self.assertEqual(self.log._runtime["Plus"]["values"]["status"], "up")
+        self.assertEqual(VisualTestStore(self.temp.name).result(self.station)["id"], previous["id"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(json.loads(self.calls[0].content)["input"], [{"role": "user", "content": "Reply with only OK."}])
+
+    async def test_circuit_retry_incomplete_stream_preserves_protection_and_throttles(self):
+        await self.monitor.discover_models(self.station, manual=True)
+        self.station.status = "down"
+        self.station.down_since = time.time() - self.gateway.cool_down - 1
+        self.events = b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+        runner = VisualTestRunner(self.registry, self.gateway, VisualTestStore(self.temp.name))
+        self.calls.clear()
+        result = await runner.retry_subscription(self.station, None)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["recovered"])
+        self.assertEqual(result["error_code"], "incomplete_response")
+        self.assertEqual(self.station.status, "down")
+        self.assertFalse(self.station.quota_exhausted)
+        self.assertFalse(self.station.recovery_inflight)
+        self.assertIsNone(runner.store.result(self.station))
+        with self.assertRaises(HTTPException) as caught:
+            await runner.retry_subscription(self.station, None)
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_circuit_retry_blocks_parallel_traffic_and_keeps_newer_failure(self):
+        await self.monitor.discover_models(self.station, manual=True)
+        self.station.status = "down"
+        self.station.down_since = time.time() - self.gateway.cool_down - 1
+        runner = VisualTestRunner(self.registry, self.gateway, VisualTestStore(self.temp.name))
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow(request):
+            entered.set()
+            await release.wait()
+            return httpx.Response(200, content=self.events, headers={"content-type": "text/event-stream"})
+        await self.station.client.aclose()
+        self.station.client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+        task = asyncio.create_task(runner.retry_subscription(self.station, None))
+        await entered.wait()
+        self.assertTrue(self.station.recovery_inflight)
+        self.assertFalse(self.registry.is_routeable(self.station))
+        with self.assertRaises(HTTPException):
+            await runner.retry_subscription(self.station, None)
+        self.station.mark_transient_failure(classify_error("Plus", 503, "newer fault"), self.gateway)
+        release.set()
+        result = await task
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["recovered"])
+        self.assertEqual(self.station.status, "down")
+        self.assertFalse(self.station.recovery_inflight)
+        self.assertNotIn("Plus", runner.tasks)
+        self.assertNotIn("Plus", runner.busy)
+
     async def test_subscription_retry_keeps_protection_for_partial_stream_and_limit(self):
         await self.monitor.discover_models(self.station, manual=True)
         self.registry.bind_statistics(self.log)

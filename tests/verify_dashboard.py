@@ -147,7 +147,7 @@ def verify_static() -> None:
     assert 'api("/admin/settings/retry", "PUT", true, body)' in js
     assert '$("retry-infinite-rounds").checked' in js
     assert '$("retry-unlimited-duration").checked' in js
-    assert "return api(path, method, false, body)" in js
+    assert "return api(path, method, false, body, options)" in js
     assert 'new URLSearchParams({' in js
     assert '/admin/logs?${query.toString()}' in js
     analytics = (STATIC / "analytics.js").read_text(encoding="utf-8")
