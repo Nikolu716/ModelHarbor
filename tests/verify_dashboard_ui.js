@@ -206,11 +206,18 @@ async function main() {
   const html = fs.readFileSync(path.join(ROOT, "app", "web", "static", "index.html"), "utf8");
   const script = fs.readFileSync(path.join(ROOT, "app", "web", "static", "dashboard.js"), "utf8");
   const quotaScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "chatgpt-quota.js"), "utf8");
+  const recoveryScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "recovery-status.js"), "utf8");
   const chatgptScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "chatgpt.js"), "utf8");
   const codexBindingScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "codex-binding.js"), "utf8");
   const analyticsScript = fs.readFileSync(path.join(ROOT, "app", "web", "static", "analytics.js"), "utf8");
   const dom = new JSDOM(html, { runScripts: "outside-only", url: "http://127.0.0.1:8000/dashboard" });
   const { window } = dom;
+  const intervalCallbacks = [];
+  const nativeSetInterval = window.setInterval.bind(window);
+  window.setInterval = (callback, delay) => {
+    if (delay === 1000) intervalCallbacks.push(callback);
+    return nativeSetInterval(callback, delay);
+  };
   window.requestAnimationFrame = (callback) => callback();
   const chartInstances = new Map();
   window.echarts = { init(element) {
@@ -419,7 +426,7 @@ async function main() {
   if (!window.HTMLDialogElement.prototype.close) {
     window.HTMLDialogElement.prototype.close = function close() { this.open = false; };
   }
-  window.eval(`${script}\n${analyticsScript}\n${codexBindingScript}\n${chatgptScript}\n${quotaScript}\n;globalThis.__testFormatters = {finiteNumber, formatBalance, formatLatency};globalThis.__testConsumeActivityEvent = consumeActivityEvent;globalThis.__testDrainActivityBuffer = drainActivityBuffer;globalThis.__testApi = api;globalThis.__testProtectionMarkup = protectionMarkup;globalThis.__testRefreshCapabilities = refreshCapabilities;`);
+  window.eval(`${recoveryScript}\n${script}\n${analyticsScript}\n${codexBindingScript}\n${chatgptScript}\n${quotaScript}\n;globalThis.__testFormatters = {finiteNumber, formatBalance, formatLatency};globalThis.__testConsumeActivityEvent = consumeActivityEvent;globalThis.__testDrainActivityBuffer = drainActivityBuffer;globalThis.__testApi = api;globalThis.__testProtectionMarkup = protectionMarkup;globalThis.__testRefreshCapabilities = refreshCapabilities;`);
   await settle();
 
   const document = window.document;
@@ -513,6 +520,47 @@ async function main() {
   protectionContainer.innerHTML = window.__testProtectionMarkup(protectionStation);
   assert.match(protectionContainer.textContent, /限流冷却 · \d+ 秒/);
   assert.match(protectionContainer.textContent, /上游 429 · 遵守上游等待时间/);
+  // Elapsed waits transition locally without fetching or rebuilding preview frames.
+  const recoveryStation = statusFixture.stations[0];
+  const originalRecoveryStation = {...recoveryStation};
+  const tickerNow = window.Date.now;
+  let simulatedNow = tickerNow();
+  window.Date.now = () => simulatedNow;
+  Object.defineProperty(document, "visibilityState", {configurable: true, value: "visible"});
+  Object.assign(recoveryStation, {provider: "chatgpt", quota_exhausted: true,
+    quota_at: simulatedNow / 1000 - 100, quota_error: maliciousModel,
+    protection: {recovery_mode: "passive", until: simulatedNow / 1000 + 2,
+      wait_source: "gateway", recovery_outcome: "interrupted", recovery_error: "client_cancelled"}});
+  const previewFrame = document.createElement("iframe");
+  document.getElementById("grid").append(previewFrame);
+  const beforeTickerRequests = fetchCalls.length;
+  for (const tick of intervalCallbacks) tick();
+  const recoveryBadges = () => [...document.querySelectorAll("[data-protection-name]")]
+    .filter(element => element.dataset.protectionName === maliciousStation);
+  assert.ok(recoveryBadges().length > 0);
+  assert.ok(recoveryBadges().every(element => /验证中断 · 0分02秒/.test(element.textContent)));
+  const stableRecoveryBadges = recoveryBadges();
+  const stableRecoveryLabels = stableRecoveryBadges.map(element => element.querySelector(".station-state"));
+  simulatedNow += 3000;
+  for (const tick of intervalCallbacks) tick();
+  assert.ok(recoveryBadges().every(element => /验证中断 · 待重试/.test(element.textContent)));
+  assert.deepEqual(recoveryBadges(), stableRecoveryBadges, "countdowns must preserve status elements");
+  assert.deepEqual(recoveryBadges().map(element => element.querySelector(".station-state")), stableRecoveryLabels);
+  assert.ok(recoveryBadges().every(element => element.querySelectorAll("img, script").length === 0));
+  assert.equal(fetchCalls.length, beforeTickerRequests);
+  assert.equal(previewFrame.isConnected, true);
+  assert.equal(recoveryStation.quota_exhausted, true);
+  assert.equal(window.pwned, undefined);
+  previewFrame.remove();
+  for (const key of Object.keys(recoveryStation)) delete recoveryStation[key];
+  Object.assign(recoveryStation, originalRecoveryStation);
+  window.Date.now = tickerNow;
+  delete document.visibilityState;
+  for (const tick of intervalCallbacks) tick();
+  Object.defineProperty(document, "visibilityState", {configurable: true, value: "visible"});
+  for (const tick of intervalCallbacks) tick();
+  assert.ok(recoveryBadges().every(element => element.querySelector(".protection-reason") === null));
+  delete document.visibilityState;
   // Subsections and viewport pagination preserve data and form drafts.
   document.getElementById("monitor-tab-history").click();
   assert.equal(document.getElementById("monitor-history").hidden, false);

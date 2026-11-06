@@ -167,11 +167,7 @@ function formatHitRate(rate, known = true) {
 function quotaRecoveryHint(station, gateway = {}) {
   if (!station.quota_exhausted) return "";
   if (station.protection?.recovery_mode === "passive") {
-    const until = Math.max(finiteNumber(station.protection.until), finiteNumber(station.quota_resume_at));
-    if (station.protection.recovery_inflight) return "正在用一个真实请求验证恢复，其他请求暂不进入此渠道。";
-    return until > Date.now() / 1000
-      ? `Codex 使用限制，等待至 ${new Date(until * 1000).toLocaleString()}；${station.protection.wait_source === "upstream" ? "依据上游等待时间" : "上游未提供恢复时间，网关逐步延长等待"}。不发送后台生成请求。`
-      : "等待已结束，下一个真实请求将单独验证恢复；成功后恢复调度，仍受限则延长等待。";
+    return window.ModelHarborRecovery.view(station).detail;
   }
   if (station.provider === "chatgpt") return ["codex_cli", "codex_relay"].includes(station.chatgpt_mode) ? "Codex 返回使用限制，已暂停此渠道；查看官方用量后可手动验证一次，不进行后台重试。" : "订阅共享接口返回使用限制，已暂停此渠道；Codex 剩余额度不能确认该接口恢复。请查看官方用量后手动验证一次，不进行后台重试。";
   const auto = gateway.quota_auto_recover !== false;
@@ -256,9 +252,9 @@ function statusInfo(station) {
   const source = { request: "业务请求", generation_probe: "生成测试", connection_probe: "连接检查" }[protection.source] || "请求";
   const code = protection.status_code ? `HTTP ${protection.status_code}` : "连接失败 / 超时";
   if (!station.enabled) return { className: "unknown", label: "已停用", detail: "管理员停用，不参与路由" };
-  if (station.quota_exhausted) return { className: "quota", label: protection.recovery_mode === "passive"
-    ? protection.recovery_inflight ? "恢复验证中" : remaining > 0 ? "用量限制 · 等待恢复" : "待真实请求验证"
-    : station.provider === "chatgpt" ? "订阅接入受限" : "配额保护", detail: station.provider === "chatgpt" ? quotaRecoveryHint(station) : protection.reason || station.quota_error || "上游报告额度不可用" };
+  const recovery = window.ModelHarborRecovery.view(station);
+  if (recovery) return { className: "quota", label: recovery.label, detail: recovery.detail, reason: recovery.diagnostic };
+  if (station.quota_exhausted) return { className: "quota", label: station.provider === "chatgpt" ? "订阅接入受限" : "配额保护", detail: station.provider === "chatgpt" ? quotaRecoveryHint(station) : protection.reason || station.quota_error || "上游报告额度不可用" };
   if (protection.kind === "rate_limited" && remaining > 0 || finiteNumber(station.rate_limit_until) > now) {
     const wait = remaining || Math.ceil(station.rate_limit_until - now);
     return { className: "cooling", label: `限流冷却 · ${wait} 秒`,
@@ -289,7 +285,25 @@ function updateProtectionDisplays() {
   const stations = new Map((statusData?.stations || []).map(station => [station.name, station]));
   document.querySelectorAll("[data-protection-name]").forEach(element => {
     const station = stations.get(element.dataset.protectionName);
-    if (station) element.outerHTML = protectionMarkup(station);
+    if (!station) return;
+    const state = statusInfo(station);
+    const title = [state.detail, state.reason].filter(Boolean).join("\n");
+    if (element.title !== title) element.title = title;
+    const badge = element.querySelector(".station-state");
+    if (badge) {
+      const className = `station-state ${state.className}`;
+      if (badge.className !== className) badge.className = className;
+      if (badge.textContent !== state.label) badge.textContent = state.label;
+    }
+    let reason = element.querySelector(".protection-reason");
+    if (station.enabled && state.className !== "up") {
+      if (!reason) {
+        reason = document.createElement("span");
+        reason.className = "protection-reason";
+        element.append(reason);
+      }
+      if (reason.textContent !== state.detail) reason.textContent = state.detail;
+    } else reason?.remove();
   });
 }
 
@@ -983,7 +997,7 @@ function renderCards(data) {
       models.push(`<span class="model-tag">+${(station.models || []).length - 6}</span>`);
     }
     const recoveryHint = quotaRecoveryHint(station, data.gateway);
-    const alert = recoveryHint
+    const alert = station.protection?.recovery_mode === "passive" ? "" : recoveryHint
       ? `<p class="card-alert">${escapeHtml(recoveryHint)}</p>`
       : (station.last_error ? `<p class="card-alert">最近错误: ${escapeHtml(station.last_error)}</p>` : "");
     const probeValue = probeResultLabel(station);
@@ -2461,8 +2475,13 @@ $("tab-monitor").parentElement.addEventListener("keydown", (event) => {
   $(`tab-${nextTab}`).focus();
 });
 
+const protectionTicker = setInterval(() => {
+  if (document.visibilityState === "visible") updateProtectionDisplays();
+}, 1000);
+
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    updateProtectionDisplays();
     clearTimeout(activityStreamRetryTimer);
     activityStreamRetryTimer = null;
     ensureActivityStream();
@@ -2471,6 +2490,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 window.addEventListener("beforeunload", () => {
+  clearInterval(protectionTicker);
   clearTimeout(activityStreamRetryTimer);
   activityStreamController?.abort();
 });
@@ -2860,8 +2880,7 @@ function renderStations() {
     const busy = (value) => value ? ' aria-busy="true"' : "";
     return `
       <tr class="${station.enabled ? "" : "is-disabled"}" data-station-row="${escapeHtml(name)}">
-        <td><span class="managed-station-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
-          ${station.quota_exhausted ? `<span class="station-warning">${station.provider === "chatgpt" ? "订阅接入受限" : "上游额度不可用"}</span>` : ""}</td>
+        <td><span class="managed-station-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span></td>
         <td class="station-url-cell" title="${escapeHtml(station.base_url || "")}">${escapeHtml(station.base_url || "-")}</td>
         <td class="station-models-cell"><button type="button" class="catalog-link" data-manage-action="models" data-station="${escapeHtml(name)}" title="${escapeHtml(modelsLabel)}">${escapeHtml(scopeLabel)}</button></td>
         <td title="${station.priority_auto ? "按同模型、同协议的综合健康度自动调度；速度占比采用账号评分策略" : "同健康度档位内优先分流，不改变健康分"}">${station.priority_auto ? `自动${station.rank ? ` · #${station.rank}` : ""}` : formatCount(station.priority)}</td>

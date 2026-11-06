@@ -131,6 +131,77 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.router.acquire(self.st))
         self.assertEqual(self.registry.ensure_semaphore(self.st)._value, 8)
 
+    async def test_recovery_outcomes_persist_without_extending_wait_on_restart(self):
+        for outcome, error, expected in [('cancelled', 'client_cancelled', 'interrupted'),
+                                          ('stream_error', 'incomplete SSE response', 'failed')]:
+            with self.subTest(outcome=outcome):
+                self.restrict()
+                self.due()
+                permit = await self.router.acquire(self.st)
+                until = self.st.quota_resume_at
+                self.router.release(self.st, permit, outcome, error)
+                self.router.release(self.st, permit, 'failed', 'late cleanup')
+                view = self.st.protection_view(self.gateway, time.time())
+                self.assertEqual(view['recovery_outcome'], expected)
+                self.assertEqual(view['recovery_error'], error)
+                self.assertEqual(view['recovery_attempt_at'], permit.recovery_at)
+                self.assertGreaterEqual(view['recovery_finished_at'], permit.recovery_at)
+                restored = StationState(self.cfg, gateway=self.gateway)
+                restored.restore_durable(self.st.durable_view())
+                self.assertEqual(restored.quota_recovery_outcome, expected)
+                self.assertEqual(restored.quota_resume_at, until)
+                self.assertTrue(restored.quota_exhausted)
+
+    async def test_restart_during_recovery_reports_interruption_not_success(self):
+        self.restrict()
+        self.due()
+        permit = await self.router.acquire(self.st)
+        saved = self.st.durable_view()
+        restored = StationState(self.cfg, gateway=self.gateway)
+        restored.restore_durable(saved)
+        self.assertEqual(restored.quota_recovery_outcome, 'interrupted')
+        self.assertEqual(restored.quota_recovery_error, 'service_restarted')
+        self.assertFalse(restored.recovery_inflight)
+        self.assertTrue(restored.quota_exhausted)
+        self.assertEqual(restored.quota_resume_at, self.st.quota_resume_at)
+        self.router.release(self.st, permit)
+
+    async def test_late_cleanup_cannot_replace_new_restriction_or_binding(self):
+        for change_binding in (False, True):
+            with self.subTest(change_binding=change_binding):
+                self.restrict()
+                self.due()
+                permit = await self.router.acquire(self.st)
+                if change_binding:
+                    self.registry.update_station('Native', {'chatgpt_account': 'f' * 32})
+                self.restrict(resets_in_seconds=2400)
+                self.router.release(self.st, permit, 'cancelled', 'client_cancelled')
+                self.assertEqual(self.st.quota_recovery_outcome, '')
+                self.assertGreater(self.st.quota_resume_at, time.time() + 2398)
+
+    async def test_manual_recovery_records_interruption_and_failure(self):
+        runner = VisualTestRunner(self.registry, self.gateway, VisualTestStore(self.temp.name))
+        self.st.probed_models = {'test-model'}
+        for cancelled in (False, True):
+            with self.subTest(cancelled=cancelled):
+                self.restrict()
+                self.due()
+                self.st.quota_at = self.st.quota_probe_at = time.time() - 61
+                runner.next_allowed.clear()
+                runner.run = AsyncMock(side_effect=asyncio.CancelledError() if cancelled else None,
+                                       return_value={'ok': False, 'error': 'incomplete_response'})
+                if cancelled:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await runner.retry_subscription(self.st, None)
+                else:
+                    result = await runner.retry_subscription(self.st, None)
+                    self.assertEqual(result['protection']['recovery_outcome'], 'failed')
+                self.assertEqual(self.st.quota_recovery_outcome, 'interrupted' if cancelled else 'failed')
+                self.assertFalse(self.st.recovery_inflight)
+                self.assertTrue(self.st.quota_exhausted)
+                self.assertGreater(self.st.quota_resume_at, time.time())
+                self.assertNotIn(self.st.cfg.name, runner.busy)
+
     async def test_same_profile_recovery_is_single_flight(self):
         other = StationState(self.cfg, gateway=self.gateway)
         self.registry.states['Alias'] = other
@@ -238,6 +309,7 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
                         pass
             self.assertFalse(self.st.quota_exhausted)
             self.assertFalse(self.st.recovery_inflight)
+            self.assertEqual(self.st.quota_recovery_outcome, '')
         self.assertEqual(len(calls), 2)
 
     async def test_proxy_real_trial_restriction_keeps_structured_wait_without_retry(self):
@@ -266,6 +338,7 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.st.recovery_inflight)
         self.assertGreater(self.st.quota_resume_at, time.time() + 1498)
         self.assertEqual(self.st.quota_code, 'usage_limit_reached')
+        self.assertEqual(self.st.quota_recovery_outcome, '')
 
     async def test_normal_and_mapped_wait_return_429_without_upstream_or_round_retries(self):
         self.st.probed_models = {'test-model'}
@@ -294,6 +367,36 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(int(response.headers['retry-after']), 1198)
         self.assertEqual(calls, [])
         self.proxy._wait_for_retry.assert_not_awaited()
+
+    async def test_real_recovery_stream_closed_by_client_records_interruption(self):
+        events = (b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+                  b'data: {"type":"response.completed","response":{"id":"resp_test","output":[]}}\n\n')
+        calls = []
+        async def upstream(request):
+            calls.append(request)
+            return httpx.Response(200, content=events, headers={'content-type': 'text/event-stream'})
+        self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        self.st.probed_models = {'test-model'}
+        self.st.model_api_paths = {'test-model': ['/responses']}
+        self.restrict()
+        self.due()
+        class Request:
+            client, headers = None, {}
+            async def json(self):
+                return {'model': 'test-model', 'input': 'real request', 'stream': True}
+            async def is_disconnected(self):
+                return False
+        with patch('app.chatgpt.authorized_headers', new=AsyncMock(return_value={})):
+            response = await self.proxy._dispatch(Request(), '/responses')
+            self.assertEqual(response.status_code, 200)
+            await anext(response.body_iterator)
+            await response.body_iterator.aclose()
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self.st.quota_exhausted)
+        self.assertFalse(self.st.recovery_inflight)
+        self.assertEqual(self.st.quota_recovery_outcome, 'interrupted')
+        self.assertEqual(self.st.quota_recovery_error, 'client_stream_closed')
+        self.assertGreater(self.st.quota_resume_at, time.time())
 
     async def test_mapped_recovery_blocks_parallel_request_and_then_recovers(self):
         self.st.probed_models = {'test-model'}

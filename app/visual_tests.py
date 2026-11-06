@@ -546,20 +546,28 @@ class VisualTestRunner:
         self.tasks[name] = task
         st.quota_probe_at = time.time()
         native_recovery = st.native_usage_limited
+        revision, signature = st.quota_revision, st.connection_signature()
+        attempt_at = st.quota_probe_at
+        outcome, error = "failed", "request_aborted"
         if native_recovery:
             st.recovery_inflight = True
-            st.quota_resume_at = max(st.quota_resume_at, st.quota_probe_at + st.native_retry_interval())
-            st.quota_wait_source = "gateway"
+            st.begin_quota_recovery(attempt_at)
         st._persist_state()
         try:
             result = await self.run(st, settings, client_ip, _reserved=True, _save_result=False)
+            outcome, error = ("success" if result["ok"] else "failed"), result.get("error", "")
             if st.quota_exhausted:
                 st.quota_probe_at = time.time()
                 st.quota_probe_error = result["error"]
                 st._persist_state()
+        except asyncio.CancelledError:
+            outcome, error = "cancelled", "client_cancelled"
+            raise
         finally:
             if native_recovery:
                 st.recovery_inflight = False
+                st.finish_quota_recovery(outcome, error, revision=revision,
+                                         signature=signature, attempt_at=attempt_at)
             self.busy.discard(name)
             if self.tasks.get(name) is task:
                 self.tasks.pop(name, None)

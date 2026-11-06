@@ -59,8 +59,11 @@ def verify_static() -> None:
     assert parser.inline_script_blocks == 0, "dashboard JS must remain external"
     assert re.search(r'/static/dashboard\.css\?v=\d+', html)
     assert re.search(r'/static/dashboard\.js\?v=\d+', html)
-    assert '/static/visual-tests.js?v=12' in html
-    assert '/static/chatgpt-quota.js?v=4' in html
+    assert re.search(r'/static/visual-tests\.js\?v=\d+', html)
+    assert re.search(r'/static/chatgpt-quota\.js\?v=\d+', html)
+    assert re.search(r'/static/recovery-status\.js\?v=\d+', html)
+    assert html.index('/static/recovery-status.js?') < html.index('/static/dashboard.js?')
+    assert html.index('/static/recovery-status.js?') < html.index('/static/chatgpt-quota.js?')
     assert '/static/visual-tests.css?v=9' in html
     assert '/static/analytics.js?v=8' in html
     assert '/static/brand-logo-source.png?v=4' in html
@@ -129,7 +132,10 @@ def verify_static() -> None:
 
     assert "function escapeHtml" in js
     assert "encodeURIComponent(stationName)" in js
-    assert "setInterval(" not in js
+    ticker = re.search(r'const protectionTicker = setInterval\(\(\) => \{(.*?)\}, 1000\);', js, re.S)
+    assert ticker and 'updateProtectionDisplays()' in ticker.group(1)
+    assert not re.search(r'\b(?:fetch|api)\s*\(', ticker.group(1))
+    assert 'clearInterval(protectionTicker)' in js
     assert "pendingActions" in js
     assert "function renderRouteStatus" in js
     assert "function renderTokenChart" in js
@@ -243,14 +249,12 @@ def verify_live() -> None:
     settings.data_dir = str(data_dir if data_dir.is_absolute() else ROOT / data_dir)
     base = local_service_url(settings)
 
-    for asset in (
-        "index.html", "dashboard.css?v=42", "dashboard.js?v=45", "analytics.js?v=8",
-        "visual-tests.js?v=11", "visual-tests.css?v=9",
-        "vendor/echarts.min.js?v=5.6.0",
-        "brand-logo-source.png?v=4", "brand-mark-180.png?v=4",
-        "brand-mark-512.png?v=4", "favicon.ico?v=4",
-    ):
-        with urllib.request.urlopen(f"{base}/static/{asset}", timeout=10) as response:
+    with urllib.request.urlopen(f"{base}/", timeout=10) as response:
+        live_html = response.read().decode("utf-8")
+    assets = dict.fromkeys(re.findall(r'(?:src|href)="(/static/[^"\s]+)"', live_html))
+    assert any(asset.startswith('/static/recovery-status.js?') for asset in assets)
+    for asset in assets:
+        with urllib.request.urlopen(f"{base}{asset}", timeout=10) as response:
             assert response.status == 200, f"{asset}: {response.status}"
             assert response.read(), f"{asset}: empty response"
 

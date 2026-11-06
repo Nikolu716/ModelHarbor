@@ -7,7 +7,7 @@
   <link rel="icon" href="/static/brand-mark-512.png?v=4" type="image/png">
   <link rel="icon" href="/static/favicon.ico?v=4" sizes="any">
   <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=4">
-  <link rel="stylesheet" href="/static/dashboard.css?v=51">
+  <link rel="stylesheet" href="/static/dashboard.css?v=52">
   <link rel="stylesheet" href="/static/model-mappings.css?v=1">
   <link rel="stylesheet" href="/static/visual-tests.css?v=9">
   <link rel="stylesheet" href="/static/selects.css?v=1">
@@ -615,7 +615,8 @@
   <dialog id="channelModelsDialog" class="channel-models-dialog" aria-labelledby="channelModelsTitle"><header class="visual-dialog-heading"><div><span class="section-kicker" id="channelModelsStation"></span><h2 id="channelModelsTitle">支持的模型</h2></div><button id="channelModelsClose" class="account-close" type="button" aria-label="关闭模型列表"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="channel-models-toolbar"><input id="channelModelsSearch" type="search" placeholder="搜索完整模型名称" aria-label="搜索完整模型名称"><span id="channelModelsCount"></span></div><div id="channelModelsList" class="channel-models-list"></div><footer class="channel-models-footer" id="channelModelsNote"></footer></dialog>
   <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
   <script src="/static/vendor/echarts.min.js?v=5.6.0" defer=""></script>
-  <script src="/static/dashboard.js?v=56" defer=""></script>
+  <script src="/static/recovery-status.js?v=1" defer></script>
+  <script src="/static/dashboard.js?v=58" defer=""></script>
     <dialog id="chatgptUsageDialog" class="go-usage-dialog chatgpt-usage-dialog" aria-labelledby="chatgptUsageTitle">
       <header><div><span id="chatgptUsageStation" class="section-kicker"></span><div class="subscription-title-row"><h2 id="chatgptUsageTitle">ChatGPT 订阅用量</h2><span id="chatgptUsageIdentity" class="subscription-account-identity"></span></div><span id="chatgptUsageBadge" class="subscription-status-badge" role="status"></span></div><button id="chatgptUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
       <section id="chatgptUsageDevice" class="subscription-device" aria-labelledby="chatgptDeviceTitle" hidden>
@@ -625,7 +626,7 @@
         <div class="subscription-device-actions"><a id="chatgptUsageLogin" class="button primary" href="https://auth.openai.com/codex/device" target="_blank" rel="noopener noreferrer">前往官方登录<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M5 3h8v8M13 3 3 13"/></svg></a><span id="chatgptUsageWaiting" class="subscription-device-wait"><span aria-hidden="true"></span><span id="chatgptUsageExpiry"></span></span></div>
         <p class="subscription-device-hint">完成授权后自动同步用量，无需再次点击连接。</p>
       </section>
-      <section id="chatgptUsageRestriction" class="subscription-restriction" hidden aria-labelledby="chatgptUsageRestrictionTitle"><h3 id="chatgptUsageRestrictionTitle">订阅接入受限</h3><p id="chatgptUsageRestrictionHint"></p><details><summary>上游诊断</summary><p id="chatgptUsageRestrictionDetail"></p></details><div class="subscription-restriction-actions"><a class="button primary" href="https://chatgpt.com/settings/usage?tab=overview" target="_blank" rel="noopener noreferrer">管理官方用量</a><button id="chatgptUsageRetry" class="button secondary" type="button">手动验证一次</button></div><p id="chatgptUsageRetryStatus" role="status" aria-live="polite"></p></section>
+      <section id="chatgptUsageRestriction" class="subscription-restriction" hidden aria-labelledby="chatgptUsageRestrictionTitle"><h3 id="chatgptUsageRestrictionTitle">订阅接入受限</h3><p id="chatgptUsageRestrictionHint"></p><details><summary>限制与验证记录</summary><p id="chatgptUsageRestrictionDetail"></p></details><div class="subscription-restriction-actions"><a class="button primary" href="https://chatgpt.com/settings/usage?tab=overview" target="_blank" rel="noopener noreferrer">管理官方用量</a><button id="chatgptUsageRetry" class="button secondary" type="button">手动验证一次</button></div><p id="chatgptUsageRetryStatus" role="status" aria-live="polite"></p></section>
       <section id="chatgptUsageEmpty" class="subscription-usage-empty" hidden><h3>连接 Codex 用量参考</h3><p>读取官方返回的额度窗口和重置卡；此信息不能单独确认订阅共享接口是否可用。</p></section>
       <p id="chatgptUsageLoading" class="subscription-usage-loading" role="status" hidden><span aria-hidden="true"></span><span>正在读取订阅用量…</span></p>
       <div id="chatgptUsageWindows" class="go-usage-windows"></div>
@@ -636,7 +637,7 @@
     </dialog>
     <script src="/static/codex-binding.js?v=2" defer></script>
     <script src="/static/chatgpt.js?v=7" defer=""></script>
-    <script src="/static/chatgpt-quota.js?v=9" defer></script>
+    <script src="/static/chatgpt-quota.js?v=10" defer></script>
   <script src="/static/go-usage.js?v=2" defer></script>
   <script src="/static/analytics.js?v=8" defer></script>
   <script src="/static/accounts.js?v=17" defer></script>

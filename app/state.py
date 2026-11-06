@@ -86,6 +86,10 @@ class StationState:
     quota_wait_source: str = ""
     quota_recovery_attempts: int = 0
     quota_revision: int = 0
+    quota_recovery_at: float = 0.0
+    quota_recovery_finished_at: float = 0.0
+    quota_recovery_outcome: str = ""
+    quota_recovery_error: str = ""
     last_probe_quota: bool = False
 
     # 429 限流短冷却（到点前不路由该站）
@@ -165,7 +169,9 @@ class StationState:
                  'breaker_status_code', 'ema_latency', 'ttft_ema', 'last_used_at',
                  'quota_exhausted', 'quota_error', 'quota_at', 'quota_source', 'quota_probe_at',
                  'quota_probe_error', 'quota_probe_backoff', 'quota_code', 'quota_limit_id',
-                 'quota_resume_at', 'quota_wait_source', 'quota_recovery_attempts', 'quota_revision', 'rate_limit_until', 'rate_limit_reason',
+                 'quota_resume_at', 'quota_wait_source', 'quota_recovery_attempts', 'quota_revision',
+                 'quota_recovery_at', 'quota_recovery_finished_at', 'quota_recovery_outcome', 'quota_recovery_error',
+                 'rate_limit_until', 'rate_limit_reason',
                  'rate_limit_source', 'rate_limit_wait_source', 'go_usage_status', 'go_usage_error',
                  'go_usage_updated_at', 'go_usage_checked_at', 'go_usage_next_at', 'go_usage_retry_at', 'go_usage_failures')
         return {'signature': self.connection_signature(), 'saved_at': time.time(),
@@ -224,6 +230,11 @@ class StationState:
             self.quota_resume_at = max(self.quota_at + RETRY_INTERVAL, self.rate_limit_until)
             self.quota_recovery_attempts = 1
             self.quota_wait_source = "gateway"
+        if self.quota_recovery_outcome == "in_progress":
+            # A process restart cannot resume or prove completion of a generation.
+            self.quota_recovery_outcome = "interrupted"
+            self.quota_recovery_error = "service_restarted"
+            self.quota_recovery_finished_at = time.time()
         self._update_score()
 
     def _persist_state(self):
@@ -347,6 +358,10 @@ class StationState:
             "recovery_mode": "passive" if self.native_usage_limited else "",
             "recovery_ready": self.native_usage_limited and now >= until and not self.recovery_inflight,
             "recovery_inflight": self.recovery_inflight,
+            "recovery_attempt_at": self.quota_recovery_at,
+            "recovery_finished_at": self.quota_recovery_finished_at,
+            "recovery_outcome": self.quota_recovery_outcome,
+            "recovery_error": self.quota_recovery_error,
         }
 
     def recover_health(self) -> None:
@@ -519,6 +534,26 @@ class StationState:
     def native_retry_interval(self) -> float:
         return min(MAX_RETRY_INTERVAL, RETRY_INTERVAL * 2 ** min(5, max(0, self.quota_recovery_attempts - 1)))
 
+    def begin_quota_recovery(self, now: float) -> None:
+        self.quota_recovery_at = now
+        self.quota_recovery_finished_at = 0.0
+        self.quota_recovery_outcome = "in_progress"
+        self.quota_recovery_error = ""
+        self.quota_resume_at = max(self.quota_resume_at, now + self.native_retry_interval())
+        self.quota_wait_source = "gateway"
+        self._persist_state()
+
+    def finish_quota_recovery(self, outcome: str, error: str, *, revision: int,
+                              signature: str, attempt_at: float) -> None:
+        if (not self.native_usage_limited or revision != self.quota_revision
+                or signature != self.connection_signature() or attempt_at != self.quota_recovery_at
+                or self.quota_recovery_outcome != "in_progress"):
+            return
+        self.quota_recovery_outcome = "interrupted" if outcome == "cancelled" else "failed"
+        self.quota_recovery_error = str(error or "incomplete_response")[:2048]
+        self.quota_recovery_finished_at = time.time()
+        self._persist_state()
+
     def reconcile_usage_wait(self, usage, now):
         if not self.native_usage_limited:
             return
@@ -535,6 +570,8 @@ class StationState:
         self.quota_exhausted = True
         self.quota_error = str(err)
         self.quota_at = time.time()
+        self.quota_recovery_at = self.quota_recovery_finished_at = 0.0
+        self.quota_recovery_outcome = self.quota_recovery_error = ""
         self.quota_code, self.quota_limit_id = err.code, err.limit_id
         if self.native_usage_limited:
             self.quota_recovery_attempts = min(6, self.quota_recovery_attempts + 1)
@@ -581,6 +618,8 @@ class StationState:
         self.quota_code = self.quota_limit_id = self.quota_wait_source = ""
         self.quota_resume_at = 0.0
         self.quota_recovery_attempts = 0
+        self.quota_recovery_at = self.quota_recovery_finished_at = 0.0
+        self.quota_recovery_outcome = self.quota_recovery_error = ""
         self.last_probe_quota = False
         self.rate_limit_until = 0.0
         self.rate_limit_reason = self.rate_limit_source = self.rate_limit_wait_source = ""

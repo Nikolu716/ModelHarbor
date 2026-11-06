@@ -23,6 +23,9 @@ class RoutePermit:
     recovery: bool = False
     released: bool = False
     quota_revision: int = 0
+    native_recovery: bool = False
+    signature: str = ""
+    recovery_at: float = 0.0
 
 
 class Router:
@@ -103,17 +106,20 @@ class Router:
             st.recovery_inflight = True
             st.recovery_attempt_at = now
             if native_recovery:
-                st.quota_resume_at = max(st.quota_resume_at, now + st.native_retry_interval())
-                st.quota_wait_source = "gateway"
-                st._persist_state()
-        return RoutePermit(sem, recovery, quota_revision=st.quota_revision)
+                st.begin_quota_recovery(now)
+        return RoutePermit(sem, recovery, quota_revision=st.quota_revision,
+                           native_recovery=native_recovery, signature=st.connection_signature(), recovery_at=now)
 
-    def release(self, st: StationState, permit: RoutePermit) -> None:
+    def release(self, st: StationState, permit: RoutePermit, outcome: str = "cancelled",
+                error: str = "request_aborted") -> None:
         if not permit.released:
             permit.released = True
             permit.semaphore.release()
             if permit.recovery:
                 st.recovery_inflight = False
+            if permit.native_recovery:
+                st.finish_quota_recovery(outcome, error, revision=permit.quota_revision,
+                                         signature=permit.signature, attempt_at=permit.recovery_at)
 
 
 def _weighted_choice(items: list, probs: list[float]):

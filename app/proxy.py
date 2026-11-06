@@ -123,7 +123,7 @@ class _StreamRouteLease:
             finally:
                 self.closed = True
                 self.registry.end_route(self.route_id, outcome, error)
-                self.router.release(self.st, self.permit)
+                self.router.release(self.st, self.permit, outcome, error)
 
     async def close(self, outcome: str = "cancelled",
                     error: str = "client_stream_closed") -> None:
@@ -1323,7 +1323,7 @@ class OpenAIProxy:
                     await _shielded_close(resp, self.registry)
                 finally:
                     self.registry.end_route(route_id, route_outcome, route_error)
-                    self.router.release(st, permit)
+                    self.router.release(st, permit, route_outcome, route_error)
 
         if local_errors and not attempts and not has_transient:
             return (_error_response(400, local_errors[0], "invalid_request_error"), False)
@@ -1654,7 +1654,7 @@ class OpenAIProxy:
                         if route_outcome == "failed" and not route_error:
                             route_error = "request_aborted"
                         self.registry.end_route(route_id, route_outcome, route_error)
-                        self.router.release(st, permit)
+                        self.router.release(st, permit, route_outcome, route_error)
 
         # ---- 全部失败 ----
         if local_errors and not attempts and not has_transient:

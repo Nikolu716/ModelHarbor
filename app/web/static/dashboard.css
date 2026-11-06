@@ -1449,6 +1449,7 @@ button.heat-cell:hover,button.heat-cell:focus-visible { outline:1px solid #676dc
 .subscription-restriction p { margin:8px 0; color:var(--muted); font-size:12px; line-height:1.8; overflow-wrap:anywhere; }
 .subscription-restriction details { font-size:11px; color:var(--muted); }
 .subscription-restriction summary { cursor:pointer; }
+.subscription-restriction #chatgptUsageRestrictionDetail { white-space:pre-line; }
 .subscription-restriction-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
 .subscription-restriction-actions .button { font-size:11px; }
 .subscription-device { padding:24px; }

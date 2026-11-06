@@ -46,7 +46,7 @@ class _RouterStub:
     def __init__(self) -> None:
         self.released = 0
 
-    def release(self, station, permit) -> None:
+    def release(self, station, permit, outcome="cancelled", error="request_aborted") -> None:
         self.released += 1
 
 

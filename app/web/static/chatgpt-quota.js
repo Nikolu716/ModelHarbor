@@ -131,17 +131,15 @@
     const station = selectedStation(), limited = Boolean(station?.quota_exhausted);
     const protection = station?.protection || {}, passive = limited && protection.recovery_mode === "passive";
     const until = Math.max(station?.quota_resume_at || 0, protection.until || 0);
-    const ready = passive && until <= Date.now() / 1000;
+    const recovery = window.ModelHarborRecovery.view(station);
     el("chatgptUsageRestriction").hidden = !limited && !retryStatus;
-    el("chatgptUsageRestrictionTitle").textContent = passive ? protection.recovery_inflight ? "正在验证恢复" : ready ? "等待真实请求验证" : "Codex 用量限制 · 等待恢复" : limited ? "订阅接入受限" : "订阅接入已恢复";
-    el("chatgptUsageRestrictionHint").textContent = passive
-      ? protection.recovery_inflight ? "正在用一个真实请求确认恢复，其他请求暂不进入此渠道。"
-        : ready ? "下一个真实请求将单独验证恢复；完整成功后恢复调度，仍受限则延长等待。不会发送后台生成请求。"
-          : (protection.wait_source === "upstream" ? "遵守上游返回的等待时间" : "上游未提供恢复时间，网关采用逐步延长的等待") + "，可于 " + new Date(until * 1000).toLocaleString() + " 后尝试。下方额度不能保证特定模型当前可用。"
+    el("chatgptUsageRestrictionTitle").textContent = recovery ? recovery.label : limited ? "订阅接入受限" : "订阅接入已恢复";
+    el("chatgptUsageRestrictionHint").textContent = recovery
+      ? recovery.detail + " 下方用量是官方窗口的参考，仍有剩余不代表已恢复；不会发送后台生成请求。"
       : !limited ? "完整生成验证已成功。" : ["codex_cli", "codex_relay"].includes(station?.chatgpt_mode)
       ? "Codex 返回使用限制，网关已暂停此渠道。查看官方用量后可手动验证一次；不会后台重试。"
       : "上游暂停了订阅共享接口的访问。下方 Codex 窗口仍有剩余，不代表此接口已恢复；网关不会据此推算恢复时间或后台重试。";
-    const detail = limited ? [station.quota_at ? new Date(station.quota_at * 1000).toLocaleString() : "", station.quota_error || "上游拒绝了订阅请求"].filter(Boolean).join(" · ") : "";
+    const detail = recovery ? recovery.diagnostic : limited ? [station.quota_at ? new Date(station.quota_at * 1000).toLocaleString() : "", station.quota_error || "上游拒绝了订阅请求"].filter(Boolean).join(" · ") : "";
     el("chatgptUsageRestrictionDetail").textContent = detail;
     const wait = Math.max(0, Math.ceil(Math.max(retryAfter, passive ? until : 0) - Date.now() / 1000));
     const button = el("chatgptUsageRetry");
