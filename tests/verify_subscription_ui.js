@@ -8,6 +8,7 @@ const dom = new JSDOM(fs.readFileSync(path.join(root, "index.html"), "utf8"), {r
 const w = dom.window, d = w.document, calls = [], copied = [], notices = [], timers = new Map(), intervals = [];
 let timerId = 0;
 let heldUsage = null;
+let stallUsage = false;
 let heldRetry = null, retryConfirmed = false;
 let visualState = null, visualError = null, heldVisual = null;
 w.confirm = () => retryConfirmed;
@@ -33,8 +34,11 @@ w.setTab = w.setSectionTab = () => {};
 w.showToast = (message, error) => notices.push({message, error});
 w.refreshStations = async () => true;
 w.render = () => {};
-w.api = async (url, method = "GET", _reload, body) => {
+w.api = async (url, method = "GET", _reload, body, options) => {
   calls.push({url, method, body});
+  if (url.includes("/usage") && stallUsage) return new Promise((_resolve, reject) => {
+    options.signal.addEventListener("abort", () => reject(new w.DOMException("Aborted", "AbortError")), {once: true});
+  });
   if (url.includes("/usage")) return heldUsage || subscription.chatgpt_usage;
   if (url.endsWith("/subscription-retry")) return heldRetry;
   if (url.endsWith("/codex-login")) return {status: "pending", user_code: "TEST-1234", expires_at: Date.now() / 1000 + 600};
@@ -199,6 +203,9 @@ async function main() {
   const connectedUsage = subscription.chatgpt_usage;
   const hasAuthorizationRequest = () => calls.some(call => call.url.endsWith("/codex-login"));
   let finishRead;
+  const refreshStations = w.refreshStations;
+  w.refreshStations = () => new Promise(() => {});
+  w.refresh = () => new Promise(() => {});
   heldUsage = new Promise(resolve => { finishRead = resolve; });
   const currentCard = d.querySelector("#chatgptUsageWindows section");
   d.getElementById("chatgptUsageRefresh").click();
@@ -209,6 +216,20 @@ async function main() {
   assert.equal(hasAuthorizationRequest(), false, "refresh must never start a new login");
   finishRead(connectedUsage); heldUsage = null; await settle();
   assert.equal(d.getElementById("chatgptUsageDialog").getAttribute("aria-busy"), "false");
+  w.refreshStations = refreshStations;
+  delete w.refresh;
+  stallUsage = true;
+  d.getElementById("chatgptUsageRefresh").click();
+  assert.equal(d.getElementById("chatgptUsageDialog").getAttribute("aria-busy"), "true");
+  assert.equal(timers.size, 1, "a quota request has a bounded client timeout");
+  [...timers.values()][0](); await settle();
+  assert.equal(d.getElementById("chatgptUsageDialog").getAttribute("aria-busy"), "false");
+  assert.equal(d.getElementById("chatgptUsageBadge").textContent, "读取失败");
+  assert.match(d.getElementById("chatgptUsageStatus").textContent, /超时.*保留上次数据/);
+  assert.ok(d.querySelectorAll("#chatgptUsageWindows section").length > 0);
+  assert.equal(hasAuthorizationRequest(), false);
+  assert.equal(timers.size, 0, "failed quota reads never start automatic polling");
+  stallUsage = false;
   d.getElementById("chatgptUsageConnect").click();
   assert.equal(d.getElementById("chatgptUsageReauth").hidden, false);
   assert.equal(hasAuthorizationRequest(), false, "re-authorization needs an explicit second action");

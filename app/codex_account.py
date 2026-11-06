@@ -13,11 +13,58 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from . import __version__
 from .chatgpt import ChatGPTAuthError, _private_directory, _atomic
 
 USAGE_INTERVAL = 900
+USAGE_TIMEOUT = 45
+USAGE_LOCK_TIMEOUT = 3
+RPC_TIMEOUT = 30
+
+
+class CodexAccountError(ChatGPTAuthError):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def codex_environment(directory, *, account_metadata=False):
+    """Isolate credentials; opt only account metadata into the service proxy."""
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("CODEX_") and key not in {
+                       "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ACCESS_TOKEN",
+                       "MODELHARBOR_CODEX_PROXY"}}
+    environment["CODEX_HOME"] = str(directory)
+    proxy = os.environ.get("MODELHARBOR_CODEX_PROXY", "").strip() if account_metadata else ""
+    if proxy:
+        try:
+            parsed = urlsplit(proxy)
+            valid = (parsed.scheme in {"http", "https"} and parsed.hostname
+                     and parsed.port and parsed.path in {"", "/"} and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise CodexAccountError("Codex 代理地址无效，请检查 MODELHARBOR_CODEX_PROXY", "codex_proxy_invalid")
+        # Lowercase variants take precedence in some HTTP stacks.
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            environment[name] = proxy
+    return environment
+
+
+def _rpc_error(error):
+    """Classify known CLI failures without exposing its raw response or tokens."""
+    message = str(error.get("message", "")).lower()
+    if error.get("code") == -32601:
+        return CodexAccountError("当前 Codex CLI 尚不支持此账号接口，请升级 CLI", "codex_method_unsupported")
+    if "workspace routing discovery timed out" in message:
+        return CodexAccountError("Codex 工作空间连接超时，请检查部署主机到 OpenAI 的网络或代理；无需重新授权", "codex_workspace_timeout")
+    if any(value in message for value in ("error sending request", "connection refused", "dns error", "timed out")):
+        return CodexAccountError("Codex 连接官方服务失败，请检查部署主机的网络或代理后刷新；无需重新授权", "codex_network_error")
+    if any(value in message for value in ("401", "unauthorized", "refresh_token_reused", "refresh_token_expired", "invalid_grant")):
+        return CodexAccountError("Codex 账号授权已失效，请重新授权当前绑定的账号", "codex_auth_required")
+    return CodexAccountError("Codex 账号接口暂时读取失败，请稍后刷新，暂不需要重新授权", "codex_rpc_error")
 
 
 def codex_executable():
@@ -110,7 +157,7 @@ class CodexAccount:
         now = time.time()
         return {**self.cache, "stale": bool(self.cache.get("updated_at")) and (
             self.cache["status"] != "connected" or now - self.cache["updated_at"] >= USAGE_INTERVAL * 2),
-            "manual_refresh_at": self.cache.get("checked_at", 0) + 60,
+            "manual_refresh_at": max(self.cache.get("checked_at", 0), self.cache.get("failed_at", 0)) + 60,
             "next_refresh_at": self.next_refresh_at}
 
     async def refresh_background(self):
@@ -123,20 +170,20 @@ class CodexAccount:
         self.next_refresh_at = time.time() + USAGE_INTERVAL
         try:
             await self.refresh()
-        except (ChatGPTAuthError, OSError):
+        except (ChatGPTAuthError, OSError) as exc:
             self.failures += 1
             self.next_refresh_at = time.time() + min(14400, USAGE_INTERVAL * 2 ** min(self.failures, 4))
-            self.cache.update(status="error", error="暂时无法读取订阅用量，保留上次数据；请稍后刷新，只有授权失效时才需要重新授权用量")
+            self._usage_failed(exc)
 
     async def start(self):
         async with self.start_lock:
-            if self.process and self.process.returncode is None:
+            if (self.process and self.process.returncode is None
+                    and self.reader and not self.reader.done()):
                 return
+            if self.process or self.reader:
+                await self.close()
             _private_directory(self.directory)
-            environment = {key: value for key, value in os.environ.items()
-                           if key not in {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ACCESS_TOKEN",
-                                          "CODEX_API_KEY", "CODEX_REMOTE_TOKEN"}}
-            environment["CODEX_HOME"] = str(self.directory)
+            environment = codex_environment(self.directory, account_metadata=True)
             executable = await asyncio.to_thread(codex_executable)
             self.process = await asyncio.create_subprocess_exec(
                 executable, "app-server", "--listen", "stdio://",
@@ -168,12 +215,13 @@ class CodexAccount:
         self.pending[identifier] = future
         try:
             await self._write({"id": identifier, "method": method, "params": params or {}})
-            result = await asyncio.wait_for(future, 30)
+            result = await asyncio.wait_for(future, RPC_TIMEOUT)
             if not isinstance(result, dict):
                 raise ChatGPTAuthError("Codex 账户接口返回了无效响应")
             return result
         except (TimeoutError, BrokenPipeError, ConnectionError) as exc:
-            raise ChatGPTAuthError("Codex 账号接口暂不可用，请稍后重试") from exc
+            await self.close()
+            raise CodexAccountError("Codex 账号连接超时或中断，请稍后刷新；无需重新授权", "codex_connection_error") from exc
         finally:
             self.pending.pop(identifier, None)
 
@@ -185,9 +233,7 @@ class CodexAccount:
                     future = self.pending[message["id"]]
                     if not future.done():
                         if "error" in message:
-                            code = (message.get("error") or {}).get("code")
-                            future.set_exception(ChatGPTAuthError(
-                                "当前 Codex CLI 尚不支持此账号接口，请升级 CLI" if code == -32601 else "Codex 账号接口调用失败，请检查登录或稍后重试"))
+                            future.set_exception(_rpc_error(message.get("error") or {}))
                         else:
                             future.set_result(message.get("result") or {})
                 elif message.get("method") == "account/login/completed":
@@ -279,36 +325,64 @@ class CodexAccount:
             await self.close()
 
     async def refresh(self):
-        async with self.operation_lock:
+        # CLI text generation owns this lock for its entire stream. A quota read
+        # must not wait behind it indefinitely or terminate the active request.
+        try:
+            await asyncio.wait_for(self.operation_lock.acquire(), USAGE_LOCK_TIMEOUT)
+        except TimeoutError as exc:
+            raise CodexAccountError("此 Codex 账号正在处理其他操作，请稍后刷新用量", "codex_account_busy") from exc
+        try:
             if self.login and self.login.get("status") == "failed":
                 return self.login
-            if time.time() - self.cache.get("checked_at", 0) < 60:
+            if time.time() - max(self.cache.get("checked_at", 0), self.cache.get("failed_at", 0)) < 60:
                 return self.view()
-            account = await self._account()
-            result = await self.rpc("account/rateLimits/read")
-            buckets = result.get("rateLimitsByLimitId") or {"codex": result.get("rateLimits") or {}}
-            windows, limits = [], []
-            for name, bucket in buckets.items():
-                if not isinstance(bucket, dict):
-                    continue
-                limit_id = bucket.get("limitId") or name
-                limits.append({"limit_id": limit_id, "reached_type": bucket.get("rateLimitReachedType")})
-                for key in ("primary", "secondary"):
-                    value = bucket.get(key)
-                    if isinstance(value, dict):
-                        windows.append({"name": bucket.get("limitName") or name, "limit_id": limit_id, "window": key,
-                                        "used_percent": value.get("usedPercent"), "duration_mins": value.get("windowDurationMins"),
-                                        "resets_at": value.get("resetsAt")})
-            credits = result.get("rateLimitResetCredits")
-            self.cache.update(status="connected", plan=account.get("planType"), email=account.get("email"),
-                              windows=windows, limits=limits, updated_at=time.time(), reset_credits=credits if isinstance(credits, dict) else None)
-            self.cache["checked_at"] = time.time()
-            self.cache.pop("error", None)
-            self.failures = 0
-            self.next_refresh_at = time.time() + USAGE_INTERVAL
-            _private_directory(self.directory)
-            _atomic(self.directory / "usage.json", json.dumps(self.cache).encode())
-            return self.view()
+            try:
+                async with asyncio.timeout(USAGE_TIMEOUT):
+                    return await self._refresh_usage()
+            except TimeoutError as exc:
+                await self.close()
+                error = CodexAccountError("读取 Codex 用量超时，请检查部署主机的网络或代理后刷新；无需重新授权", "codex_usage_timeout")
+                self._usage_failed(error)
+                raise error from exc
+            except (ChatGPTAuthError, OSError) as exc:
+                self._usage_failed(exc)
+                raise
+        finally:
+            self.operation_lock.release()
+
+    def _usage_failed(self, error):
+        self.cache.update(status="error", failed_at=time.time(),
+                          error=str(error) if isinstance(error, ChatGPTAuthError) else "读取 Codex 用量失败，请检查本机 CLI 和网络后刷新",
+                          error_code=getattr(error, "code", "codex_usage_error"))
+
+    async def _refresh_usage(self):
+        account = await self._account()
+        result = await self.rpc("account/rateLimits/read")
+        buckets = result.get("rateLimitsByLimitId") or {"codex": result.get("rateLimits") or {}}
+        windows, limits = [], []
+        for name, bucket in buckets.items():
+            if not isinstance(bucket, dict):
+                continue
+            limit_id = bucket.get("limitId") or name
+            limits.append({"limit_id": limit_id, "reached_type": bucket.get("rateLimitReachedType")})
+            for key in ("primary", "secondary"):
+                value = bucket.get(key)
+                if isinstance(value, dict):
+                    windows.append({"name": bucket.get("limitName") or name, "limit_id": limit_id, "window": key,
+                                    "used_percent": value.get("usedPercent"), "duration_mins": value.get("windowDurationMins"),
+                                    "resets_at": value.get("resetsAt")})
+        credits = result.get("rateLimitResetCredits")
+        self.cache.update(status="connected", plan=account.get("planType"), email=account.get("email"),
+                          windows=windows, limits=limits, updated_at=time.time(), reset_credits=credits if isinstance(credits, dict) else None)
+        self.cache["checked_at"] = time.time()
+        self.cache.pop("error", None)
+        self.cache.pop("error_code", None)
+        self.cache.pop("failed_at", None)
+        self.failures = 0
+        self.next_refresh_at = time.time() + USAGE_INTERVAL
+        _private_directory(self.directory)
+        _atomic(self.directory / "usage.json", json.dumps(self.cache).encode())
+        return self.view()
 
     async def consume(self, credit_id, idempotency_key):
         async with self.operation_lock:
@@ -316,6 +390,7 @@ class CodexAccount:
             result = await self.rpc("account/rateLimitResetCredit/consume", {"idempotencyKey": idempotency_key,
                 **({"creditId": credit_id} if credit_id else {})})
             self.cache["checked_at"] = 0
+            self.cache.pop("failed_at", None)
         # Refresh even when nothing was consumed; never infer a new quota window.
         try:
             await self.refresh()
@@ -335,3 +410,4 @@ class CodexAccount:
             self.reader.cancel()
             await asyncio.gather(self.reader, return_exceptions=True)
         self.process = None
+        self.reader = None

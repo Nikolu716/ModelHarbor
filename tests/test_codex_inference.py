@@ -1,6 +1,7 @@
 """Native CLI integration: protocol bounds, auth isolation and child cleanup."""
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,6 +112,29 @@ class CodexCLIProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["env"]["CODEX_HOME"], str(self.bridge.directory))
         self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
         self.assertFalse(list(self.bridge.directory.glob("text-*")), "request scratch must be removed")
+
+    async def test_generation_does_not_inherit_metadata_proxy_override(self):
+        for proxy in ("http://127.0.0.1:9999", "http://user:secret@host:bad"):
+            with self.subTest(proxy_valid=proxy.endswith("9999")):
+                self.process = FakeProcess(self.events)
+                environment = {"MODELHARBOR_CODEX_PROXY": proxy,
+                               "HTTPS_PROXY": "http://existing.invalid:80",
+                               "https_proxy": "http://existing.invalid:80",
+                               "OPENAI_API_KEY": "unrelated-key",
+                               "CODEX_REMOTE_TOKEN": "unrelated-token"}
+                with patch.dict(os.environ, environment, clear=True):
+                    response = await self.client.post("https://api.openai.com/v1/responses",
+                        json={"model": "native-model", "input": "hello"})
+                result, error = completed_response(response.content)
+                self.assertIsNone(error)
+                self.assertEqual(result["model"], "native-model")
+                child_env = self.spawned[-1][1]["env"]
+                proxies = {key.lower(): value for key, value in child_env.items()
+                           if key.lower() in {"http_proxy", "https_proxy"}}
+                self.assertEqual(proxies, {"https_proxy": "http://existing.invalid:80"})
+                self.assertNotIn("MODELHARBOR_CODEX_PROXY", child_env)
+                self.assertNotIn("OPENAI_API_KEY", child_env)
+                self.assertNotIn("CODEX_REMOTE_TOKEN", child_env)
 
     async def test_first_cli_error_stops_retries_and_never_reports_completed(self):
         self.process = FakeProcess([{"type": "error", "message": json.dumps({"error": {

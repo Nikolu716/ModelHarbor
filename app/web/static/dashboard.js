@@ -354,7 +354,7 @@ function requestAdminKey() {
   return authPending;
 }
 
-async function api(path, method = "GET", allowAuthRetry = true, body = null) {
+async function api(path, method = "GET", allowAuthRetry = true, body = null, options = {}) {
   const headers = {};
   const accountContext = window.modelHarborAccount;
   if (accountContext && path.startsWith("/admin/") && !path.startsWith("/admin/accounts")) {
@@ -366,7 +366,7 @@ async function api(path, method = "GET", allowAuthRetry = true, body = null) {
   if (body) headers["Content-Type"] = "application/json";
 
   const response = await fetch(path, {
-    method, headers, cache: "no-store",
+    method, headers, cache: "no-store", signal: options.signal,
     body: body ? JSON.stringify(body) : undefined,
   });
   const responseRevision = response.headers?.get?.("X-ModelHarbor-Revision");
@@ -376,7 +376,7 @@ async function api(path, method = "GET", allowAuthRetry = true, body = null) {
   }
   if (response.status === 401 && path.startsWith("/admin/") && allowAuthRetry) {
     localStorage.removeItem("zg_admin_key");
-    if (await requestAdminKey()) return api(path, method, false, body);
+    if (await requestAdminKey()) return api(path, method, false, body, options);
     throw new Error("需要管理密钥");
   }
 

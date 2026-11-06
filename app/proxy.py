@@ -51,11 +51,18 @@ SSE_HEADERS = {
 }
 
 
+class _RetryBudget:
+    def __init__(self):
+        self.deadline: float | None = None
+        self.sent_attempts = 0
+
+
 class _RequestBody(dict):
     """Keep subscription attempts scoped to one client request, across rounds."""
     def __init__(self, body):
         super().__init__(body)
         self.subscription_attempts = getattr(body, "subscription_attempts", set())
+        self.retry_budget = getattr(body, "retry_budget", _RetryBudget())
 
     def copy(self):
         return _RequestBody(self)
@@ -950,6 +957,7 @@ class OpenAIProxy:
             stream = path.endswith("?alt=sse")
         max_retry_seconds = self.gateway.max_retry_seconds
         deadline = (time.monotonic() + max_retry_seconds) if max_retry_seconds else None
+        body.retry_budget.deadline = deadline
         round_index = 0
         total_attempts = 0
         # 仅瞬时失败继续下一轮；确定性错误立即返回。所有客户端均按
@@ -974,7 +982,8 @@ class OpenAIProxy:
                     result, has_transient = await asyncio.wait_for(forward, remaining)
             except asyncio.TimeoutError:
                 return failure(
-                    model, self._retry_timeout_response(max_retry_seconds), total_attempts)
+                    model, self._retry_timeout_response(max_retry_seconds),
+                    max(total_attempts, body.retry_budget.sent_attempts))
             total_attempts += getattr(result, "_zg_attempts", 0)
             if result.status_code == 502:
                 # A trial may just have renewed the usage wait, or another
@@ -1005,7 +1014,7 @@ class OpenAIProxy:
                             return failure(
                                 model,
                                 self._retry_timeout_response(max_retry_seconds),
-                                total_attempts,
+                                max(total_attempts, body.retry_budget.sent_attempts),
                             )
                         if getattr(result, "status_code", 0) != 400:
                             return result
@@ -1104,6 +1113,49 @@ class OpenAIProxy:
     # ------------------------------------------------------------------
     # 非流式转发（完整缓冲，可无缝切换）
     # ------------------------------------------------------------------
+    def _attempt_deadline(self, body, path, remaining_candidates,
+                          sent_attempts, targets=None, current_subscription=None, client_headers=None):
+        """Share only the pre-commit retry window with usable fallback routes.
+
+        No additional cap for a lone channel, unlimited global budgets, or a
+        committed stream. Fast failures leave their unused time for successors.
+        """
+        budget = getattr(body, 'retry_budget', None)
+        if budget is None or budget.deadline is None:
+            return None
+        slots = self.gateway.max_attempts - sent_attempts - 1
+        if slots <= 0:
+            return None
+        subscriptions = set(getattr(body, 'subscription_attempts', ()))
+        if current_subscription is not None:
+            subscriptions.add(current_subscription)
+        fallbacks = 0
+        for st in remaining_candidates:
+            subscription = st.cfg.chatgpt_account or st.cfg.name
+            if st.cfg.provider == 'chatgpt' and subscription in subscriptions:
+                continue
+            if self.router.unavailable_reason(st):
+                continue
+            try:
+                routed_body = {**body, 'model': targets[st.cfg.name]} if targets is not None else body
+                target_path, _, _ = prepare_request(st, path, routed_body, allow_tools=targets is not None)
+                _build_headers(st, client_headers, target_path)
+            except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError):
+                continue
+            fallbacks += 1
+            if st.cfg.provider == 'chatgpt':
+                subscriptions.add(subscription)
+            if fallbacks >= slots:
+                break
+        if not fallbacks:
+            return None
+        now = time.monotonic()
+        remaining = budget.deadline - now
+        # Leave retry delays inside the existing total limit. If configured
+        # delays exceed it, still give each route a positive share of the time.
+        reserve = min(self.gateway.retry_backoff * fallbacks, max(0, remaining) / 2)
+        return now + max(0, remaining - reserve) / (fallbacks + 1)
+
     async def _forward_json(self, path: str, body: dict, model: str, client_ip: str | None = None, client_headers=None):
         """非流式转发：完整缓冲 + 站级无缝切换。
 
@@ -1111,6 +1163,7 @@ class OpenAIProxy:
         值得整体重试一轮（fail-fast 判断依据）。
         """
         attempts: list[str] = []
+        skipped: list[str] = []
         has_transient = False
         local_errors: list[str] = []
         mapping = getattr(body, 'mapping', None)
@@ -1130,27 +1183,42 @@ class OpenAIProxy:
             subscription = st.cfg.chatgpt_account or st.cfg.name
             if st.cfg.provider == "chatgpt" and subscription in getattr(body, "subscription_attempts", ()):
                 continue
-            if (sent_attempts if mapping else idx) >= self.gateway.max_attempts:
+            if sent_attempts >= self.gateway.max_attempts:
                 break
+            reason = self.router.unavailable_reason(st)
+            if reason:
+                skipped.append(f"[{st.cfg.name}] {reason}")
+                has_transient = True
+                continue
+            attempt_deadline = self._attempt_deadline(
+                body, path, candidates[idx + 1:], sent_attempts, targets,
+                subscription if st.cfg.provider == 'chatgpt' else None, client_headers)
             try:
                 model = targets[st.cfg.name] if targets is not None else requested_model
                 routed_body = {**body, 'model': model} if mapping else body
                 signature = st.connection_signature()
                 target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
                 from .chatgpt import authorized_headers
-                headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
+                async with asyncio.timeout_at(attempt_deadline):
+                    headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
+                    if sent_attempts:
+                        await asyncio.sleep(self.gateway.retry_backoff)
                 url = inference_url(st.cfg, target_path, model)
+            except asyncio.TimeoutError:
+                skipped.append(f"[{st.cfg.name}] 调用准备等待超时，已为后备站保留时间")
+                has_transient = True
+                continue
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
                 local_errors.append(str(exc))
                 continue  # No upstream I/O, semaphore, or station-health failure.
-            if attempts:
-                await asyncio.sleep(self.gateway.retry_backoff)
             permit = await self.router.acquire(st)
             if permit is None:
-                attempts.append(f"[{st.cfg.name}] 并发已满")
+                skipped.append(f"[{st.cfg.name}] {self.router.unavailable_reason(st) or '站点暂不可路由'}")
                 has_transient = True  # 下一轮可能不忙
                 continue
             sent_attempts += 1
+            if hasattr(body, 'retry_budget'):
+                body.retry_budget.sent_attempts += 1
             if st.cfg.provider == "chatgpt" and hasattr(body, "subscription_attempts"):
                 body.subscription_attempts.add(subscription)
             route_id = self.registry.begin_route(st.cfg.name, model, client_ip, **log_mapping)
@@ -1158,148 +1226,154 @@ class OpenAIProxy:
             route_error = ""
             resp = None
             try:
-                client = self.registry.ensure_client(st)
-                timeout = httpx.Timeout(
-                    connect=self.gateway.connect_timeout,
-                    read=st.cfg.timeout,
-                    write=30.0, pool=min(10.0, self.gateway.first_byte_timeout * .8),
-                )
-                t0 = time.perf_counter()
-                req = client.build_request("POST", url, json=target_body,
-                                           headers=headers, timeout=timeout)
-                # send 会一直等到响应头返回：用首字节超时兜底卡死站点
-                # （卡死 = 响应头都不回，超时后取消并切换下一站）
-                resp = await asyncio.wait_for(
-                    client.send(req, stream=True, follow_redirects=False),
-                    timeout=self.gateway.first_byte_timeout,
-                )
+                async with asyncio.timeout_at(attempt_deadline) as attempt_timer:
+                    client = self.registry.ensure_client(st)
+                    timeout = httpx.Timeout(
+                        connect=self.gateway.connect_timeout,
+                        read=st.cfg.timeout,
+                        write=30.0, pool=min(10.0, self.gateway.first_byte_timeout * .8),
+                    )
+                    t0 = time.perf_counter()
+                    req = client.build_request("POST", url, json=target_body,
+                                               headers=headers, timeout=timeout)
+                    # send 会一直等到响应头返回：用首字节超时兜底卡死站点
+                    # （卡死 = 响应头都不回，超时后取消并切换下一站）
+                    resp = await asyncio.wait_for(
+                        client.send(req, stream=True, follow_redirects=False),
+                        timeout=self.gateway.first_byte_timeout,
+                    )
 
-                protect_response(resp, self.registry.start_cleanup)
-                if resp.status_code in (200, 201):
-                    # 等首字节（卡死检测），之后缓冲剩余；顺带测量首字时间
-                    try:
-                        stream_iter, first = await _read_first(
-                            resp, timeout=self.gateway.first_byte_timeout)
-                    except (asyncio.TimeoutError, httpx.TimeoutException):
-                        await _shielded_close(resp, self.registry)
-                        err = first_byte_error(st.cfg.name)
-                        self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
-                        route_error = str(err)
-                        attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
-                        has_transient = True
-                        continue
-                    except httpx.TransportError as e:
-                        await _shielded_close(resp, self.registry)
-                        err = connect_error(st.cfg.name, type(e).__name__)
-                        self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
-                        route_error = str(err)
-                        attempts.append(str(err))
-                        has_transient = True
-                        continue
-                    self.registry.update_route_phase(route_id, "receiving")
-                    # 缓冲剩余字节（后续读取超时受 station.timeout 约束）
-                    try:
-                        chunks = [first] if first else []
-                        async for chunk in stream_iter:
-                            chunks.append(chunk)
-                    except (httpx.TimeoutException, httpx.TransportError) as e:
-                        await stream_iter.aclose()
-                        await _shielded_close(resp, self.registry)
-                        err = timeout_error(st.cfg.name,
-                                            f"读取中断: {type(e).__name__}")
-                        self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
-                        route_error = str(err)
-                        attempts.append(str(err))
-                        has_transient = True
-                        continue
-                    await _shielded_close(resp, self.registry)
-
-                    latency = (time.perf_counter() - t0) * 1000
-                    # 非流式不记录 TTFT（响应体和响应头同时到达，无"首字"体感含义）
-                    switched = bool(attempts)
-                    detail = "成功" + (f" (经{len(attempts)}次切换)" if switched else "")
-                    body_bytes = b"".join(chunks)
-                    if st.cfg.provider == "chatgpt":
-                        from .chatgpt import completed_response
+                    protect_response(resp, self.registry.start_cleanup)
+                    if resp.status_code in (200, 201):
+                        # 等首字节（卡死检测），之后缓冲剩余；顺带测量首字时间
                         try:
-                            completed, subscription_error = completed_response(body_bytes)
-                        except (ValueError, TypeError, AttributeError):
-                            completed, subscription_error = None, {"message": "ChatGPT 返回了无效的 Responses 事件流"}
-                        if subscription_error:
-                            err = self._handle_failure(st, classify_error(st.cfg.name, 200, json.dumps({"error": subscription_error})),
+                            stream_iter, first = await _read_first(
+                                resp, timeout=self.gateway.first_byte_timeout)
+                        except (asyncio.TimeoutError, httpx.TimeoutException):
+                            await _shielded_close(resp, self.registry)
+                            err = first_byte_error(st.cfg.name)
+                            self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
+                            route_error = str(err)
+                            attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
+                            has_transient = True
+                            continue
+                        except httpx.TransportError as e:
+                            await _shielded_close(resp, self.registry)
+                            err = connect_error(st.cfg.name, type(e).__name__)
+                            self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
+                            route_error = str(err)
+                            attempts.append(str(err))
+                            has_transient = True
+                            continue
+                        self.registry.update_route_phase(route_id, "receiving")
+                        # 缓冲剩余字节（后续读取超时受 station.timeout 约束）
+                        try:
+                            chunks = [first] if first else []
+                            async for chunk in stream_iter:
+                                chunks.append(chunk)
+                        except (httpx.TimeoutException, httpx.TransportError) as e:
+                            await stream_iter.aclose()
+                            await _shielded_close(resp, self.registry)
+                            err = timeout_error(st.cfg.name,
+                                                f"读取中断: {type(e).__name__}")
+                            self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
+                            route_error = str(err)
+                            attempts.append(str(err))
+                            has_transient = True
+                            continue
+                        await _shielded_close(resp, self.registry)
+
+                        latency = (time.perf_counter() - t0) * 1000
+                        # 非流式不记录 TTFT（响应体和响应头同时到达，无"首字"体感含义）
+                        switched = bool(attempts)
+                        detail = "成功" + (f" (经{len(attempts)}次切换)" if switched else "")
+                        body_bytes = b"".join(chunks)
+                        if st.cfg.provider == "chatgpt":
+                            from .chatgpt import completed_response
+                            try:
+                                completed, subscription_error = completed_response(body_bytes)
+                            except (ValueError, TypeError, AttributeError):
+                                completed, subscription_error = None, {"message": "ChatGPT 返回了无效的 Responses 事件流"}
+                            if subscription_error:
+                                err = self._handle_failure(st, classify_error(st.cfg.name, 200, json.dumps({"error": subscription_error})),
+                                                           retry_after=resp.headers.get('retry-after'), model=model, path=target_path, signature=signature)
+                                route_error = str(err)
+                                attempts.append(str(err))
+                                has_transient |= not err.deterministic
+                                continue
+                            body_bytes = json.dumps(completed, ensure_ascii=False).encode()
+                        if _looks_like_error(body_bytes):
+                            err = self._handle_failure(st, classify_error(st.cfg.name, 200, body_bytes),
                                                        retry_after=resp.headers.get('retry-after'), model=model, path=target_path, signature=signature)
                             route_error = str(err)
                             attempts.append(str(err))
                             has_transient |= not err.deterministic
                             continue
-                        body_bytes = json.dumps(completed, ensure_ascii=False).encode()
-                    if _looks_like_error(body_bytes):
-                        err = self._handle_failure(st, classify_error(st.cfg.name, 200, body_bytes),
-                                                   retry_after=resp.headers.get('retry-after'), model=model, path=target_path, signature=signature)
-                        route_error = str(err)
-                        attempts.append(str(err))
-                        has_transient |= not err.deterministic
-                        continue
-                    if target_path == '/responses':
-                        try:
-                            self.namespace_memory.remember_response(json.loads(body_bytes))
-                        except (ValueError, UnicodeDecodeError):
-                            pass
-                    usage = _extract_usage(body_bytes)
-                    tokens = None if usage is None else usage.tokens
-                    # 协议翻译：chat 响应 → responses（Codex 入口 + chat 站）
-                    if adapter == ("r2c",):
-                        try:
-                            obj = json.loads(body_bytes.decode("utf-8", errors="replace"))
-                            body_bytes = json.dumps(
-                                (mapped_chat_to_responses if mapping else chat_to_responses)(obj, model),
-                                ensure_ascii=False).encode("utf-8")
-                        except (ValueError, TypeError, KeyError):
-                            route_error = '上游响应不符合协议，无法转换'
-                            self._record_request_failure(st, connect_error(st.cfg.name, route_error),
-                                                         model=model, path=target_path, stream=False, signature=signature)
-                            attempts.append(f'[{st.cfg.name}] {route_error}')
-                            has_transient = True
-                            continue
-                    st.record_success(latency / 1000, switched=switched, model=model, path=target_path, signature=signature, quota_revision=permit.quota_revision)
-                    self.eventlog.add(st.cfg.name, model, True, latency,
-                                      detail, attempts=len(attempts) + 1,
-                                      client_ip=client_ip, route_id=route_id, **log_mapping,
-                                      **(usage.as_kwargs() if usage else {
-                                          "tokens": tokens}))
-                    # Juice 被动统计：上游头家族 + model 回显比对 + 真实响应特征指纹
-                    resp_model = response_model(body_bytes)
-                    st.note_upstream(resp.headers, resp_model, model)
-                    self.registry.note_fingerprint(
-                        st, model, response_text(body_bytes))
-                    self.registry.mark_routed(st.cfg.name, model, latency)
-                    route_outcome = "success"
-                    return (Response(
-                        content=body_bytes,
-                        status_code=resp.status_code,
-                        media_type="application/json" if st.cfg.provider == "chatgpt" else resp.headers.get("content-type", "application/json"),
-                    ), False)
-                # 非 2xx：读错误体（该响应尚未被迭代，可安全 aread）
-                payload = await resp.aread()
-                await _shielded_close(resp, self.registry)
-                err = classify_error(st.cfg.name, resp.status_code, payload)
-                err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=False, signature=signature)
-                route_error = str(err)
-                if not err.retryable:
-                    # 客户端问题，无需再试其他站
-                    return (_error_response(err.status_code or 400, err.message,
-                                            "invalid_request_error"), False)
-                attempts.append(str(err))
-                has_transient |= not err.deterministic
+                        if target_path == '/responses':
+                            try:
+                                self.namespace_memory.remember_response(json.loads(body_bytes))
+                            except (ValueError, UnicodeDecodeError):
+                                pass
+                        usage = _extract_usage(body_bytes)
+                        tokens = None if usage is None else usage.tokens
+                        # 协议翻译：chat 响应 → responses（Codex 入口 + chat 站）
+                        if adapter == ("r2c",):
+                            try:
+                                obj = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                                body_bytes = json.dumps(
+                                    (mapped_chat_to_responses if mapping else chat_to_responses)(obj, model),
+                                    ensure_ascii=False).encode("utf-8")
+                            except (ValueError, TypeError, KeyError):
+                                route_error = '上游响应不符合协议，无法转换'
+                                self._record_request_failure(st, connect_error(st.cfg.name, route_error),
+                                                             model=model, path=target_path, stream=False, signature=signature)
+                                attempts.append(f'[{st.cfg.name}] {route_error}')
+                                has_transient = True
+                                continue
+                        st.record_success(latency / 1000, switched=switched, model=model, path=target_path, signature=signature, quota_revision=permit.quota_revision)
+                        self.eventlog.add(st.cfg.name, model, True, latency,
+                                          detail, attempts=len(attempts) + 1,
+                                          client_ip=client_ip, route_id=route_id, **log_mapping,
+                                          **(usage.as_kwargs() if usage else {
+                                              "tokens": tokens}))
+                        # Juice 被动统计：上游头家族 + model 回显比对 + 真实响应特征指纹
+                        resp_model = response_model(body_bytes)
+                        st.note_upstream(resp.headers, resp_model, model)
+                        self.registry.note_fingerprint(
+                            st, model, response_text(body_bytes))
+                        self.registry.mark_routed(st.cfg.name, model, latency)
+                        route_outcome = "success"
+                        return (Response(
+                            content=body_bytes,
+                            status_code=resp.status_code,
+                            media_type="application/json" if st.cfg.provider == "chatgpt" else resp.headers.get("content-type", "application/json"),
+                        ), False)
+                    # 非 2xx：读错误体（该响应尚未被迭代，可安全 aread）
+                    payload = await resp.aread()
+                    await _shielded_close(resp, self.registry)
+                    err = classify_error(st.cfg.name, resp.status_code, payload)
+                    err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=False, signature=signature)
+                    route_error = str(err)
+                    if not err.retryable:
+                        # 客户端问题，无需再试其他站
+                        return (_error_response(err.status_code or 400, err.message,
+                                                "invalid_request_error"), False)
+                    attempts.append(str(err))
+                    has_transient |= not err.deterministic
             except asyncio.CancelledError:
                 route_outcome = "cancelled"
                 route_error = "client_cancelled"
                 raise
             except asyncio.TimeoutError:
-                err = first_byte_error(st.cfg.name)
-                self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
-                route_error = str(err)
-                attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
+                if attempt_timer.expired():
+                    route_outcome = "cancelled"
+                    route_error = "为后备站预留时间，已停止本次等待"
+                    attempts.append(f"[{st.cfg.name}] {route_error}")
+                else:
+                    err = first_byte_error(st.cfg.name)
+                    self._record_request_failure(st, err, model=model, path=target_path, stream=False, signature=signature)
+                    route_error = str(err)
+                    attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
                 has_transient = True
             except httpx.TimeoutException as e:
                 if isinstance(e, httpx.PoolTimeout):
@@ -1328,7 +1402,9 @@ class OpenAIProxy:
         if local_errors and not attempts and not has_transient:
             return (_error_response(400, local_errors[0], "invalid_request_error"), False)
         msg = _all_failed_message(attempts)
-        response = _annotate_attempts(_error_response(502, msg), len(attempts))
+        if skipped:
+            msg += "；跳过: " + " | ".join(skipped)
+        response = _annotate_attempts(_error_response(502, msg), sent_attempts)
         return (response, has_transient)
 
     # ------------------------------------------------------------------
@@ -1340,6 +1416,7 @@ class OpenAIProxy:
         返回 (response, has_transient)，语义同 _forward_json。
         """
         attempts: list[str] = []
+        skipped: list[str] = []
         has_transient = False
         local_errors: list[str] = []
         mapping = getattr(body, 'mapping', None)
@@ -1355,28 +1432,43 @@ class OpenAIProxy:
             subscription = st.cfg.chatgpt_account or st.cfg.name
             if st.cfg.provider == "chatgpt" and subscription in getattr(body, "subscription_attempts", ()):
                 continue
-            if (sent_attempts if mapping else idx) >= self.gateway.max_attempts:
+            if sent_attempts >= self.gateway.max_attempts:
                 break
+            reason = self.router.unavailable_reason(st)
+            if reason:
+                skipped.append(f"[{st.cfg.name}] {reason}")
+                has_transient = True
+                continue
+            attempt_deadline = self._attempt_deadline(
+                body, path, candidates[idx + 1:], sent_attempts, targets,
+                subscription if st.cfg.provider == 'chatgpt' else None, client_headers)
             try:
                 model = targets[st.cfg.name] if targets is not None else requested_model
                 routed_body = {**body, 'model': model} if mapping else body
                 signature = st.connection_signature()
                 target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
                 from .chatgpt import authorized_headers
-                headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
+                async with asyncio.timeout_at(attempt_deadline):
+                    headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
+                    if sent_attempts:
+                        await asyncio.sleep(self.gateway.retry_backoff)
                 url = inference_url(st.cfg, target_path, model)
+            except asyncio.TimeoutError:
+                skipped.append(f"[{st.cfg.name}] 调用准备等待超时，已为后备站保留时间")
+                has_transient = True
+                continue
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError) as exc:
                 local_errors.append(str(exc))
                 continue  # No upstream I/O, semaphore, or station-health failure.
-            if attempts:
-                await asyncio.sleep(self.gateway.retry_backoff)
             permit = await self.router.acquire(st)
             if permit is None:
-                attempts.append(f"[{st.cfg.name}] 并发已满")
+                skipped.append(f"[{st.cfg.name}] {self.router.unavailable_reason(st) or '站点暂不可路由'}")
                 has_transient = True
                 continue
 
             sent_attempts += 1
+            if hasattr(body, 'retry_budget'):
+                body.retry_budget.sent_attempts += 1
             if st.cfg.provider == "chatgpt" and hasattr(body, "subscription_attempts"):
                 body.subscription_attempts.add(subscription)
             route_id = self.registry.begin_route(st.cfg.name, model, client_ip, **log_mapping)
@@ -1385,99 +1477,100 @@ class OpenAIProxy:
             transferred = False
             resp = None
             try:
-                client = self.registry.ensure_client(st)
-                timeout = httpx.Timeout(
-                    connect=self.gateway.connect_timeout,
-                    read=self.gateway.read_timeout,
-                    write=30.0, pool=min(10.0, self.gateway.first_byte_timeout * .8),
-                )
-                t0 = time.perf_counter()
-                req = client.build_request("POST", url, json=target_body,
-                                           headers=headers, timeout=timeout)
-                try:
-                    # send 会一直等到响应头返回：用首字节超时兜底卡死站点
-                    resp = await asyncio.wait_for(
-                        client.send(req, stream=True, follow_redirects=False),
-                        timeout=self.gateway.first_byte_timeout,
+                async with asyncio.timeout_at(attempt_deadline) as attempt_timer:
+                    client = self.registry.ensure_client(st)
+                    timeout = httpx.Timeout(
+                        connect=self.gateway.connect_timeout,
+                        read=self.gateway.read_timeout,
+                        write=30.0, pool=min(10.0, self.gateway.first_byte_timeout * .8),
                     )
-                except asyncio.TimeoutError:
-                    err = first_byte_error(st.cfg.name)
-                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
-                    route_error = str(err)
-                    attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
-                    has_transient = True
-                    continue
-                except httpx.TimeoutException as e:
-                    if isinstance(e, httpx.PoolTimeout):
-                        err = self._local_pool_error(st, client)
-                    else:
-                        err = timeout_error(st.cfg.name)
+                    t0 = time.perf_counter()
+                    req = client.build_request("POST", url, json=target_body,
+                                               headers=headers, timeout=timeout)
+                    try:
+                        # send 会一直等到响应头返回：用首字节超时兜底卡死站点
+                        resp = await asyncio.wait_for(
+                            client.send(req, stream=True, follow_redirects=False),
+                            timeout=self.gateway.first_byte_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        err = first_byte_error(st.cfg.name)
                         self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
-                    route_error = str(err)
-                    attempts.append(str(err))
-                    has_transient = True
-                    continue
-                except httpx.TransportError as e:
-                    err = connect_error(st.cfg.name, type(e).__name__)
-                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
-                    route_error = str(err)
-                    attempts.append(str(err))
-                    has_transient = True
-                    continue
+                        route_error = str(err)
+                        attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
+                        has_transient = True
+                        continue
+                    except httpx.TimeoutException as e:
+                        if isinstance(e, httpx.PoolTimeout):
+                            err = self._local_pool_error(st, client)
+                        else:
+                            err = timeout_error(st.cfg.name)
+                            self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
+                        route_error = str(err)
+                        attempts.append(str(err))
+                        has_transient = True
+                        continue
+                    except httpx.TransportError as e:
+                        err = connect_error(st.cfg.name, type(e).__name__)
+                        self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
+                        route_error = str(err)
+                        attempts.append(str(err))
+                        has_transient = True
+                        continue
 
-                protect_response(resp, self.registry.start_cleanup)
-                # ---- 状态码检查（首字节之前，可切换） ----
-                if resp.status_code != 200:
-                    payload = await resp.aread()
-                    err = classify_error(st.cfg.name, resp.status_code, payload)
-                    err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
-                    route_error = str(err)
-                    if not err.retryable:
-                        return (_error_response(err.status_code or 400, err.message,
-                                                "invalid_request_error"), False)
-                    attempts.append(str(err))
-                    has_transient |= not err.deterministic
-                    continue
+                    protect_response(resp, self.registry.start_cleanup)
+                    # ---- 状态码检查（首字节之前，可切换） ----
+                    if resp.status_code != 200:
+                        payload = await resp.aread()
+                        err = classify_error(st.cfg.name, resp.status_code, payload)
+                        err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
+                        route_error = str(err)
+                        if not err.retryable:
+                            return (_error_response(err.status_code or 400, err.message,
+                                                    "invalid_request_error"), False)
+                        attempts.append(str(err))
+                        has_transient |= not err.deterministic
+                        continue
 
-                # ---- 等首个内容事件（卡死检测点 + 首字时间测量） ----
-                stream_iter = resp.aiter_bytes()
-                try:
-                    buffered, has_content = await _read_until_content(
-                        stream_iter, timeout=self.gateway.first_token_timeout)
-                except (asyncio.TimeoutError, httpx.TimeoutException):
-                    await stream_iter.aclose()
-                    err = first_byte_error(st.cfg.name)
-                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
-                    route_error = str(err)
-                    attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
-                    has_transient = True
-                    continue
-                except httpx.TransportError as e:
-                    await stream_iter.aclose()
-                    err = connect_error(st.cfg.name, type(e).__name__)
-                    self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
-                    route_error = str(err)
-                    attempts.append(str(err))
-                    has_transient = True
-                    continue
-                first = buffered[0] if buffered else b""
+                    # ---- 等首个内容事件（卡死检测点 + 首字时间测量） ----
+                    stream_iter = resp.aiter_bytes()
+                    try:
+                        buffered, has_content = await _read_until_content(
+                            stream_iter, timeout=self.gateway.first_token_timeout)
+                    except (asyncio.TimeoutError, httpx.TimeoutException):
+                        await stream_iter.aclose()
+                        err = first_byte_error(st.cfg.name)
+                        self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
+                        route_error = str(err)
+                        attempts.append(f"[{st.cfg.name}] {STUCK_MSG}")
+                        has_transient = True
+                        continue
+                    except httpx.TransportError as e:
+                        await stream_iter.aclose()
+                        err = connect_error(st.cfg.name, type(e).__name__)
+                        self._record_request_failure(st, err, model=model, path=target_path, stream=True, signature=signature)
+                        route_error = str(err)
+                        attempts.append(str(err))
+                        has_transient = True
+                        continue
+                    first = buffered[0] if buffered else b""
 
-                # ---- 首块校验（200 + error JSON 的情况） ----
-                if _looks_like_error(b"".join(buffered)):
-                    raw_error = b"".join(buffered)
-                    for line in raw_error.splitlines():
-                        if line.startswith(b"data:") and _looks_like_error(line[5:].strip()):
-                            raw_error = line[5:].strip()
-                            break
-                    err = classify_error(st.cfg.name, 200, raw_error)
-                    err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
-                    route_error = str(err)
-                    if not err.retryable:
-                        return (_error_response(400, err.message,
-                                                "invalid_request_error"), False)
-                    attempts.append(str(err))
-                    has_transient |= not err.deterministic
-                    continue
+                    # ---- 首块校验（200 + error JSON 的情况） ----
+                    if _looks_like_error(b"".join(buffered)):
+                        raw_error = b"".join(buffered)
+                        for line in raw_error.splitlines():
+                            if line.startswith(b"data:") and _looks_like_error(line[5:].strip()):
+                                raw_error = line[5:].strip()
+                                break
+                        err = classify_error(st.cfg.name, 200, raw_error)
+                        err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
+                        route_error = str(err)
+                        if not err.retryable:
+                            return (_error_response(400, err.message,
+                                                    "invalid_request_error"), False)
+                        attempts.append(str(err))
+                        has_transient |= not err.deterministic
+                        continue
 
                 # ===== 已提交：开始透传（此后不可切换） =====
                 latency = (time.perf_counter() - t0) * 1000
@@ -1632,6 +1725,12 @@ class OpenAIProxy:
                 route_outcome = "cancelled"
                 route_error = "client_cancelled"
                 raise
+            except asyncio.TimeoutError:
+                # This is our scheduling deadline, not the upstream's timeout.
+                route_outcome = "cancelled"
+                route_error = "为后备站预留时间，已停止本次等待"
+                attempts.append(f"[{st.cfg.name}] {route_error}")
+                has_transient = True
             except httpx.TimeoutException as e:
                 err = (self._local_pool_error(st, client) if isinstance(e, httpx.PoolTimeout)
                        else timeout_error(st.cfg.name))
@@ -1660,5 +1759,7 @@ class OpenAIProxy:
         if local_errors and not attempts and not has_transient:
             return (_error_response(400, local_errors[0], "invalid_request_error"), False)
         msg = _all_failed_message(attempts)
-        response = _annotate_attempts(_error_response(502, msg), len(attempts))
+        if skipped:
+            msg += "；跳过: " + " | ".join(skipped)
+        response = _annotate_attempts(_error_response(502, msg), sent_attempts)
         return (response, has_transient)

@@ -243,23 +243,27 @@
   async function refresh(manual) {
     if (busy || !profile) return;
     const id = profile, revision = epoch;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 55000);
     if (manual) confirming = false;
     busy = true; operation = "read"; renderControls();
     try {
-      const usage = await api("/admin/chatgpt/profile/" + encodeURIComponent(id) + "/usage" + (manual ? "?refresh=true" : ""));
+      const usage = await api("/admin/chatgpt/profile/" + encodeURIComponent(id) + "/usage" + (manual ? "?refresh=true" : ""),
+        "GET", true, null, {signal: controller.signal});
       if (epoch === revision) {
         pollFailures = 0; update(id, usage); render(true);
-        if (manual) {
-          await refreshStations({force: true});
-          if (typeof window.refresh === "function") await window.refresh(true);
-        }
       }
     } catch (error) {
       if (epoch === revision) {
-        pollFailures++; data = {...data, error: error.message};
-        if (manual) showToast(error.message, true);
+        const message = error.name === "AbortError" ? "读取用量超时，请检查网关连接后刷新；已保留上次数据" : error.message;
+        pollFailures++; data = {...data, status: pending() ? "pending" : "error", stale: Boolean(data?.updated_at), error: message,
+          manual_refresh_at: Date.now() / 1000 + 60};
+        if (manual) showToast(message, true);
       }
-    } finally { if (epoch === revision) { busy = false; operation = ""; renderDetail(); schedulePoll(); } }
+    } finally {
+      clearTimeout(timeout);
+      if (epoch === revision) { busy = false; operation = ""; renderDetail(); schedulePoll(); }
+    }
   }
   function connect() {
     if (busy || !profile) return;

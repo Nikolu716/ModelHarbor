@@ -82,8 +82,38 @@ class Router:
             ordered.insert(0, trial)
         return ordered
 
+    def unavailable_reason(self, st: StationState, *, check_concurrency: bool = True) -> str | None:
+        """Explain a local routing refusal without treating it as an upstream fault.
+
+        Recheck after taking a semaphore: the candidate snapshot can become stale
+        while credentials are refreshed or another request starts recovery.
+        """
+        now = time.time()
+        if not st.enabled:
+            return "站点已停用"
+        if st.cfg.provider == "chatgpt" and self.registry.subscription_recovery_busy(st):
+            return "账号正在恢复验证"
+        recovery = st.status == STATUS_DOWN or st.native_usage_limited
+        if recovery and (st.recovery_inflight or st.generation_probe_lock.locked()):
+            return "站点正在恢复验证"
+        if not self.registry.is_routeable(st, now):
+            if st.quota_exhausted:
+                return "站点额度暂不可用"
+            if now < st.rate_limit_until:
+                return "站点正在限流冷却"
+            if st.status == STATUS_DOWN:
+                return "站点正在熔断冷却"
+            return "站点暂不可路由"
+        if recovery and now < st.recovery_attempt_at + max(1.0, self.gateway.cool_down):
+            return "站点正在等待下一次恢复验证"
+        if check_concurrency and self.registry.ensure_semaphore(st).locked():
+            return "并发已满"
+        return None
+
     async def acquire(self, st: StationState, timeout: float = 0.0) -> RoutePermit | None:
         """尝试获取站点并发额度；timeout=0 时立即失败不等待。"""
+        if self.unavailable_reason(st, check_concurrency=False):
+            return None
         sem = self.registry.ensure_semaphore(st)
         if timeout > 0:
             try:
@@ -97,9 +127,7 @@ class Router:
         now = time.time()
         native_recovery = st.native_usage_limited
         recovery = st.status == STATUS_DOWN or native_recovery
-        if not self.registry.is_routeable(st, now) or (recovery and (
-                st.recovery_inflight or st.generation_probe_lock.locked()
-                or now < st.recovery_attempt_at + max(1.0, self.gateway.cool_down))):
+        if self.unavailable_reason(st, check_concurrency=False):
             sem.release()
             return None
         if recovery:

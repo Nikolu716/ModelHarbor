@@ -131,7 +131,7 @@ class _CLIStream(httpx.AsyncByteStream):
                 await self.aclose()
 
     async def _iterate(self, bridge):
-        from .codex_account import codex_executable
+        from .codex_account import codex_executable, codex_environment
         identifier = "resp_codex_" + uuid.uuid4().hex
         response = {"id": identifier, "object": "response", "created_at": int(time.time()),
                     "model": self.body["model"], "status": "in_progress", "output": []}
@@ -141,10 +141,7 @@ class _CLIStream(httpx.AsyncByteStream):
                 await bridge._account()  # Verify the explicitly linked account before inference.
                 await bridge.close()  # Prevent two native processes rotating the same login.
                 executable = await asyncio.to_thread(codex_executable)
-                environment = {key: value for key, value in os.environ.items()
-                               if not key.startswith("CODEX_") and key not in {
-                                   "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ACCESS_TOKEN"}}
-                environment["CODEX_HOME"] = str(bridge.directory)
+                environment = codex_environment(bridge.directory)
                 self.scratch = tempfile.TemporaryDirectory(prefix="text-", dir=bridge.directory)
                 scratch = self.scratch.name
                 instructions = Path(scratch) / "instructions.txt"
