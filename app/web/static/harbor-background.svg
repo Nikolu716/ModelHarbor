@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1200" fill="none">
+  <defs>
+    <radialGradient id="wash">
+      <stop stop-color="#dcd9ed" stop-opacity=".65"/>
+      <stop offset="1" stop-color="#f5f5f9" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="line" x1="480" y1="90" x2="1500" y2="780" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity="0"/>
+      <stop offset=".55" stop-color="#c9c5df" stop-opacity=".4"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=".7"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="1380" cy="160" rx="720" ry="620" fill="url(#wash)"/>
+  <ellipse cx="180" cy="1160" rx="650" ry="420" fill="url(#wash)" opacity=".4"/>
+  <g stroke="url(#line)" stroke-width="1.2">
+    <path d="M570-70C970 25 870 395 1280 445S1660 610 1690 810"/>
+    <path d="M615-80C1015 15 915 385 1325 435S1705 600 1735 800"/>
+    <path d="M660-90C1060 5 960 375 1370 425S1750 590 1780 790"/>
+    <path d="M705-100C1105-5 1005 365 1415 415S1795 580 1825 780"/>
+    <path d="M750-110C1150-15 1050 355 1460 405S1840 570 1870 770"/>
+    <path d="M795-120C1195-25 1095 345 1505 395S1885 560 1915 760"/>
+    <path d="M840-130C1240-35 1140 335 1550 385S1930 550 1960 750"/>
+  </g>
+</svg>

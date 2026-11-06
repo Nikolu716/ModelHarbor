@@ -9,6 +9,7 @@ const w = dom.window, d = w.document, calls = [], copied = [], notices = [], tim
 let timerId = 0;
 let heldUsage = null;
 let heldRetry = null, retryConfirmed = false;
+let visualState = null, visualError = null, heldVisual = null;
 w.confirm = () => retryConfirmed;
 const popups = [];
 w.open = (...args) => { popups.push(args); return null; };
@@ -38,6 +39,13 @@ w.api = async (url, method = "GET", _reload, body) => {
   if (url.endsWith("/subscription-retry")) return heldRetry;
   if (url.endsWith("/codex-login")) return {status: "pending", user_code: "TEST-1234", expires_at: Date.now() / 1000 + 600};
   if (url === "/admin/visual-tests/prompts") return [{id: "builtin", name: "Draw", prompt: "Draw an SVG", builtin: true}];
+  if (url.endsWith("/visual-test")) {
+    if (method === "POST") {
+      if (visualError) throw visualError;
+      return heldVisual || {running: true};
+    }
+    if (visualState) return visualState;
+  }
   return method === "POST" ? {running: true} : {result: null, running: false, schedule: {enabled: false}};
 };
 w.ModelHarborChatGPT = {consume: async () => {}};
@@ -74,6 +82,67 @@ async function main() {
   assert.equal(submitted.model, "gpt-test");
   assert.equal("max_output_tokens" in submitted, false);
   d.getElementById("visualTestClose").click();
+  // Manual IQ tests obey the same passive recovery gate as real traffic.
+  subscription.quota_exhausted = true;
+  subscription.quota_resume_at = Date.now() / 1000 + 600;
+  subscription.protection = {recovery_mode: "passive", until: subscription.quota_resume_at,
+    wait_source: "gateway", recovery_outcome: "interrupted", recovery_error: "client_cancelled"};
+  visualState = {running: false, result: null, quota_exhausted: true,
+    quota_resume_at: subscription.quota_resume_at, protection: subscription.protection};
+  await open("ChatGPT");
+  const run = d.getElementById("visualTestRun"), form = d.getElementById("visualTestForm");
+  const submitTest = () => form.dispatchEvent(new w.Event("submit", {bubbles: true, cancelable: true}));
+  const visualPosts = () => calls.filter(call => call.url.endsWith("/visual-test") && call.method === "POST");
+  const countdown = intervals.find(callback => callback.toString().includes("syncRunControl()"));
+  assert.ok(countdown);
+  Object.defineProperty(d, "hidden", {configurable: true, value: false});
+  assert.equal(run.disabled, true);
+  assert.equal(d.getElementById("visualTestProtection").hidden, false);
+  assert.match(d.getElementById("visualTestProtection").textContent, /客户端取消了请求/);
+  const blockedPosts = visualPosts().length;
+  submitTest(); await settle();
+  assert.equal(visualPosts().length, blockedPosts);
+  d.getElementById("visualTestPrompt").value = "Keep my draft";
+  const beforeCountdown = calls.length;
+  countdown(); countdown();
+  assert.equal(calls.length, beforeCountdown);
+  assert.equal(d.getElementById("visualTestPrompt").value, "Keep my draft");
+  subscription.quota_resume_at = subscription.protection.until = Date.now() / 1000 - 1;
+  countdown();
+  assert.equal(run.disabled, false);
+  assert.equal(run.textContent, "验证并测试一次");
+  visualError = Object.assign(new Error("请等待 60 秒再测试"), {status: 429, retryAfter: 60});
+  submitTest(); await settle();
+  assert.match(d.getElementById("visualTestStatus").textContent, /未提交测试.*未发送生成请求/);
+  assert.equal(run.disabled, true);
+  assert.equal(visualPosts().length, blockedPosts + 1);
+  submitTest(); await settle();
+  assert.equal(visualPosts().length, blockedPosts + 1);
+  d.getElementById("visualTestClose").click();
+  subscription.quota_exhausted = false;
+  subscription.quota_resume_at = 0;
+  subscription.protection = {};
+  visualState = null;
+  await open("ChatGPT");
+  visualError = Object.assign(new Error("配置已变化"), {status: 409});
+  submitTest(); await settle();
+  assert.match(d.getElementById("visualTestStatus").textContent, /未提交测试/);
+  visualError = new Error("网络连接中断");
+  submitTest(); await settle();
+  assert.match(d.getElementById("visualTestStatus").textContent, /提交未确认/);
+  visualError = null;
+  let finishVisual;
+  heldVisual = new Promise(resolve => {finishVisual = resolve;});
+  const beforeRepeatedSubmit = visualPosts().length;
+  submitTest(); submitTest(); await settle();
+  assert.equal(run.disabled, true);
+  assert.equal(run.textContent, "提交中…");
+  assert.equal(visualPosts().length, beforeRepeatedSubmit + 1);
+  finishVisual({running: true}); await settle();
+  assert.equal(run.textContent, "生成中…");
+  heldVisual = null;
+  d.getElementById("visualTestClose").click();
+  delete d.hidden;
   const quota = d.createElement("div");
   quota.innerHTML = w.ModelHarborChatGPTQuota.markup(subscription);
   d.body.append(quota);

@@ -445,6 +445,140 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.headers['retry-after'], blocked.headers['retry-after'])
 
+    async def test_cancelled_trial_uses_short_wait_without_increasing_backoff(self):
+        self.restrict()
+        self.due()
+        permit = await self.router.acquire(self.st)
+        self.router.release(self.st, permit, 'cancelled', 'client_cancelled')
+        self.assertAlmostEqual(self.st.quota_resume_at - permit.recovery_at, 60)
+        self.assertEqual(self.st.quota_recovery_attempts, 1)
+        self.assertTrue(self.st.quota_exhausted)
+        self.assertEqual(self.st.quota_recovery_outcome, 'interrupted')
+
+    async def test_restore_old_interruption_does_not_shorten_upstream_wait(self):
+        self.restrict()
+        saved = self.st.durable_view()
+        attempt = time.time() - 180
+        saved['values'].update(quota_at=attempt - 3600, quota_recovery_at=attempt,
+            quota_recovery_outcome='interrupted', quota_recovery_error='client_cancelled',
+            quota_resume_at=attempt + 900, quota_wait_source='gateway')
+        restored = StationState(self.cfg, gateway=self.gateway)
+        restored.restore_durable(saved)
+        self.assertEqual(restored.quota_resume_at, attempt + 60)
+        self.assertTrue(restored.quota_exhausted)
+        self.assertEqual(restored.quota_recovery_attempts, 1)
+        saved['values']['quota_wait_source'] = 'upstream'
+        restored.restore_durable(saved)
+        self.assertEqual(restored.quota_resume_at, attempt + 900)
+        saved['values'].update(quota_wait_source='gateway', quota_at=attempt + 1)
+        restored.restore_durable(saved)
+        self.assertEqual(restored.quota_resume_at, attempt + 900)
+
+    def visual_runner_due(self):
+        self.st.probed_models = {'test-model'}
+        self.st.model_api_paths = {'test-model': ['/responses']}
+        self.restrict()
+        self.due()
+        self.st.quota_at = self.st.quota_probe_at = time.time() - 120
+        return VisualTestRunner(self.registry, self.gateway, VisualTestStore(self.temp.name))
+
+    async def test_visual_submit_recovers_once_and_blocks_alias_real_requests(self):
+        runner = self.visual_runner_due()
+        self.registry.add_station(StationConfig.from_dict('Alias', {'provider': 'chatgpt', 'chatgpt_mode': 'codex_relay',
+            'chatgpt_account': self.cfg.chatgpt_account}))
+        other = self.registry.get('Alias')
+        other.probed_models = {'test-model'}
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        async def upstream(request):
+            calls.append(request)
+            entered.set()
+            await release.wait()
+            event = {'type': 'response.completed', 'response': {'id': 'resp_ok',
+                'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': '<svg></svg>'}]}]}}
+            return httpx.Response(200, content=('data: ' + json.dumps(event) + '\n\n').encode(),
+                                  headers={'content-type': 'text/event-stream'})
+        self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        with patch('app.chatgpt.authorized_headers', new=AsyncMock(return_value={})):
+            job = runner.submit(self.st, {'model': 'test-model', 'prompt': 'Draw SVG'}, None, lambda _: None)
+            task = runner.tasks['Native']
+            try:
+                self.assertTrue(job['running'])
+                self.assertEqual(job['job']['state'], 'running')
+                self.assertTrue(self.st.recovery_inflight)
+                await asyncio.wait_for(entered.wait(), 2)
+                with self.assertRaises(HTTPException):
+                    runner.submit(self.st, {'model': 'test-model', 'prompt': 'Draw SVG'}, None, lambda _: None)
+                self.assertIsNone(await self.router.acquire(other))
+                with self.assertRaises(HTTPException) as blocked:
+                    runner.submit(other, {'model': 'test-model', 'prompt': 'Draw SVG'}, None, lambda _: None)
+                self.assertEqual(blocked.exception.status_code, 409)
+            finally:
+                release.set()
+                await task
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.st.quota_exhausted)
+        self.assertFalse(self.st.recovery_inflight)
+        self.assertNotIn('Native', runner.busy)
+        self.assertTrue(runner.store.result(self.st)['ok'])
+        self.assertTrue(self.registry.is_routeable(other))
+
+    async def test_visual_submit_respects_wait_and_new_upstream_rejection(self):
+        runner = self.visual_runner_due()
+        calls = []
+        async def upstream(request):
+            calls.append(request)
+            return httpx.Response(429, headers={'Retry-After': '2400'},
+                json={'error': {'type': 'usage_limit_reached', 'message': 'wait'}})
+        self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+        self.st.quota_resume_at = time.time() + 1200
+        with self.assertRaises(HTTPException) as raised:
+            runner.submit(self.st, {'model': 'test-model', 'prompt': 'Draw SVG'}, None, lambda _: None)
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(calls, [])
+        self.assertFalse(self.st.recovery_inflight)
+        self.due()
+        with patch('app.chatgpt.authorized_headers', new=AsyncMock(return_value={})):
+            runner.submit(self.st, {'model': 'test-model', 'prompt': 'Draw SVG'}, None, lambda _: None)
+            await runner.tasks['Native']
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(self.st.quota_exhausted)
+        self.assertFalse(self.st.recovery_inflight)
+        self.assertEqual(self.st.quota_recovery_attempts, 2)
+        self.assertGreater(self.st.quota_resume_at, time.time() + 2398)
+        self.assertEqual(self.st.quota_wait_source, 'upstream')
+        self.assertEqual(self.st.quota_recovery_outcome, '')
+
+    async def test_visual_prestart_cancel_releases_recovery_and_keeps_preview(self):
+        runner = self.visual_runner_due()
+        previous = dict(id='previous', station='Native', model='test-model', created_at=time.time(),
+            ok=True, artifact='<svg></svg>', kind='svg', latency_ms=1, usage=None, http_status=200)
+        runner.store.save_result(self.st, previous)
+        runner.submit(self.st, {'model': 'test-model', 'prompt': 'Draw SVG'}, None, lambda _: None)
+        task = runner.tasks['Native']
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        self.assertNotIn('Native', runner.busy)
+        self.assertFalse(self.st.recovery_inflight)
+        self.assertTrue(self.st.quota_exhausted)
+        self.assertEqual(self.st.quota_recovery_outcome, 'interrupted')
+        self.assertLessEqual(self.st.quota_resume_at - time.time(), 60)
+        self.assertEqual(runner.store.result(self.st)['id'], 'previous')
+
+    async def test_visual_incomplete_response_keeps_restriction_and_short_wait(self):
+        runner = self.visual_runner_due()
+        self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200,
+            content=b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+            headers={'content-type': 'text/event-stream'})))
+        with patch('app.chatgpt.authorized_headers', new=AsyncMock(return_value={})):
+            result = await runner.run(self.st, {'model': 'test-model', 'prompt': 'Draw SVG'}, None)
+        self.assertFalse(result['ok'])
+        self.assertTrue(self.st.quota_exhausted)
+        self.assertFalse(self.st.recovery_inflight)
+        self.assertEqual(self.st.quota_recovery_outcome, 'failed')
+        self.assertEqual(self.st.quota_recovery_attempts, 1)
+        self.assertLessEqual(self.st.quota_resume_at - time.time(), 60)
+
 
 if __name__ == '__main__':
     unittest.main()

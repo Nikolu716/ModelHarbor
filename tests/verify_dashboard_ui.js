@@ -199,6 +199,7 @@ async function main() {
     return {
       status,
       ok: status >= 200 && status < 300,
+      headers: new Map(),
       json: async () => payload,
     };
   }
@@ -588,6 +589,29 @@ async function main() {
   document.getElementById("btn-card").click();
   assert.equal(document.getElementById("cardSections").hidden, false);
   assert.equal(document.querySelectorAll(".card-content .card-actions").length, 0);
+  // Container dimensions cover small/zoomed screens and tall desktop layouts.
+  for (const [width, height, count, capacity] of [
+    [296, 240, 8, 1], [680, 700, 8, 4], [1080, 480, 10, 3], [1800, 1000, 18, 8],
+  ]) {
+    const layout = window.stationCardLayout(width, height, count);
+    assert.equal(layout.capacity, capacity);
+    assert.ok(layout.height * layout.rows + 16 * (layout.rows - 1) <= height);
+    assert.ok(layout.height <= 440);
+  }
+  const firstCard = document.querySelector("#grid .station-card");
+  Object.defineProperties(viewport, {
+    clientWidth: {configurable: true, value: 296}, clientHeight: {configurable: true, value: 400},
+  });
+  window.fitViewportContent();
+  assert.equal(document.querySelectorAll("#grid .station-card:not([hidden])").length, 1);
+  secondPage.click();
+  assert.match(document.querySelector("#monitorPagination .page-info").textContent, /2 [/] 2/);
+  Object.defineProperty(viewport, "clientWidth", {configurable: true, value: 700});
+  window.fitViewportContent();
+  assert.equal(document.querySelectorAll("#grid .station-card:not([hidden])").length, 2);
+  assert.equal(document.querySelector("#grid .station-card"), firstCard, "resize keeps existing cards");
+  delete viewport.clientWidth;
+  delete viewport.clientHeight;
   document.querySelector('[data-card-section="details"]:not(#grid)').click();
   assert.equal(document.getElementById("grid").dataset.cardSection, "details");
   document.querySelector('[data-card-section="overview"]:not(#grid)').click();

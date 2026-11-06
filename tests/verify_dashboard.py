@@ -64,7 +64,7 @@ def verify_static() -> None:
     assert re.search(r'/static/recovery-status\.js\?v=\d+', html)
     assert html.index('/static/recovery-status.js?') < html.index('/static/dashboard.js?')
     assert html.index('/static/recovery-status.js?') < html.index('/static/chatgpt-quota.js?')
-    assert '/static/visual-tests.css?v=9' in html
+    assert re.search(r'/static/visual-tests\.css\?v=\d+', html)
     assert '/static/analytics.js?v=8' in html
     assert '/static/brand-logo-source.png?v=4' in html
     assert '/static/favicon.ico?v=4' in html

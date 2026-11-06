@@ -7,9 +7,9 @@
   <link rel="icon" href="/static/brand-mark-512.png?v=4" type="image/png">
   <link rel="icon" href="/static/favicon.ico?v=4" sizes="any">
   <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=4">
-  <link rel="stylesheet" href="/static/dashboard.css?v=52">
+  <link rel="stylesheet" href="/static/dashboard.css?v=53">
   <link rel="stylesheet" href="/static/model-mappings.css?v=1">
-  <link rel="stylesheet" href="/static/visual-tests.css?v=9">
+  <link rel="stylesheet" href="/static/visual-tests.css?v=10">
   <link rel="stylesheet" href="/static/selects.css?v=1">
 </head>
 <body>
@@ -590,7 +590,7 @@
             <p class="visual-prompt-note">停用站点或账号切换后不会发起新的自动测试；已提交的请求可能已计费。静态预览仅供人工比较，不用于判断模型真伪或自动排名。</p>
           </div>
         </div>
-        <footer class="visual-run-footer"><span id="visualTestStatus" role="status" aria-live="polite">尚未发送请求</span><button id="visualTestRun" class="button primary" type="submit">开始测试</button></footer>
+        <footer class="visual-run-footer"><div class="visual-run-message"><span id="visualTestStatus" role="status" aria-live="polite">尚未发送请求</span><span id="visualTestProtection" hidden></span></div><button id="visualTestRun" class="button primary" type="submit">开始测试</button></footer>
       </form>
       <section class="visual-result" aria-label="生成结果">
         <div class="visual-result-toolbar"><div class="visual-result-tabs" role="tablist" aria-label="测试结果视图"><button id="visual-tab-preview" type="button" role="tab" aria-selected="true" aria-controls="visual-panel-preview" data-visual-tab="preview">预览</button><button id="visual-tab-source" type="button" role="tab" aria-selected="false" aria-controls="visual-panel-source" data-visual-tab="source" tabindex="-1">HTML / SVG</button><button id="visual-tab-raw" type="button" role="tab" aria-selected="false" aria-controls="visual-panel-raw" data-visual-tab="raw" tabindex="-1">原始返回</button></div><button id="visualTestCopy" class="button secondary" type="button" disabled>复制代码</button></div>
@@ -616,7 +616,7 @@
   <dialog id="goUsageDialog" class="go-usage-dialog" aria-labelledby="goUsageTitle"><header><div><span id="goUsageStation" class="section-kicker"></span><h2 id="goUsageTitle">Go 订阅用量</h2></div><button id="goUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div id="goUsageWindows" class="go-usage-windows"></div><p id="goUsageStatus" class="go-usage-status" role="status"></p><footer><p>上游账号额度，包含其他客户端的使用。总用量指本订阅周期，并非历史累计 Token；小时窗口为 5 小时。每 15 分钟读取一次，不调用生成模型。</p><button id="goUsageRefresh" type="button" class="button secondary">刷新用量</button></footer></dialog>
   <script src="/static/vendor/echarts.min.js?v=5.6.0" defer=""></script>
   <script src="/static/recovery-status.js?v=1" defer></script>
-  <script src="/static/dashboard.js?v=58" defer=""></script>
+  <script src="/static/dashboard.js?v=59" defer=""></script>
     <dialog id="chatgptUsageDialog" class="go-usage-dialog chatgpt-usage-dialog" aria-labelledby="chatgptUsageTitle">
       <header><div><span id="chatgptUsageStation" class="section-kicker"></span><div class="subscription-title-row"><h2 id="chatgptUsageTitle">ChatGPT 订阅用量</h2><span id="chatgptUsageIdentity" class="subscription-account-identity"></span></div><span id="chatgptUsageBadge" class="subscription-status-badge" role="status"></span></div><button id="chatgptUsageClose" class="account-close" type="button" aria-label="关闭订阅用量"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
       <section id="chatgptUsageDevice" class="subscription-device" aria-labelledby="chatgptDeviceTitle" hidden>
@@ -641,7 +641,7 @@
   <script src="/static/go-usage.js?v=2" defer></script>
   <script src="/static/analytics.js?v=8" defer></script>
   <script src="/static/accounts.js?v=17" defer></script>
-  <script src="/static/visual-tests.js?v=12" defer></script>
+  <script src="/static/visual-tests.js?v=13" defer></script>
   <script src="/static/model-mappings.js?v=1" defer></script>
   <script src="/static/selects.js?v=1" defer></script>
 

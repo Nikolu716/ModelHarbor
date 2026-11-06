@@ -235,6 +235,13 @@ class StationState:
             self.quota_recovery_outcome = "interrupted"
             self.quota_recovery_error = "service_restarted"
             self.quota_recovery_finished_at = time.time()
+        if (self.native_usage_limited and self.quota_wait_source == "gateway"
+                and self.quota_recovery_outcome in {"interrupted", "failed"}
+                and self.quota_recovery_at > self.quota_at):
+            # Old releases reused the upstream-limit backoff for interrupted
+            # trials. A cancelled request is not evidence of another limit.
+            self.quota_resume_at = min(self.quota_resume_at,
+                                       max(self.quota_recovery_at + 60, self.rate_limit_until))
         self._update_score()
 
     def _persist_state(self):
@@ -539,7 +546,9 @@ class StationState:
         self.quota_recovery_finished_at = 0.0
         self.quota_recovery_outcome = "in_progress"
         self.quota_recovery_error = ""
-        self.quota_resume_at = max(self.quota_resume_at, now + self.native_retry_interval())
+        # The in-flight gate provides single flight. Only a new upstream
+        # usage-limit response should apply the long exponential backoff.
+        self.quota_resume_at = max(self.quota_resume_at, now + 60)
         self.quota_wait_source = "gateway"
         self._persist_state()
 
@@ -1041,9 +1050,11 @@ class Registry:
             state._update_score()
         if not state.enabled:
             return False
+        if state.cfg.provider == "chatgpt" and self.subscription_recovery_busy(state):
+            return False
         if state.native_usage_limited:
             state.reconcile_usage_wait(self.chatgpt.usage_view(state.cfg.chatgpt_account), now)
-            if (now < state.quota_resume_at or self.subscription_recovery_busy(state)
+            if (now < state.quota_resume_at
                     or state.generation_probe_lock.locked()):
                 return False
         elif state.quota_exhausted:

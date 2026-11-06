@@ -388,7 +388,10 @@ async function api(path, method = "GET", allowAuthRetry = true, body = null) {
   }
   if (!response.ok) {
     const detail = payload?.detail || payload?.error?.message;
-    throw new Error(detail || `${method} ${path} 返回 ${response.status}`);
+    const error = new Error(detail || `${method} ${path} 返回 ${response.status}`);
+    error.status = response.status;
+    error.retryAfter = Number(response.headers.get("Retry-After")) || 0;
+    throw error;
   }
   return payload;
 }
@@ -552,6 +555,14 @@ function paginateElements(key, elements, capacity, pager) {
   pager.querySelector('[data-page-step="-1"]').disabled = viewportPages[key] <= 1;
   pager.querySelector('[data-page-step="1"]').disabled = viewportPages[key] >= pages;
 }
+function stationCardLayout(width, height, count) {
+  const gap = 16;
+  const columns = Math.min(4, Math.max(1, Math.floor((width + gap) / (320 + gap))));
+  const rows = Math.min(2, Math.max(1, Math.ceil(count / columns)),
+    Math.max(1, Math.floor((height + gap) / (320 + gap))));
+  return {columns, rows, capacity: columns * rows,
+    height: Math.max(1, Math.min(440, Math.floor((height - gap * (rows - 1)) / rows)))};
+}
 function fitViewportContent() {
   updateEventsLayout();
   if ($("editor-models").getClientRects().length) renderStationModels();
@@ -562,8 +573,12 @@ function fitViewportContent() {
     rows.forEach(row => { row.hidden = false; });
     let capacity = 1;
     if (cardMode) {
-      const columns = getComputedStyle($("grid")).gridTemplateColumns.split(" ").length;
-      capacity = Math.max(1, columns);
+      const grid = $("grid");
+      const layout = stationCardLayout(viewport.clientWidth, viewport.clientHeight, rows.length);
+      grid.style.setProperty("--station-columns", layout.columns);
+      grid.style.setProperty("--station-rows", layout.rows);
+      grid.style.setProperty("--station-row-height", layout.height + "px");
+      capacity = layout.capacity;
     } else {
       const head = document.querySelector("#list-wrap thead");
       const headerHeight = head?.getBoundingClientRect().height || 38;

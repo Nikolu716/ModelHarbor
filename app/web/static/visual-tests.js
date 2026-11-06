@@ -21,6 +21,30 @@
     el("visualTestStatus").textContent = text;
     el("visualTestStatus").classList.toggle("text-danger", error);
   };
+  function currentStation() {
+    return (statusData?.stations || []).find(item => item.name === station?.name)
+      || STATIONS.find(item => item.name === station?.name) || station;
+  }
+  function restriction() {
+    const item = currentStation();
+    const recovery = window.ModelHarborRecovery.view(item);
+    if (recovery) return recovery;
+    if (item?.quota_exhausted) return item.provider === "chatgpt"
+      ? {ready: false, label: "请先验证订阅接入", detail: "此渠道仍有接入限制，请在渠道用量中查看原因并手动验证；本次未提交测试。"}
+      : {ready: false, label: "请先恢复渠道额度", detail: "此渠道额度不可用，请确认上游余额或配额恢复后再测试；本次未提交测试。"};
+    return null;
+  }
+  function applyProtection(value) {
+    if (!value.protection || !station) return;
+    const fields = {protection: value.protection};
+    for (const key of ["quota_exhausted", "quota_error", "quota_at", "quota_resume_at"]) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) fields[key] = value[key];
+    }
+    Object.assign(station, fields);
+    for (const item of [...STATIONS, ...(statusData?.stations || [])]) {
+      if (item.name === station.name) Object.assign(item, fields);
+    }
+  }
 
   const modelsOf = item => {
     const candidates = [...new Set(item.probe_model_candidates || [...(item.detected_models || []), ...(item.models || [])])];
@@ -110,14 +134,17 @@
     if (!gallery.getClientRects().length) return;
     const query = el("visualGallerySearch").value.trim().toLowerCase();
     const items = STATIONS.filter(item => `${item.name} ${modelsOf(item).join(" ")}`.toLowerCase().includes(query));
-    const columns = Math.min(3, Math.max(1, Math.floor((grid.clientWidth + 16) / 280)));
-    const rows = Math.min(2, Math.max(1, Math.floor((grid.clientHeight + 16) / 260)));
+    const columns = Math.min(4, Math.max(1, Math.floor((grid.clientWidth + 16) / 336)));
+    const rows = Math.min(2, Math.max(1, Math.floor((grid.clientHeight + 16) / 336)));
     galleryCapacity = columns * rows;
     const pages = Math.max(1, Math.ceil(items.length / galleryCapacity));
     galleryPage = Math.min(pages, Math.max(1, galleryPage));
     const visible = items.slice((galleryPage - 1) * galleryCapacity, galleryPage * galleryCapacity);
     grid.style.setProperty("--visual-columns", columns);
-    grid.style.setProperty("--visual-rows", Math.min(rows, Math.max(1, Math.ceil(visible.length / columns))));
+    const visibleRows = Math.min(rows, Math.max(1, Math.ceil(visible.length / columns)));
+    grid.style.setProperty("--visual-rows", visibleRows);
+    grid.style.setProperty("--visual-row-height", Math.max(1,
+      Math.min(440, Math.floor((grid.clientHeight - 16 * (visibleRows - 1)) / visibleRows))) + "px");
     const key = JSON.stringify([galleryPage, columns, rows, visible.map(s => [s.name, s.enabled, modelsOf(s), s.visual_test, s.visual_running, s.visual_model, s.visual_job?.id, s.visual_schedule])]);
     if (key !== galleryKey) {
       galleryKey = key;
@@ -224,7 +251,7 @@
     for (const control of el("visualTestForm").querySelectorAll("input,textarea,select,button")) control.disabled = loading || saving || submitting;
     el("visualTestClose").disabled = false;
     el("visualTestClear").disabled = busy || loading;
-    el("visualTestRun").disabled = busy || submitting || loading || saving || loadFailed || !station?.enabled || !el("visualTestModel").options.length;
+    syncRunControl();
     el("visualScheduleSave").disabled = loading || saving || submitting || loadFailed;
     el("visualScheduleEnabled").disabled = loading || saving || submitting || station?.provider === "chatgpt";
     if (station?.provider === "chatgpt") {
@@ -233,10 +260,22 @@
       el("visualScheduleInterval").disabled = true;
       el("visualScheduleFeedback").textContent = "ChatGPT 订阅仅手动测试，不发送定时生成请求。";
     }
-    el("visualTestRun").textContent = busy ? "生成中…" : "开始测试";
     el("visualTestRun").classList.toggle("is-generating", busy);
     el("visualTestForm").setAttribute("aria-busy", String(busy || loading));
     syncProtocolOptions();
+  }
+
+  function syncRunControl() {
+    const protection = restriction(), wait = Math.max(0, Math.ceil(nextAllowed - Date.now() / 1000));
+    const button = el("visualTestRun"), note = el("visualTestProtection");
+    button.disabled = busy || submitting || loading || saving || loadFailed || !currentStation()?.enabled
+      || !el("visualTestModel").options.length || Boolean(protection && !protection.ready) || wait > 0;
+    button.textContent = busy ? "生成中…" : submitting ? "提交中…" : protection && !protection.ready ? protection.label
+      : wait > 0 ? `${wait} 秒后可测试` : protection ? "验证并测试一次" : "开始测试";
+    button.title = protection?.detail || "";
+    const detail = protection?.detail || "";
+    if (note.textContent !== detail) note.textContent = detail;
+    note.hidden = !protection || loading || busy;
   }
 
   function syncProtocolOptions() {
@@ -337,6 +376,7 @@
       const value = await api(path(name));
       if (generation !== token || !dialog.open || saving) return;
       const wasBusy = busy;
+      applyProtection(value);
       busy = value.running; nextAllowed = value.next_allowed_at || 0;
       showPlan(value.schedule);
       if (value.result?.id !== result?.id) { showResult(value.result); cache.delete(name); }
@@ -388,6 +428,7 @@
       showResult(latest.result);
       showPlan(latest.schedule, true);
       busy = latest.running;
+      applyProtection(latest);
       const settings = (latest.running && latest.job?.state === "running" ? latest.job.settings : null) || latest.schedule?.settings || latest.result;
       if (settings) {
         if (!models.includes(settings.model)) el("visualTestModel").add(new Option(`${settings.model} · 不在当前目录`, settings.model));
@@ -467,7 +508,9 @@
 
   el("visualTestForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    if (busy || loading || saving || loadFailed || !station?.enabled || !validContent()) return;
+    if (busy || submitting || loading || saving || loadFailed || !currentStation()?.enabled || !validContent()) return;
+    const protection = restriction();
+    if (protection && !protection.ready) { status(protection.detail, true); return; }
     const wait = Math.ceil(nextAllowed - Date.now() / 1000);
     if (wait > 0) { status(`请等待 ${wait} 秒再测试`, true); return; }
     const name = station.name, token = generation;
@@ -482,13 +525,20 @@
         status("后台生成中，可关闭窗口或切换页面");
       }
       showToast(`${name} 已开始后台测试`);
-      await refreshStations({ force: true });
+      await refreshStations({ force: true }).catch(() => {});
     } catch (error) {
-      if (token === generation) status(`提交未确认：${error.message}。请重新查看进度。`, true);
+      if (token === generation) {
+        const rejected = error.status >= 400 && error.status < 500;
+        if (error.retryAfter) nextAllowed = Math.max(nextAllowed, Date.now() / 1000 + error.retryAfter);
+        status(rejected ? `未提交测试：${error.message}。未发送生成请求。` : `提交未确认：${error.message}。请重新查看进度。`, true);
+      }
       else showToast(`请重新查看 ${name} 的测试进度：${error.message}`, true);
     }
     finally { if (token === generation) { submitting = false; syncControls(); } }
   });
+  setInterval(() => {
+    if (dialog.open && !loading && !submitting && !saving && !document.hidden) syncRunControl();
+  }, 1000);
 
   function setWorkspace(value) {
     dialog.dataset.view = value;

@@ -438,7 +438,7 @@ class VisualTestRunner:
     def submit(self, st, body, client_ip, on_complete):
         """Reserve before returning 202; browser lifetime does not own the job."""
         settings = self.validate(st, body)
-        self._reserve(st)
+        recovery = self._reserve(st, quota_retry=st.native_usage_limited)
         name = st.cfg.name
         cfg = st.cfg
         job = dict(id=uuid.uuid4().hex, state="running", started_at=time.time(),
@@ -449,18 +449,23 @@ class VisualTestRunner:
         async def execute():
             nonlocal started
             started = True
+            outcome, error = "failed", "request_aborted"
             try:
                 if self.registry.get(name) is not st or st.cfg is not cfg:
                     raise HTTPException(409, "提交后站点配置已变更，请确认后重新测试")
                 result = await self.run(st, settings, client_ip, _reserved=True)
+                outcome, error = ("success" if result["ok"] else "failed"), result["error"]
                 job.update(state="completed" if result["ok"] else "failed", result_id=result["id"], error=result["error"])
                 on_complete(name)
             except asyncio.CancelledError:
+                outcome, error = "cancelled", "service_restarted"
                 job.update(state="cancelled", error="账号切换或服务停止，测试已结束")
                 raise
             except Exception as exc:
                 self.busy.discard(name)
                 job.update(state="failed", error=str(exc.detail) if isinstance(exc, HTTPException) else "测试执行异常，请重新查看结果")
+            finally:
+                self._finish_recovery(st, recovery, outcome, error)
 
         task = asyncio.create_task(execute(), name=f"visual-test-{name}")
         self.tasks[name] = task
@@ -471,6 +476,7 @@ class VisualTestRunner:
                 self.tasks.pop(name, None)
             if not started:
                 self.busy.discard(name)
+                self._finish_recovery(st, recovery, "cancelled", "request_aborted")
             if done.cancelled():
                 job.update(state="cancelled", error="账号切换或服务停止，测试已结束")
             job["finished_at"] = time.time()
@@ -511,6 +517,11 @@ class VisualTestRunner:
         return dict(model=model, prompt=prompt.strip(), template_name=template_name,
                     max_output_tokens=limit, protocol=protocol, reasoning_effort=effort)
 
+    def next_allowed_at(self, st, *, quota_retry=False):
+        last_retry = max(st.quota_at, st.quota_probe_at) + 60 if quota_retry or st.native_usage_limited else 0
+        return max(st.rate_limit_until, st.quota_resume_at if st.native_usage_limited else 0,
+                   self.next_allowed.get(st.cfg.name, 0), last_retry)
+
     def _reserve(self, st, *, quota_retry=False):
         now, name = time.time(), st.cfg.name
         if st.native_usage_limited:
@@ -521,9 +532,7 @@ class VisualTestRunner:
             raise HTTPException(409, "站点已停用，未发送请求")
         if st.quota_exhausted and not (quota_retry and st.cfg.provider == "chatgpt"):
             raise HTTPException(409, "站点额度不可用，请先确认额度恢复")
-        last_retry = max(st.quota_at, st.quota_probe_at) + 60 if quota_retry else 0
-        wait = max(st.rate_limit_until, st.quota_resume_at if st.native_usage_limited else 0,
-                   self.next_allowed.get(name, 0), last_retry) - now
+        wait = self.next_allowed_at(st, quota_retry=quota_retry) - now
         if wait > 0:
             raise HTTPException(429, f"请等待 {math.ceil(wait)} 秒再测试", headers={"Retry-After": str(math.ceil(wait))})
         if st.status == "down" and now - st.down_since < self.gateway.cool_down:
@@ -531,27 +540,35 @@ class VisualTestRunner:
         sem = self.registry.ensure_semaphore(st)
         if (name in self.busy or len(self.busy) >= 2 or sem.locked() or st.recovery_inflight
                 or st.generation_probe_lock.locked()
-                or st.native_usage_limited and self.registry.subscription_recovery_busy(st)):
+                or st.cfg.provider == "chatgpt" and self.registry.subscription_recovery_busy(st)):
             raise HTTPException(409, "测试正在进行或站点并发已满，请稍后重试")
         self.busy.add(name)
         self.next_allowed[name] = now + 15
+        if quota_retry and st.native_usage_limited:
+            st.recovery_inflight = True
+            st.recovery_attempt_at = st.quota_probe_at = now
+            recovery = dict(revision=st.quota_revision, signature=st.connection_signature(), attempt_at=now)
+            st.begin_quota_recovery(now)
+            return recovery
+        return None
+
+    def _finish_recovery(self, st, recovery, outcome, error):
+        if recovery is None:
+            return
+        if st.recovery_attempt_at == recovery["attempt_at"]:
+            st.recovery_inflight = False
+        st.finish_quota_recovery(outcome, error, **recovery)
 
     async def retry_subscription(self, st, client_ip):
         """One explicit recovery request; keep the last visual artifact intact."""
         if st.cfg.provider != "chatgpt" or not st.quota_exhausted:
             raise HTTPException(409, "仅对接入受限的 ChatGPT 订阅执行手动验证")
         settings = self.validate(st, {"prompt": "Reply with only OK.", "template_name": "手动验证订阅接入"})
-        self._reserve(st, quota_retry=True)
+        recovery = self._reserve(st, quota_retry=True)
         name, task = st.cfg.name, asyncio.current_task()
         self.tasks[name] = task
         st.quota_probe_at = time.time()
-        native_recovery = st.native_usage_limited
-        revision, signature = st.quota_revision, st.connection_signature()
-        attempt_at = st.quota_probe_at
         outcome, error = "failed", "request_aborted"
-        if native_recovery:
-            st.recovery_inflight = True
-            st.begin_quota_recovery(attempt_at)
         st._persist_state()
         try:
             result = await self.run(st, settings, client_ip, _reserved=True, _save_result=False)
@@ -564,17 +581,14 @@ class VisualTestRunner:
             outcome, error = "cancelled", "client_cancelled"
             raise
         finally:
-            if native_recovery:
-                st.recovery_inflight = False
-                st.finish_quota_recovery(outcome, error, revision=revision,
-                                         signature=signature, attempt_at=attempt_at)
+            self._finish_recovery(st, recovery, outcome, error)
             self.busy.discard(name)
             if self.tasks.get(name) is task:
                 self.tasks.pop(name, None)
         return {key: result.get(key) for key in ("ok", "model", "http_status", "error", "error_code", "request_id")} | {
             "recovered": not st.quota_exhausted, "quota_exhausted": st.quota_exhausted,
             "quota_error": st.quota_error, "quota_at": st.quota_at,
-            "next_allowed_at": max(self.next_allowed.get(st.cfg.name, 0), st.rate_limit_until, st.quota_resume_at),
+            "next_allowed_at": self.next_allowed_at(st, quota_retry=st.quota_exhausted),
             "protection": st.protection_view(self.gateway, time.time()),
         }
 
@@ -583,7 +597,19 @@ class VisualTestRunner:
             raise HTTPException(400, "ChatGPT 订阅仅支持手动智商测试，不发送后台定时生成请求")
         settings = self.validate(st, body)
         if not _reserved:
-            self._reserve(st)
+            recovery = self._reserve(st, quota_retry=source == "manual" and st.native_usage_limited)
+            outcome, error = "failed", "request_aborted"
+            try:
+                result = await self.run(st, settings, client_ip, source=source,
+                                        _reserved=True, _save_result=_save_result)
+                outcome, error = ("success" if result["ok"] else "failed"), result["error"]
+                return result
+            except asyncio.CancelledError:
+                outcome, error = "cancelled", "request_aborted"
+                raise
+            finally:
+                self._finish_recovery(st, recovery, outcome, error)
+                self.busy.discard(st.cfg.name)
         model, prompt, template_name, limit, protocol, effort = (
             settings[k] for k in ("model", "prompt", "template_name", "max_output_tokens", "protocol", "reasoning_effort"))
         now, name = time.time(), st.cfg.name
@@ -937,7 +963,12 @@ def create_visual_test_router(registry, gateway, store, runner, scheduler=None):
         st = station(name)
         return {"result": store.result(st), "running": name in runner.busy,
                 "job": runner.job(name),
-                "next_allowed_at": max(runner.next_allowed.get(name, 0), st.rate_limit_until),
+                "next_allowed_at": runner.next_allowed_at(st),
+                "quota_exhausted": st.quota_exhausted,
+                "quota_error": st.quota_error,
+                "quota_at": st.quota_at,
+                "quota_resume_at": st.quota_resume_at,
+                "protection": st.protection_view(gateway, time.time()),
                 "schedule": scheduler.view(name)}
 
     @api.put("/station/{name}/visual-test/schedule")
