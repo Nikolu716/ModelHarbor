@@ -176,6 +176,37 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('16000', result['error'])
         self.assertEqual(self.runner.validate(self.st, {'max_output_tokens': 1})['max_output_tokens'], 1)
 
+    async def test_explicit_station_wire_controls_test_options_and_automatic_request(self):
+        for wire, stale_path, expected_path, rejected in (
+                ('responses', '/chat/completions', '/v1/responses', 'chat_completions'),
+                ('chat_completions', '/responses', '/v1/chat/completions', 'responses')):
+            with self.subTest(wire=wire):
+                self.st.cfg = dataclasses.replace(self.st.cfg, wire_api=wire, probe_chat_path=stale_path)
+                self.runner.next_allowed.clear()
+                self.assertEqual(self.st.protocol_view()['first'], [expected_path.removeprefix('/v1')])
+                station = (await self.client.get('/admin/stations')).json()[0]
+                self.assertEqual(station['wire_api'], wire)
+                self.assertEqual(station['model_api_paths']['first'], [expected_path.removeprefix('/v1')])
+                before = len(self.calls)
+                response = await self.client.post('/admin/station/alpha/visual-test', json={'protocol': rejected})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(len(self.calls), before)
+                self.assertNotIn('alpha', self.runner.next_allowed)
+                result = await self.runner.run(self.st, {'protocol': 'auto'}, None)
+                self.assertTrue(result['ok'])
+                self.assertEqual(len(self.calls), before + 1)
+                self.assertEqual(self.calls[-1].url.path, expected_path)
+
+    async def test_openai_station_rejects_native_protocols_without_upstream_or_reservation(self):
+        for protocol in ('messages', 'generate_content'):
+            with self.subTest(protocol=protocol):
+                response = await self.client.post('/admin/station/alpha/visual-test', json={'protocol': protocol})
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('OpenAI', response.json()['detail'])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.runner.next_allowed, {})
+        self.assertEqual(self.runner.busy, set())
+
     async def test_reasoning_only_response_has_evidence_and_redacted_raw_response(self):
         self.reply = httpx.Response(200, json={'choices': [{'message': {'content': '', 'reasoning_content': 'private reasoning test-secret-key'}, 'finish_reason': 'length'}],
             'usage': {'prompt_tokens': 41, 'completion_tokens': 4096, 'total_tokens': 4137, 'completion_tokens_details': {'reasoning_tokens': 4096}}})

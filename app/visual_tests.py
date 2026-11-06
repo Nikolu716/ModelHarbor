@@ -503,6 +503,14 @@ class VisualTestRunner:
             raise HTTPException(400, "输出 Token 上限需为正整数，模型支持范围由上游校验")
         if protocol not in ("auto", "responses", "chat_completions", "chat_completions_legacy", "messages", "generate_content"):
             raise HTTPException(400, "不支持的测试协议")
+        if st.cfg.provider == "openai":
+            from .protocols import provider_supports
+            path = st.generation_path(model) if protocol == "auto" else {
+                "responses": "/responses", "messages": "/messages", "generate_content": "/generateContent",
+            }.get(protocol, "/chat/completions")
+            paths = st.protocol_view().get(model)
+            if not provider_supports("openai", path) or (paths and path not in paths):
+                raise HTTPException(400, "所选测试协议与此 OpenAI 兼容站点的接口配置不符，请使用自动协议或修改站点配置")
         if st.cfg.provider in ("opencode", "anthropic", "gemini", "chatgpt") and protocol != "auto":
             path = {"responses": "/responses", "messages": "/messages", "generate_content": "/generateContent"}.get(protocol, "/chat/completions")
             if not st.supports_model(model, path):

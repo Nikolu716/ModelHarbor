@@ -286,6 +286,9 @@ class StationState:
         if self.cfg.provider in ("anthropic", "gemini"):
             path = "/messages" if self.cfg.provider == "anthropic" else "/generateContent"
             return {model: [path] for model in self.known_models}
+        if self.cfg.provider == "openai" and self.cfg.wire_api in ("responses", "chat_completions"):
+            path = "/responses" if self.cfg.wire_api == "responses" else "/chat/completions"
+            return {model: [path] for model in self.known_models}
         return dict(self.model_api_paths)
 
     def model_allowed(self, model: str) -> bool:
@@ -318,6 +321,8 @@ class StationState:
     def generation_path(self, model: str) -> str:
         if self.cfg.provider in ("anthropic", "gemini"):
             return "/messages" if self.cfg.provider == "anthropic" else "/generateContent"
+        if self.cfg.provider == "openai" and self.cfg.wire_api in ("responses", "chat_completions"):
+            return "/responses" if self.cfg.wire_api == "responses" else "/chat/completions"
         paths = self.model_api_paths.get(model, []) if self.cfg.provider == "opencode" else []
         return paths[0] if paths else self.cfg.probe_chat_path
 

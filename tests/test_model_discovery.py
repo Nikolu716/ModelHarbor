@@ -167,6 +167,22 @@ class ModelDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(again['skipped'])
         self.assertEqual(len(self.requests), 2)
 
+    async def test_generation_probe_uses_configured_wire_instead_of_stale_probe_path(self):
+        for wire, old_path, expected_path, input_key in (
+                ('responses', '/chat/completions', '/v1/responses', 'input'),
+                ('chat_completions', '/responses', '/v1/chat/completions', 'messages')):
+            with self.subTest(wire=wire):
+                self.st.cfg = dataclasses.replace(self.st.cfg, models=['model-a'],
+                    wire_api=wire, probe_chat_path=old_path)
+                self.st.probe_chat_at = 0
+                self.response = httpx.Response(200, json={'output': []})
+                before = len(self.requests)
+                result = await self.monitor.test_generation(self.st)
+                self.assertTrue(result['ok'])
+                self.assertEqual(len(self.requests), before + 1)
+                self.assertEqual(self.requests[-1].url.path, expected_path)
+                self.assertIn(input_key, json.loads(self.requests[-1].content))
+
     async def test_manual_model_survives_catalog_reordering_and_missing_model_never_falls_back(self):
         self.st.cfg = dataclasses.replace(self.st.cfg, probe_chat_model='model-b')
         await self.monitor.discover_models(self.st)
