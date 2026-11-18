@@ -8,6 +8,7 @@ import dataclasses
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -27,6 +28,8 @@ class GatewayConfig:
     round_backoff: float = 1.0  # 轮间基础退避秒数（第 N 轮前等待 round_backoff * 2^(N-1)）
     max_round_backoff: float = 10.0  # 轮间退避上限
     max_retry_seconds: float = 60.0  # 0 表示不限总时长（仅限有限轮次）
+    # Shared budget for all stations that resolve to the same upstream origin.
+    origin_max_concurrency: int = 8
     probe_interval: float = 900.0
     fail_threshold: int = 3
     cool_down: float = 60.0
@@ -88,6 +91,11 @@ class GatewayConfig:
         if isinstance(cfg.max_rounds, bool) or not isinstance(cfg.max_rounds, int) \
                 or cfg.max_rounds < 0:
             raise ValueError("gateway.max_rounds must be an integer >= 0")
+        if (isinstance(cfg.origin_max_concurrency, bool)
+                or not isinstance(cfg.origin_max_concurrency, int)
+                or not 1 <= cfg.origin_max_concurrency <= 10000):
+            raise ValueError(
+                "gateway.origin_max_concurrency must be an integer between 1 and 10000")
 
         def non_negative_number(value: object, name: str) -> float:
             if isinstance(value, bool) or not isinstance(value, (int, float)) \
@@ -182,6 +190,21 @@ class StationConfig:
         if not url.endswith("/v1"):
             url += "/v1"
         return url
+
+    @property
+    def origin_key(self) -> str:
+        """Canonical scheme/host/port used for shared upstream admission."""
+        parsed = urlsplit(self.api_base)
+        scheme = (parsed.scheme or "https").lower()
+        host = (parsed.hostname or parsed.netloc or self.api_base).lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port is None:
+            port = 443 if scheme == "https" else 80 if scheme == "http" else ""
+        suffix = f":{port}" if port else ""
+        return f"{scheme}://{host}{suffix}"
 
     @property
     def models_url(self) -> str:

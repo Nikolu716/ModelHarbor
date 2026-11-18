@@ -13,6 +13,8 @@ gateway:
   round_backoff: 1.0
   max_round_backoff: 30
   max_retry_seconds: 300
+  # Shared across channels that use the same scheme/host/port.
+  origin_max_concurrency: 8
   probe_interval: 900
   # Generation probes are opt-in globally and per station; they may consume upstream tokens.
   generation_probe_enabled: false

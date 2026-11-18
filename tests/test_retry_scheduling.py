@@ -174,6 +174,76 @@ class RetrySchedulingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.calls, ['a'])
             self.assertEqual(result._zg_attempts, 1)
 
+    async def test_admission_wait_does_not_spend_upstream_rounds(self):
+        self.gateway.round_backoff = .01
+        self.proxy.router.pick.return_value = [self.stations[0]]
+        a = self.stations[0]
+        for mode in ('busy', 'recovery', 'cooldown'):
+            for streaming in (False, True):
+                with self.subTest(mode=mode, streaming=streaming):
+                    self.calls.clear()
+                    a.status = 'up'
+                    a.recovery_attempt_at = 0
+                    if mode == 'busy':
+                        sem = self.registry.ensure_semaphore(a)
+                        await sem.acquire()
+                        await sem.acquire()
+                    else:
+                        a.status = STATUS_DOWN
+                        a.down_since = time.time() if mode == 'cooldown' else time.time() - 1000
+                        a.recovery_inflight = mode == 'recovery'
+
+                    async def release():
+                        await asyncio.sleep(.08)
+                        if mode == 'busy':
+                            sem.release()
+                            sem.release()
+                        else:
+                            a.status = 'up'
+                            a.recovery_inflight = False
+
+                    unblock = asyncio.create_task(release())
+                    try:
+                        result = await self.proxy._dispatch(Request(streaming), '/responses')
+                        self.assertEqual(result.status_code, 200, getattr(result, 'body', b''))
+                        if streaming:
+                            async for _ in result.body_iterator:
+                                pass
+                        self.assertEqual(self.calls, ['a'])
+                        self.assertEqual(a.failures, 0)
+                        self.assert_released()
+                    finally:
+                        await unblock
+
+    async def test_admission_wait_is_bounded_and_disconnectable(self):
+        self.proxy.router.pick.return_value = []
+        self.gateway.round_backoff = 0
+        self.gateway.max_retry_seconds = .12
+        started = time.monotonic()
+        result = await self.proxy._dispatch(Request(), '/responses')
+        self.assertEqual(result.status_code, 502)
+        self.assertIn('总时限', result.body.decode())
+        self.assertLess(time.monotonic() - started, .5)
+        self.assertEqual(self.calls, [])
+        self.assertLessEqual(self.proxy.router.pick.call_count, 5)
+
+        class Disconnected(Request):
+            async def is_disconnected(inner):
+                return self.proxy.router.pick.call_count > 0
+
+        self.proxy.router.pick.reset_mock()
+        result = await self.proxy._dispatch(Disconnected(), '/responses')
+        self.assertEqual(result.status_code, 499)
+        self.assertEqual(self.calls, [])
+
+    async def test_finite_rounds_still_bound_admission_when_deadline_disabled(self):
+        self.proxy.router.pick.return_value = []
+        self.gateway.max_retry_seconds = 0
+        result = await asyncio.wait_for(self.proxy._dispatch(Request(), '/responses'), .5)
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(self.proxy.router.pick.call_count, 1)
+        self.assertEqual(self.calls, [])
+
     async def test_already_attempted_subscription_does_not_hide_fallback(self):
         self.gateway.max_attempts = 1
         a = self.stations[0]

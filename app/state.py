@@ -642,6 +642,24 @@ class StationState:
         self._persist_state()
 
 
+@dataclass
+class OriginLimiter:
+    """Admission state shared by every station using one upstream origin."""
+
+    key: str
+    limit: int
+    semaphore: asyncio.Semaphore = field(init=False)
+    recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active: int = 0
+    failure_streak: int = 0
+    last_failure_at: float = 0.0
+    cooldown_until: float = 0.0
+    recovery_required: bool = False
+
+    def __post_init__(self) -> None:
+        self.semaphore = asyncio.Semaphore(self.limit)
+
+
 class Registry:
     def __init__(self, gateway: GatewayConfig, stations: list[StationConfig]):
         from .chatgpt import ChatGPTAccounts
@@ -652,6 +670,12 @@ class Registry:
         self.states: dict[str, StationState] = {
             s.name: StationState(cfg=s, enabled=s.enabled, gateway=gateway) for s in stations
         }
+        # Kept by canonical origin rather than station name so several keys
+        # cannot multiply load against one provider.  Limiters are retained
+        # across station edits so an in-flight permit can always be released.
+        self._origin_limiters: dict[str, OriginLimiter] = {}
+        for state in self.states.values():
+            self.ensure_origin_limiter(state)
         self._lock = asyncio.Lock()
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._retired_clients: dict[httpx.AsyncClient, asyncio.Task | None] = {}
@@ -1023,6 +1047,49 @@ class Registry:
             state.semaphore = asyncio.Semaphore(state.cfg.max_concurrency)
         return state.semaphore
 
+    def ensure_origin_limiter(self, state: StationState) -> OriginLimiter:
+        key = state.cfg.origin_key
+        limiter = self._origin_limiters.get(key)
+        if limiter is None:
+            limiter = OriginLimiter(key, self.gateway.origin_max_concurrency)
+            self._origin_limiters[key] = limiter
+        elif (limiter.limit != self.gateway.origin_max_concurrency
+              and limiter.active == 0
+              and limiter.semaphore._value == limiter.limit):
+            # Gateway settings can be changed live by an operator. Resize only
+            # while idle; active permits keep their original limiter object.
+            limiter.limit = self.gateway.origin_max_concurrency
+            limiter.semaphore = asyncio.Semaphore(limiter.limit)
+        return limiter
+
+    def note_origin_failure(self, state: StationState, err: UpstreamError) -> None:
+        """Aggregate transient provider failures across all keys for one origin."""
+        if (not getattr(err, "retryable", False)
+                or getattr(err, "deterministic", False)
+                or getattr(err, "quota", False)
+                or getattr(err, "status_code", 0) == 429):
+            return
+        limiter = self.ensure_origin_limiter(state)
+        now = time.time()
+        if (limiter.last_failure_at
+                and now - limiter.last_failure_at > max(1.0, self.gateway.cool_down)):
+            limiter.failure_streak = 0
+        limiter.failure_streak += 1
+        limiter.last_failure_at = now
+        if limiter.failure_streak >= self.gateway.fail_threshold:
+            limiter.recovery_required = True
+            limiter.cooldown_until = max(
+                limiter.cooldown_until, now + max(1.0, self.gateway.cool_down))
+
+    def note_origin_success(self, state: StationState, *, limiter: OriginLimiter | None = None) -> None:
+        """Close a shared breaker only after a real response succeeds."""
+        limiter = limiter or self.ensure_origin_limiter(state)
+        if limiter.recovery_required:
+            limiter.recovery_required = False
+            limiter.cooldown_until = 0.0
+        limiter.failure_streak = 0
+        limiter.last_failure_at = 0.0
+
     async def close_clients(self) -> None:
         retired = list(self._retired_clients.items())
         drains = [task for _, task in retired if task is not None]
@@ -1166,6 +1233,7 @@ class Registry:
                     "last_error": st.last_error,
                     "last_error_at": st.last_error_at,
                     "max_concurrency": st.cfg.max_concurrency,
+                    "origin": st.cfg.origin_key,
                 }
             )
         up = sum(1 for s in stations if s["status"] == STATUS_UP and s["enabled"])
@@ -1180,12 +1248,25 @@ class Registry:
                          reverse=True)
         for i, s in enumerate(ordered):
             s["rank"] = i + 1
+        origins = [
+            {
+                "origin": limiter.key,
+                "limit": limiter.limit,
+                "inflight": limiter.active,
+                "recovery": limiter.recovery_lock.locked(),
+                "failure_streak": limiter.failure_streak,
+                "cooldown_until": limiter.cooldown_until,
+                "recovery_required": limiter.recovery_required,
+            }
+            for limiter in sorted(self._origin_limiters.values(), key=lambda item: item.key)
+        ]
         return {"gateway": {"max_attempts": self.gateway.max_attempts,
                              "retry_backoff": self.gateway.retry_backoff,
                              "max_rounds": self.gateway.max_rounds,
                              "round_backoff": self.gateway.round_backoff,
                              "max_round_backoff": self.gateway.max_round_backoff,
                              "max_retry_seconds": self.gateway.max_retry_seconds,
+                             "origin_max_concurrency": self.gateway.origin_max_concurrency,
                              "cool_down": self.gateway.cool_down,
                              "scoring_speed_weight": self.gateway.scoring_speed_weight,
                              "fail_threshold": self.gateway.fail_threshold,
@@ -1199,6 +1280,7 @@ class Registry:
                              "quota_probe_interval": self.gateway.quota_probe_interval,
                              "quota_probe_max_interval": self.gateway.quota_probe_max_interval},
                 "stations": stations,
+                "origins": origins,
                 # last_routed 保持向后兼容；route_activity 是新代码的规范入口。
                 "last_routed": (route_activity["last_success"]
                                 or {"station": "", "model": "", "ts": 0.0,

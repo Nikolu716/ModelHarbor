@@ -26,6 +26,9 @@ class RoutePermit:
     native_recovery: bool = False
     signature: str = ""
     recovery_at: float = 0.0
+    origin_limiter: object | None = None
+    origin_recovery_lock: asyncio.Lock | None = None
+    origin_recovery: bool = False
 
 
 class Router:
@@ -94,6 +97,11 @@ class Router:
         if st.cfg.provider == "chatgpt" and self.registry.subscription_recovery_busy(st):
             return "账号正在恢复验证"
         recovery = st.status == STATUS_DOWN or st.native_usage_limited
+        origin = self.registry.ensure_origin_limiter(st)
+        if now < origin.cooldown_until:
+            return "共享上游正在冷却"
+        if origin.recovery_required and origin.recovery_lock.locked():
+            return "共享上游正在恢复验证"
         if recovery and (st.recovery_inflight or st.generation_probe_lock.locked()):
             return "站点正在恢复验证"
         if not self.registry.is_routeable(st, now):
@@ -104,8 +112,12 @@ class Router:
             if st.status == STATUS_DOWN:
                 return "站点正在熔断冷却"
             return "站点暂不可路由"
+        if recovery and origin.recovery_lock.locked():
+            return "共享上游正在恢复验证"
         if recovery and now < st.recovery_attempt_at + max(1.0, self.gateway.cool_down):
             return "站点正在等待下一次恢复验证"
+        if check_concurrency and origin.semaphore.locked():
+            return "共享上游并发已满"
         if check_concurrency and self.registry.ensure_semaphore(st).locked():
             return "并发已满"
         return None
@@ -115,34 +127,90 @@ class Router:
         if self.unavailable_reason(st, check_concurrency=False):
             return None
         sem = self.registry.ensure_semaphore(st)
-        if timeout > 0:
-            try:
-                await asyncio.wait_for(sem.acquire(), timeout=timeout)
-            except asyncio.TimeoutError:
+        origin = self.registry.ensure_origin_limiter(st)
+        origin_sem = origin.semaphore
+        station_acquired = False
+        origin_acquired = False
+        try:
+            # Check both before acquiring either one.  The normal zero-wait
+            # path therefore never consumes a station slot for a full origin.
+            if sem.locked() or origin_sem.locked():
                 return None
-        else:
-            if sem.locked():
-                return None
-            await sem.acquire()
+            if timeout > 0:
+                deadline = asyncio.get_running_loop().time() + timeout
+                await asyncio.wait_for(origin_sem.acquire(), timeout)
+                origin_acquired = True
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                try:
+                    await asyncio.wait_for(sem.acquire(), remaining)
+                except asyncio.TimeoutError:
+                    origin_sem.release()
+                    origin_acquired = False
+                    return None
+                station_acquired = True
+            else:
+                await origin_sem.acquire()
+                origin_acquired = True
+                await sem.acquire()
+                station_acquired = True
+        except BaseException:
+            if station_acquired:
+                sem.release()
+            if origin_acquired:
+                origin_sem.release()
+            raise
+        if not station_acquired or not origin_acquired:
+            if station_acquired:
+                sem.release()
+            if origin_acquired:
+                origin_sem.release()
+            return None
         now = time.time()
         native_recovery = st.native_usage_limited
         recovery = st.status == STATUS_DOWN or native_recovery
+        origin_recovery = origin.recovery_required
         if self.unavailable_reason(st, check_concurrency=False):
             sem.release()
+            origin_sem.release()
             return None
-        if recovery:
-            st.recovery_inflight = True
-            st.recovery_attempt_at = now
-            if native_recovery:
-                st.begin_quota_recovery(now)
+        recovery_lock = None
+        if recovery or origin_recovery:
+            # Only one channel may validate a shared origin after a breaker.
+            if origin.recovery_lock.locked():
+                sem.release()
+                origin_sem.release()
+                return None
+            try:
+                await origin.recovery_lock.acquire()
+            except BaseException:
+                sem.release()
+                origin_sem.release()
+                raise
+            recovery_lock = origin.recovery_lock
+            if recovery:
+                st.recovery_inflight = True
+                st.recovery_attempt_at = now
+                if native_recovery:
+                    st.begin_quota_recovery(now)
+        origin.active += 1
         return RoutePermit(sem, recovery, quota_revision=st.quota_revision,
-                           native_recovery=native_recovery, signature=st.connection_signature(), recovery_at=now)
+                           native_recovery=native_recovery, signature=st.connection_signature(), recovery_at=now,
+                           origin_limiter=origin, origin_recovery_lock=recovery_lock,
+                           origin_recovery=origin_recovery)
 
     def release(self, st: StationState, permit: RoutePermit, outcome: str = "cancelled",
                 error: str = "request_aborted") -> None:
         if not permit.released:
             permit.released = True
             permit.semaphore.release()
+            origin = permit.origin_limiter
+            if origin is not None:
+                origin.active = max(0, origin.active - 1)
+                if outcome == "success":
+                    self.registry.note_origin_success(st, limiter=origin)
+                if permit.origin_recovery_lock is not None and permit.origin_recovery_lock.locked():
+                    permit.origin_recovery_lock.release()
+                origin.semaphore.release()
             if permit.recovery:
                 st.recovery_inflight = False
             if permit.native_recovery:

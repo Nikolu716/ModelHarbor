@@ -369,12 +369,16 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
         self.proxy._wait_for_retry.assert_not_awaited()
 
     async def test_real_recovery_stream_closed_by_client_records_interruption(self):
-        events = (b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
-                  b'data: {"type":"response.completed","response":{"id":"resp_test","output":[]}}\n\n')
+        # Separate network chunks: the client cancels BEFORE response.completed.
+        # A single bytes body delivers both frames in the first anext().
+        class PartialStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'data: {"type":"response.output_text.delta","delta":"partial"}\n\n'
+                yield b'data: {"type":"response.completed","response":{"id":"resp_test","output":[]}}\n\n'
         calls = []
         async def upstream(request):
             calls.append(request)
-            return httpx.Response(200, content=events, headers={'content-type': 'text/event-stream'})
+            return httpx.Response(200, stream=PartialStream(), headers={'content-type': 'text/event-stream'})
         self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
         self.st.probed_models = {'test-model'}
         self.st.model_api_paths = {'test-model': ['/responses']}
@@ -397,6 +401,26 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.st.quota_recovery_outcome, 'interrupted')
         self.assertEqual(self.st.quota_recovery_error, 'client_stream_closed')
         self.assertGreater(self.st.quota_resume_at, time.time())
+
+    async def test_native_recovery_completed_frame_survives_immediate_client_close(self):
+        events = (b'data: {"type":"response.output_text.delta","delta":"done"}\n\n'
+                  b'data: {"type":"response.completed","response":{"id":"resp_test","output":[]}}\n\n')
+        self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, content=events)))
+        self.st.probed_models = {'test-model'}
+        self.st.model_api_paths = {'test-model': ['/responses']}
+        self.restrict()
+        self.due()
+        with patch('app.chatgpt.authorized_headers', new=AsyncMock(return_value={})):
+            response, _ = await self.proxy._forward_stream('/responses',
+                {'model': 'test-model', 'input': 'real request', 'stream': True}, 'test-model')
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b'response.completed', await anext(response.body_iterator))
+            await response.body_iterator.aclose()
+        self.assertFalse(self.st.quota_exhausted)
+        self.assertFalse(self.st.recovery_inflight)
+        self.assertEqual(self.st.quota_recovery_outcome, '')
+        self.assertEqual((self.st.calls, self.st.failures), (1, 0))
 
     async def test_mapped_recovery_blocks_parallel_request_and_then_recovers(self):
         self.st.probed_models = {'test-model'}

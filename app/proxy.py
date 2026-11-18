@@ -87,7 +87,8 @@ class _StreamRouteLease:
     """Idempotently release a committed stream route on every exit path."""
 
     def __init__(self, registry: Registry, router: Router, st: StationState,
-                 route_id: int, resp: httpx.Response, stream_iter, permit: RoutePermit) -> None:
+                 route_id: int, resp: httpx.Response, stream_iter, permit: RoutePermit,
+                 on_close=None) -> None:
         self.registry = registry
         self.router = router
         self.st = st
@@ -95,6 +96,7 @@ class _StreamRouteLease:
         self.resp = resp
         self.stream_iter = stream_iter
         self.permit = permit
+        self.on_close = on_close
         self.closed = False
         self.pending_read: asyncio.Future | None = None
         self._close_task: asyncio.Task | None = None
@@ -129,8 +131,14 @@ class _StreamRouteLease:
                 await close_resource(self.resp)
             finally:
                 self.closed = True
-                self.registry.end_route(self.route_id, outcome, error)
-                self.router.release(self.st, self.permit, outcome, error)
+                try:
+                    if self.on_close is not None:
+                        outcome, error = self.on_close(outcome, error)
+                finally:
+                    try:
+                        self.registry.end_route(self.route_id, outcome, error)
+                    finally:
+                        self.router.release(self.st, self.permit, outcome, error)
 
     async def close(self, outcome: str = "cancelled",
                     error: str = "client_stream_closed") -> None:
@@ -510,6 +518,8 @@ class _StreamUsageParser:
         self._anthropic_usage: dict = {}
         self.messages_finished = False
         self.responses_finished = False
+        self.responses_terminal = False
+        self.chat_finished = False
         self.gemini_candidates: set[int] = set()
         self.gemini_finished: set[int] = set()
 
@@ -518,6 +528,9 @@ class _StreamUsageParser:
             return None
         payload = "\n".join(self._data_lines)
         self._data_lines.clear()
+        if payload.strip() == '[DONE]':
+            self.chat_finished = True
+            return None
         try:
             obj = json.loads(payload)
         except (ValueError, TypeError):
@@ -543,6 +556,8 @@ class _StreamUsageParser:
                 self.messages_finished = True
             if kind == "response.completed":
                 self.responses_finished = True
+            if kind in ("response.completed", "response.failed", "response.incomplete"):
+                self.responses_terminal = True
             for position, candidate in enumerate(obj.get("candidates") or []):
                 index = candidate.get("index", position)
                 self.gemini_candidates.add(index)
@@ -563,6 +578,21 @@ class _StreamUsageParser:
             return None
         self.last = usage
         return usage.tokens
+
+    def terminal(self, path: str) -> bool:
+        """Recognize protocol completion without waiting for transport EOF.
+
+        Gemini can send usage after candidate finish reasons, so its stream
+        still needs EOF. Chat finish_reason likewise precedes the usage chunk;
+        only [DONE] is terminal there.
+        """
+        if self.error:
+            return True
+        if path == '/responses':
+            return self.responses_terminal
+        if path == MESSAGES:
+            return self.messages_finished
+        return path not in GEMINI_PATHS and self.chat_finished
 
     def _consume_line(self, line: str) -> int | None:
         if line.endswith("\r"):
@@ -1022,10 +1052,16 @@ class OpenAIProxy:
             if not has_transient:
                 return failure(
                     model, result, total_attempts)  # 确定性失败：快速返回
-            round_index += 1
-            if self.gateway.max_rounds and round_index >= self.gateway.max_rounds:
-                return failure(model, result, total_attempts)
-            delay = self._round_delay(round_index - 1)
+            if deadline is not None and getattr(result, '_zg_attempts', None) == 0:
+                # Waiting for capacity/cooldown/recovery is not an upstream
+                # attempt. Poll within the total deadline without exhausting
+                # the retry rounds, including when round_backoff is zero.
+                delay = max(.1, min(1.0, self.gateway.round_backoff))
+            else:
+                round_index += 1
+                if self.gateway.max_rounds and round_index >= self.gateway.max_rounds:
+                    return failure(model, result, total_attempts)
+                delay = self._round_delay(round_index - 1)
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1083,6 +1119,7 @@ class OpenAIProxy:
         st.record_failure(err, **evidence)
         if evidence.get('signature') is not None and evidence['signature'] != st.connection_signature():
             return
+        self.registry.note_origin_failure(st, err)
         if err.retryable and not err.deterministic and not err.quota and err.status_code != 429:
             st.mark_transient_failure(err, self.gateway, source='request')
 
@@ -1578,7 +1615,7 @@ class OpenAIProxy:
                 if signature == st.connection_signature():
                     st.record_ttft(ttft_ms / 1000)
                 switched = bool(attempts)
-                # Account for the attempt now; reliability is recorded only at EOF.
+                # Account now; reliability is recorded at protocol completion.
                 st.calls += 1
                 if switched:
                     st.switch_in += 1
@@ -1599,33 +1636,63 @@ class OpenAIProxy:
                 route_event_time = event_time
                 registry = self.registry
                 router = self.router
+                usage_parser = _StreamUsageParser()
+                stream_outcome = 'cancelled'
+                stream_error = 'client_stream_closed'
+
+                def finish_stream(outcome, error):
+                    # ASGI can fail in send() while gen() is suspended at a
+                    # yield. Finalize from the lease exactly once, using the
+                    # frame parsed before that yield rather than socket EOF.
+                    if usage_parser.error:
+                        outcome, error = 'stream_error', usage_parser.error
+                    elif usage_parser.terminal(target_path):
+                        outcome, error = 'success', ''
+                    elif stream_outcome != 'cancelled':
+                        outcome, error = stream_outcome, stream_error
+                    if outcome == 'success':
+                        st.record_success(latency / 1000, model=model, path=target_path, stream=True,
+                                          counted=True, signature=signature, quota_revision=permit.quota_revision)
+                    elif outcome == 'stream_error':
+                        err = (classify_error(st.cfg.name, 200, usage_parser.error_payload)
+                               if usage_parser.error_payload else connect_error(st.cfg.name, error))
+                        self._handle_failure(st, err, retry_after=resp.headers.get('retry-after'),
+                                             model=model, path=target_path, stream=True, counted=True,
+                                             switched=False, signature=signature)
+                    usage = usage_parser.last
+                    if usage is not None and usage.tokens is not None:
+                        eventlog.add_tokens(
+                            st.cfg.name, route_model, usage.tokens, occurred_at=route_event_time,
+                            input_tokens=usage.input_tokens, cache_read=usage.cache_read,
+                            cache_write=usage.cache_write, route_id=route_id)
+                    return outcome, error
+
                 lease = _StreamRouteLease(
-                    registry, router, st, route_id, resp, stream_iter, permit)
+                    registry, router, st, route_id, resp, stream_iter, permit, on_close=finish_stream)
 
                 async def gen(resp=resp, st=st, prefetch=buffered,
                               stream_iter=stream_iter, route_id=route_id,
                               adapter=adapter, model=model):
+                    nonlocal stream_outcome, stream_error
                     translator = ((MappedStreamTranslator if mapping else ChatStreamToResponsesTranslator)(model)
                                   if adapter == ("r2c",) else None)
-                    stream_tokens = None
-                    usage_parser = _StreamUsageParser()
                     namespace_scanner = _NamespaceStreamScanner(self.namespace_memory) if target_path == '/responses' else None
-                    stream_outcome = "cancelled"
-                    stream_error = "client_stream_closed"
                     pending_read = None
                     try:
                         for chunk in prefetch:
                             if namespace_scanner:
                                 namespace_scanner.feed(chunk)
-                            parsed_tokens = usage_parser.feed(chunk)
-                            if parsed_tokens is not None:
-                                stream_tokens = parsed_tokens
+                            usage_parser.feed(chunk)
                             if translator:
                                 out = translator.feed(chunk)
+                                if getattr(translator, 'error', '') and not usage_parser.error:
+                                    usage_parser.error = translator.error
                                 if out:
                                     yield out
                             else:
                                 yield chunk
+                            if usage_parser.terminal(target_path):
+                                return
                         while True:
                             try:
                                 if pending_read is None:
@@ -1637,23 +1704,23 @@ class OpenAIProxy:
                                 lease.pending_read = None
                                 if namespace_scanner:
                                     namespace_scanner.feed(chunk)
-                                parsed_tokens = usage_parser.feed(chunk)
-                                if parsed_tokens is not None:
-                                    stream_tokens = parsed_tokens
+                                usage_parser.feed(chunk)
                                 if translator:
                                     out = translator.feed(chunk)
+                                    if getattr(translator, 'error', '') and not usage_parser.error:
+                                        usage_parser.error = translator.error
                                     if out:
                                         yield out
                                 else:
                                     yield chunk
+                                if usage_parser.terminal(target_path):
+                                    return
                             except StopAsyncIteration:
                                 pending_read = None
                                 lease.pending_read = None
                                 if namespace_scanner:
                                     namespace_scanner.finish()
-                                parsed_tokens = usage_parser.finish()
-                                if parsed_tokens is not None:
-                                    stream_tokens = parsed_tokens
+                                usage_parser.finish()
                                 incomplete = (
                                     st.cfg.provider == "chatgpt" and not usage_parser.responses_finished
                                     or
@@ -1664,14 +1731,15 @@ class OpenAIProxy:
                                 if incomplete and not usage_parser.error:
                                     usage_parser.error = "上游流提前结束，未收到完整结束事件"
                                     yield _error_sse(usage_parser.error, path)
+                                tail = b''
                                 if translator:
                                     tail = translator.finish()
                                     if getattr(translator, 'error', '') and not usage_parser.error:
                                         usage_parser.error = translator.error
-                                    if tail:
-                                        yield tail
                                 stream_outcome = "stream_error" if usage_parser.error else "success"
                                 stream_error = usage_parser.error
+                                if tail:
+                                    yield tail
                                 break
                             except asyncio.TimeoutError:
                                 # SSE 保活：长流无事件时发注释行，防止客户端空闲超时
@@ -1688,31 +1756,8 @@ class OpenAIProxy:
                         yield _error_sse(
                             f"上游 {st.cfg.name} 流中断: {type(e).__name__}", path)
                     finally:
-                        if stream_outcome == "success":
-                            st.record_success(latency / 1000, model=model, path=target_path, stream=True, counted=True, signature=signature, quota_revision=permit.quota_revision)
-                        elif stream_outcome == "stream_error":
-                            err = (classify_error(st.cfg.name, 200, usage_parser.error_payload)
-                                   if usage_parser.error_payload else connect_error(st.cfg.name, stream_error))
-                            self._handle_failure(st, err, retry_after=resp.headers.get('retry-after'), model=model, path=target_path, stream=True,
-                                                 counted=True, switched=False, signature=signature)
-                        # Bookkeeping only: the upstream socket must be closed
-                        # from an independent task, because this generator may
-                        # be running inside Starlette's cancelled task group.
-                        usage = usage_parser.last
-                        if usage is not None and usage.tokens is not None:
-                            eventlog.add_tokens(
-                                st.cfg.name, route_model, usage.tokens,
-                                occurred_at=route_event_time,
-                                input_tokens=usage.input_tokens,
-                                cache_read=usage.cache_read,
-                                cache_write=usage.cache_write, route_id=route_id)
-                        elif stream_tokens is not None:
-                            eventlog.add_tokens(
-                                st.cfg.name, route_model, stream_tokens,
-                                occurred_at=route_event_time, route_id=route_id)
-                        # close() moves the socket close onto an independent
-                        # task, so a cancelled caller cannot abort it; normal
-                        # completion still waits for the route to be released.
+                        # Cleanup and bookkeeping share one independent task,
+                        # including ASGI send errors while suspended at yield.
                         await lease.close(stream_outcome, stream_error)
 
                 response = _LeasedStreamingResponse(
