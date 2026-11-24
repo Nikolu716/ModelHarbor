@@ -849,7 +849,11 @@ class HealthMonitor:
             if not token:
                 if data.get("has_more"):
                     raise ValueError("Incomplete catalog")
-                return httpx.Response(response.status_code, json={"data": items}, headers=response.headers)
+                # httpx has already decoded the upstream body. The normalized
+                # JSON is a new representation; carrying Content-Encoding or
+                # Content-Length forward would decode it a second time.
+                headers = {"Retry-After": response.headers["retry-after"]} if "retry-after" in response.headers else {}
+                return httpx.Response(response.status_code, json={"data": items}, headers=headers)
             if not isinstance(token, str) or len(token) > 4096 or token in seen:
                 raise ValueError("Invalid catalog pagination")
             seen.add(token)

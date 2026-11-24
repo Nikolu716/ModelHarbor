@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import gzip
 import json
 import time
 import unittest
@@ -75,6 +76,39 @@ class ModelDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.st.probed_models, set())
         self.assertEqual(self.st.effective_models, {'manual'})
         self.assertFalse(self.st.accepts_any_model)
+
+    async def test_compressed_native_catalogs_normalize_without_decoding_twice(self):
+        for provider in ("anthropic", "gemini"):
+            with self.subTest(provider=provider):
+                self.st.cfg = dataclasses.replace(self.st.cfg, provider=provider)
+                self.expire()
+                self.requests.clear()
+                pages = ([{'data': [{'id': 'model-a'}], 'has_more': True, 'last_id': 'model-a'},
+                          {'data': [{'id': 'model-b'}], 'has_more': False}]
+                         if provider == 'anthropic' else
+                         [{'models': [{'name': 'models/model-a', 'supportedGenerationMethods': ['generateContent']}],
+                           'nextPageToken': 'next-page'},
+                          {'models': [{'name': 'models/model-b', 'supportedGenerationMethods': ['generateContent']}]}])
+                async def handle(request):
+                    self.requests.append(request)
+                    body = gzip.compress(json.dumps(pages[len(self.requests) - 1]).encode())
+                    return httpx.Response(200, content=body, headers={
+                        'Content-Type': 'application/json', 'Content-Encoding': 'gzip',
+                        'Content-Length': str(len(body)), 'Retry-After': '120',
+                    })
+                await self.st.client.aclose()
+                self.st.client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+                await self.monitor.discover_models(self.st, manual=True)
+                self.assertEqual(self.st.models_discovery_status, 'ready')
+                self.assertEqual(self.st.probed_model_order, ['model-a', 'model-b'])
+                self.assertEqual(self.st.probed_models, {'model-a', 'model-b'})
+                self.assertEqual(len(self.requests), 2)
+                self.assertTrue(all(request.method == 'GET' for request in self.requests))
+                self.assertEqual(dict(self.requests[1].url.params),
+                                 {'after_id': 'model-a'} if provider == 'anthropic' else {'pageToken': 'next-page'})
+                self.assertGreater(self.st.models_retry_after_until, time.time() + 118)
+                self.assertEqual(self.st.calls, 0)
+                self.assertIsNone(self.st.health_score)
 
     async def test_transient_error_retains_catalog_and_backs_off(self):
         await self.monitor.discover_models(self.st)
