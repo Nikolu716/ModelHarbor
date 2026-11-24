@@ -13,7 +13,7 @@ import httpx
 
 from app.config import AppConfig, GatewayConfig, StationConfig
 from app.mapping_wire import ChatStreamToResponsesTranslator, responses_to_chat, chat_to_responses
-from app.model_mappings import ModelMappings, validate_rules
+from app.model_mappings import ModelMappings, mapping_preview, validate_rules
 from app.proxy import OpenAIProxy
 from app.state import Registry
 from app.stats import EventLog
@@ -24,7 +24,7 @@ from gateway import build_app
 def rule(**changes):
     return {'id': 'substitute', 'name': 'GPT via DeepSeek', 'enabled': True,
             'source_model': 'gpt-6-sol', 'source_ips': [],
-            'targets': [{'station': 'Go', 'model': 'deepseek-v4.1-flash'}], **changes}
+            'target_models': ['deepseek-v4.1-flash'], **changes}
 
 
 def sse(obj):
@@ -70,15 +70,15 @@ class MappingStoreTests(unittest.TestCase):
         self.assertEqual(store.match('gpt-6-sol', '10.1.1.1', '/responses')['id'], 'ip')
         self.assertEqual(store.match('gpt-6-sol', '10.2.2.2', '/responses')['id'], 'substitute')
         snapshot = store.match('gpt-6-sol', None, '/responses')
-        snapshot['targets'][0]['model'] = 'changed'
-        self.assertEqual(store.rules[0]['targets'][0]['model'], 'deepseek-v4.1-flash')
+        snapshot['target_models'][0] = 'changed'
+        self.assertEqual(store.rules[0]['target_models'], ['deepseek-v4.1-flash'])
         self.assertIsNone(store.match('gpt-6-sol-extra', None, '/responses'))
         self.assertIsNone(store.match('gpt-6-sol', None, '/embeddings'))
 
     def test_validation_conflicts_and_limits(self):
         invalid = [[rule(), rule(id='another')], [rule(source_ips=['10.1.1.1/24'])],
-                   [rule(targets=[])], [rule(source_model='gpt*')], [rule(enabled='true')],
-                   [rule(targets=rule()['targets'] * 2)], [rule(source_ips='10.1.1.1')],
+                   [rule(target_models=[])], [rule(source_model='gpt*')], [rule(enabled='true')],
+                   [rule(target_models=rule()['target_models'] * 2)], [rule(source_ips='10.1.1.1')],
                    [rule(id=str(i)) for i in range(65)],
                    [rule(id='ip1', source_ips=['10.1.1.1']), rule(id='ip2', source_ips=['::ffff:10.1.1.1'])]]
         for values in invalid:
@@ -101,6 +101,42 @@ class MappingStoreTests(unittest.TestCase):
                 broken.match('any-model', '10.1.1.1', '/responses')
             broken.save([], None)
             self.assertIsNone(broken.match('any-model', None, '/responses'))
+
+    def test_legacy_station_targets_migrate_to_model_only_rules(self):
+        legacy = {'id': 'legacy', 'name': 'Legacy', 'enabled': True,
+                  'source_model': 'gpt-6-astra', 'source_ips': [],
+                  'targets': [{'station': 'aihub-k1', 'model': 'gpt-6.2-astra'},
+                              {'station': 'aihub-k2', 'model': 'gpt-6.2-astra'},
+                              {'station': 'aihub-k2', 'model': 'gpt-6.2-sol'}]}
+        normalized = validate_rules([legacy])
+        self.assertEqual(normalized[0]['target_models'], ['gpt-6.2-astra', 'gpt-6.2-sol'])
+        self.assertNotIn('targets', normalized[0])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'model-mappings.json'
+            path.write_text(json.dumps({'rules': [legacy]}), encoding='utf-8')
+            store = ModelMappings(directory)
+            self.assertEqual(store.rules[0]['target_models'], ['gpt-6.2-astra', 'gpt-6.2-sol'])
+            persisted = json.loads(path.read_text(encoding='utf-8'))
+            self.assertEqual(persisted['rules'][0]['target_models'], ['gpt-6.2-astra', 'gpt-6.2-sol'])
+            self.assertNotIn('targets', persisted['rules'][0])
+            self.assertEqual(json.loads(path.with_suffix('.legacy.json').read_text())['rules'], [legacy])
+            self.assertFalse(store.migration_error)
+            self.assertEqual(ModelMappings(directory).rules, store.rules)
+
+    def test_migration_write_failure_keeps_valid_legacy_policy_active(self):
+        legacy = rule()
+        legacy['targets'] = [{'station': 'old', 'model': legacy.pop('target_models')[0]}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'model-mappings.json'
+            path.write_text(json.dumps({'rules': [legacy]}), encoding='utf-8')
+            with patch.object(Path, 'replace', side_effect=OSError('read only')):
+                store = ModelMappings(directory)
+            self.assertEqual(store.match('gpt-6-sol', None, '/responses')['target_models'], ['deepseek-v4.1-flash'])
+            self.assertFalse(store.error)
+            self.assertTrue(store.view()['migration_error'])
+            self.assertEqual(json.loads(path.read_text())['rules'], [legacy])
+            store.save(store.rules, None)
+            self.assertFalse(store.migration_error)
 
 
 class WireMappingTests(unittest.TestCase):
@@ -161,9 +197,12 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
         self.gateway = GatewayConfig(data_dir=self.tmp.name, max_rounds=1, retry_backoff=0, sse_keepalive_interval=0)
         configs = [StationConfig.from_dict('Go', {'provider': 'opencode', 'opencode_plan': 'go', 'base_url': 'https://opencode.ai', 'api_key': 'fixture'}),
                    StationConfig(name='Backup', base_url='https://backup.invalid/v1', api_key='fixture', models=['backup-model'], wire_api='chat_completions'),
-                   StationConfig(name='Outside', base_url='https://outside.invalid/v1', api_key='fixture', models=['gpt-6-sol'])]
+                   StationConfig(name='Outside', base_url='https://outside.invalid/v1', api_key='fixture', models=['gpt-6-sol']),
+                   StationConfig(name='Spare', base_url='https://spare.invalid/v1', api_key='fixture',
+                                 models=['deepseek-v4.1-flash'], wire_api='chat_completions', enabled=False)]
         self.registry = Registry(self.gateway, configs)
         self.go = self.registry.get('Go')
+        self.spare = self.registry.get('Spare')
         self.go.model_api_paths = {'deepseek-v4.1-flash': ['/chat/completions']}
         self.go.probed_models = {'deepseek-v4.1-flash'}
         self.registry.model_mappings.save([rule()], self.registry)
@@ -185,12 +224,17 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
             if self.status != 200 and request.url.host == 'opencode.ai':
                 return httpx.Response(self.status, json={'error': {'message': 'temporarily unavailable'}})
             if body.get('stream'):
-                stream = Fragments(sse({'model': body['model'], 'choices': [{'delta': {'content': 'answer'}}]}) + self.tail)
+                payload = (sse({'type': 'response.output_text.delta', 'delta': 'answer'}) +
+                           sse({'type': 'response.completed', 'response': {'model': body['model'], 'output': []}})
+                           if request.url.path.endswith('/responses') else
+                           sse({'model': body['model'], 'choices': [{'delta': {'content': 'answer'}}]}) + self.tail)
+                stream = Fragments(payload)
                 self.streams.append(stream)
                 return httpx.Response(200, stream=stream, headers={'content-type': 'text/event-stream'})
             return httpx.Response(200, json={'model': body['model'], 'choices': [{'message': {'content': 'answer'}, 'finish_reason': 'stop'}],
                                             'usage': {'prompt_tokens': 3, 'completion_tokens': 2, 'total_tokens': 5}})
         for station in self.registry.states.values():
+            station.models_discovery_status = 'ready'
             station.client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
 
     async def asyncTearDown(self):
@@ -249,6 +293,7 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[-1][1], {**body, 'model': 'deepseek-v4.1-flash'})
 
     async def test_unconvertible_is_local_and_preserves_station_health(self):
+        self.registry.get('Outside').enabled = False
         result = await self.dispatch(tools=[{'type': 'web_search'}])
         self.assertEqual(result.status_code, 400)
         self.assertEqual(self.sent, [])
@@ -256,7 +301,7 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_local_incompatible_target_does_not_consume_send_budget(self):
         self.gateway.max_attempts = 1
-        self.registry.model_mappings.save([rule(targets=rule()['targets'] + [{'station': 'Outside', 'model': 'gpt-6-sol'}])], self.registry)
+        self.registry.model_mappings.save([rule(target_models=rule()['target_models'] + ['gpt-6-sol'])], self.registry)
         with patch.object(self.proxy.router, 'pick', return_value=[self.go, self.registry.get('Outside')]):
             result = await self.dispatch(tools=[{'type': 'web_search'}])
         self.assertEqual(result.status_code, 200)
@@ -264,7 +309,7 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[0][0].url.host, 'outside.invalid')
 
     async def test_target_only_failover_with_different_actual_models(self):
-        self.registry.model_mappings.save([rule(targets=rule()['targets'] + [{'station': 'Backup', 'model': 'backup-model'}])], self.registry)
+        self.registry.model_mappings.save([rule(target_models=rule()['target_models'] + ['backup-model'])], self.registry)
         for code in (503, 429):
             self.status = code
             self.sent.clear()
@@ -275,20 +320,61 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads(result.body)['model'], 'backup-model')
             self.assertEqual(self.go.semaphore._value, self.go.cfg.max_concurrency)
 
-    async def test_disabled_quota_deleted_and_restricted_targets_never_escape(self):
+    async def test_mapping_uses_another_station_for_the_target_model(self):
+        self.spare.enabled = True
+        self.go.enabled = False
+        result = await self.dispatch()
+        self.assertEqual(result.status_code, 200, result.body)
+        self.assertEqual(self.sent[-1][0].url.host, 'spare.invalid')
+        self.assertEqual(self.sent[-1][1]['model'], 'deepseek-v4.1-flash')
+        self.assertEqual(json.loads(result.body)['model'], 'deepseek-v4.1-flash')
+
+    async def test_rule_target_model_is_resolved_from_channel_capabilities(self):
+        self.registry.model_mappings.save([rule(target_models=['backup-model'])], self.registry)
+        result = await self.dispatch()
+        self.assertEqual(result.status_code, 200, result.body)
+        self.assertEqual(self.sent[-1][0].url.host, 'backup.invalid')
+        self.assertEqual(self.sent[-1][1]['model'], 'backup-model')
+
+    async def test_unavailable_target_falls_back_to_requested_model_then_errors(self):
         for attribute, value in [('enabled', False), ('quota_exhausted', True)]:
             old = getattr(self.go, attribute)
             setattr(self.go, attribute, value)
+            self.sent.clear()
             result = await self.dispatch()
-            self.assertEqual(result.status_code, 422)
+            self.assertEqual(result.status_code, 200, result.body)
+            self.assertEqual(self.sent[-1][0].url.host, 'outside.invalid')
+            self.assertEqual(self.sent[-1][1]['model'], 'gpt-6-sol')
             setattr(self.go, attribute, old)
         self.go.cfg.route_models = ['another-model']
-        self.assertEqual((await self.dispatch()).status_code, 422)
+        self.sent.clear()
+        self.assertEqual((await self.dispatch()).status_code, 200)
+        self.assertEqual(self.sent[-1][0].url.host, 'outside.invalid')
         self.go.cfg.route_models = []
         del self.registry.states['Go']
-        self.assertEqual((await self.dispatch()).status_code, 422)
+        self.sent.clear()
+        self.assertEqual((await self.dispatch()).status_code, 200)
+        self.assertEqual(self.sent[-1][0].url.host, 'outside.invalid')
+        # Neither the mapped target nor the requested model remains.
+        self.registry.model_mappings.save([rule(target_models=['gone-model'])], None)
+        self.registry.get('Outside').enabled = False
+        self.registry.get('Backup').last_probe_ok = True
+        self.sent.clear()
+        result = await self.dispatch()
+        self.assertEqual(result.status_code, 422)
+        self.assertIn('均无可用渠道', result.body.decode())
         self.assertEqual(self.sent, [])
         await self.go.client.aclose()
+
+    async def test_streaming_mapping_uses_another_station_for_the_target_model(self):
+        self.spare.enabled = True
+        self.go.enabled = False
+        result = await self.dispatch(stream=True)
+        self.assertEqual(result.status_code, 200)
+        content = b''.join([chunk async for chunk in result.body_iterator])
+        self.assertIn(b'response.completed', content)
+        self.assertEqual(self.sent[-1][0].url.host, 'spare.invalid')
+        self.assertEqual(self.sent[-1][1]['model'], 'deepseek-v4.1-flash')
 
     async def test_stream_completion_failure_and_cleanup(self):
         for tail, expected in [(b'data: [DONE]\n\n', b'response.completed'), (b'', b'response.failed')]:
@@ -306,13 +392,179 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
         self.go.status = 'down'
         self.go.down_since = time.time()
         result = await self.dispatch()
-        self.assertEqual(result.status_code, 502)
-        self.assertEqual(self.sent, [])
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(self.sent[-1][0].url.host, 'outside.invalid')
+        self.assertEqual(self.go.status, 'down')
         self.go.down_since = time.time() - self.gateway.cool_down - 2
         result = await self.dispatch()
         self.assertEqual(result.status_code, 200)
         self.assertEqual(self.go.status, 'up')
         self.assertFalse(self.go.recovery_inflight)
+
+    async def test_local_guards_fall_back_without_touching_target(self):
+        for guard in ('rate_limit', 'breaker', 'station_busy', 'origin_busy', 'origin_cooling'):
+            with self.subTest(guard=guard):
+                self.sent.clear()
+                sem = self.registry.ensure_semaphore(self.go)
+                origin = self.registry.ensure_origin_limiter(self.go)
+                if guard == 'rate_limit': self.go.rate_limit_until = time.time() + 300
+                if guard == 'breaker': self.go.status, self.go.down_since = 'down', time.time()
+                held = sem if guard == 'station_busy' else origin.semaphore if guard == 'origin_busy' else None
+                if held:
+                    for _ in range(held._value): await held.acquire()
+                if guard == 'origin_cooling': origin.cooldown_until = time.time() + 300
+                try:
+                    result = await self.dispatch()
+                    self.assertEqual(result.status_code, 200, result.body)
+                    self.assertEqual([request.url.host for request, _ in self.sent], ['outside.invalid'])
+                    self.assertEqual(self.log.events[-1]['mapping_id'], 'substitute')
+                    self.assertEqual(self.log.events[-1]['model'], 'gpt-6-sol')
+                finally:
+                    if held:
+                        count = self.go.cfg.max_concurrency if held is sem else self.gateway.origin_max_concurrency
+                        for _ in range(count): held.release()
+                    self.go.rate_limit_until, self.go.status, self.go.down_since = 0, 'up', 0
+                    origin.cooldown_until = 0
+
+    async def test_target_failures_fall_back_to_source_for_json_and_stream(self):
+        for stream in (False, True):
+            for status in (401, 402, 404, 429, 503):
+                with self.subTest(stream=stream, status=status):
+                    self.go.reset_quota()
+                    origin = self.registry.ensure_origin_limiter(self.go)
+                    origin.cooldown_until, origin.recovery_required = 0, False
+                    self.status = status
+                    self.sent.clear()
+                    result = await self.dispatch(stream=stream)
+                    self.assertEqual(result.status_code, 200, getattr(result, 'body', b''))
+                    if stream:
+                        content = b''.join([chunk async for chunk in result.body_iterator])
+                        self.assertIn(b'response.completed', content)
+                    self.assertEqual([body['model'] for _, body in self.sent], ['deepseek-v4.1-flash', 'gpt-6-sol'])
+                    self.assertEqual(self.sent[-1][0].url.host, 'outside.invalid')
+
+    async def test_model_priority_precedes_station_score(self):
+        self.registry.model_mappings.save([rule(target_models=['deepseek-v4.1-flash', 'backup-model'])], None)
+        with patch.object(self.go, 'routing_evidence', return_value={'score': 10}), \
+                patch.object(self.registry.get('Backup'), 'routing_evidence', return_value={'score': 100}):
+            result = await self.dispatch()
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual([body['model'] for _, body in self.sent], ['deepseek-v4.1-flash'])
+
+    async def test_second_model_on_same_station_survives_first_model_failure(self):
+        self.go.enabled = False
+        self.registry.get('Outside').enabled = False
+        backup = self.registry.get('Backup')
+        backup.cfg.models = ['first-model', 'backup-model']
+        self.registry.model_mappings.save([rule(target_models=['first-model', 'backup-model'])], None)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                sent = []
+                async def respond(request):
+                    payload = json.loads(request.content)
+                    sent.append(payload['model'])
+                    if payload['model'] == 'first-model':
+                        return httpx.Response(404, json={'error': {'message': 'model not found'}})
+                    if stream:
+                        return httpx.Response(200, content=sse({'choices': [{'delta': {'content': 'ok'}}]}) + b'data: [DONE]\n\n',
+                                              headers={'content-type': 'text/event-stream'})
+                    return httpx.Response(200, json={'choices': [{'message': {'content': 'ok'}}]})
+                await backup.client.aclose()
+                backup.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+                result = await self.dispatch(stream=stream)
+                self.assertEqual(result.status_code, 200)
+                if stream:
+                    content = b''.join([chunk async for chunk in result.body_iterator])
+                    self.assertIn(b'response.completed', content)
+                self.assertEqual(sent, ['first-model', 'backup-model'])
+
+    async def test_mapping_and_source_share_one_attempt_budget(self):
+        self.gateway.max_attempts = 1
+        self.status = 404
+        result = await self.dispatch()
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_slow_target_reserves_time_for_source_json_and_stream(self):
+        self.gateway.max_retry_seconds = 1.0
+        self.gateway.max_attempts = 2
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                sent = []
+                async def respond(request):
+                    sent.append(request.url.host)
+                    if request.url.host == 'opencode.ai':
+                        await asyncio.sleep(10)
+                    payload = json.loads(request.content)
+                    if stream:
+                        return httpx.Response(200, content=sse({'type': 'response.output_text.delta', 'delta': 'ok'}) +
+                            sse({'type': 'response.completed', 'response': {'model': payload['model'], 'output': []}}),
+                            headers={'content-type': 'text/event-stream'})
+                    return httpx.Response(200, json={'model': payload['model'], 'output': []})
+                for station in (self.go, self.registry.get('Outside')):
+                    await station.client.aclose()
+                    station.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+                result = await self.dispatch(stream=stream)
+                self.assertEqual(result.status_code, 200, getattr(result, 'body', b''))
+                if stream:
+                    content = b''.join([chunk async for chunk in result.body_iterator])
+                    self.assertIn(b'response.completed', content)
+                self.assertEqual(sent, ['opencode.ai', 'outside.invalid'])
+                self.assertEqual(self.go.failures, 0)
+                self.assertFalse(self.registry.route_activity_snapshot()['active'])
+
+    async def test_model_equals_source_is_not_attempted_twice(self):
+        self.go.enabled = False
+        self.registry.model_mappings.save([rule(target_models=['gpt-6-sol'])], None)
+        result = await self.dispatch()
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_discovery_waits_for_target_without_generation_or_early_source(self):
+        self.go.probed_models.clear()
+        self.go.model_api_paths.clear()
+        self.go.cfg.models = ['some-manual-model']
+        self.go.models_discovery_status = 'loading'
+        async def finish_catalog():
+            await asyncio.sleep(.02)
+            self.assertEqual(self.sent, [])
+            self.go.probed_models = {'deepseek-v4.1-flash'}
+            self.go.model_api_paths = {'deepseek-v4.1-flash': ['/chat/completions']}
+            self.go.models_discovery_status = 'ready'
+        discovery = asyncio.create_task(finish_catalog())
+        result = await self.dispatch()
+        await discovery
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual([request.url.host for request, _ in self.sent], ['opencode.ai'])
+
+    async def test_stuck_catalog_has_bounded_wait_then_source_or_503(self):
+        self.go.probed_models.clear()
+        self.go.model_api_paths.clear()
+        self.go.models_discovery_status = 'loading'
+        with patch('app.proxy.MAPPING_DISCOVERY_GRACE', .01):
+            result = await self.dispatch()
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(self.sent[-1][0].url.host, 'outside.invalid')
+            self.registry.get('Outside').enabled = False
+            self.sent.clear()
+            result = await self.dispatch()
+            self.assertEqual(result.status_code, 503)
+            self.assertEqual(self.sent, [])
+
+    async def test_preview_uses_quota_cooldown_and_protocol_guards(self):
+        self.go.quota_exhausted = True
+        preview = mapping_preview(self.registry, rule())
+        self.assertEqual(preview['/responses']['mode'], 'fallback')
+        self.assertEqual(preview['/responses']['stations'], ['Outside'])
+        self.assertFalse(preview['/responses']['targets'][0]['stations'][0]['available'])
+        self.go.quota_exhausted = False
+        self.go.rate_limit_until = time.time() + 300
+        self.assertEqual(mapping_preview(self.registry, rule())['/responses']['mode'], 'fallback')
+        self.go.rate_limit_until = 0
+        self.go.model_api_paths['deepseek-v4.1-flash'] = ['/responses']
+        preview = mapping_preview(self.registry, rule())
+        self.assertEqual(preview['/responses']['mode'], 'target')
+        self.assertEqual(preview['/chat/completions']['mode'], 'fallback')
 
     async def test_restart_interrupted_request_retains_mapping_context(self):
         self.log.start_route(100, 'Go', 'deepseek-v4.1-flash', '10.1.1.1', requested_model='gpt-6-sol', mapping_id='substitute')
@@ -327,7 +579,7 @@ class MappingProxyTests(unittest.IsolatedAsyncioTestCase):
         self.block = True
         task = asyncio.create_task(self.dispatch())
         await asyncio.wait_for(self.entered.wait(), 2)
-        self.registry.model_mappings.save([rule(targets=[{'station': 'Backup', 'model': 'backup-model'}])], self.registry)
+        self.registry.model_mappings.save([rule(target_models=['backup-model'])], self.registry)
         self.release.set()
         result = await task
         self.assertEqual(json.loads(result.body)['model'], 'deepseek-v4.1-flash')
@@ -348,14 +600,16 @@ class MappingAccountTests(unittest.IsolatedAsyncioTestCase):
                 account = (await client.post('/admin/accounts', json={'username': 'other', 'display_name': 'Other', 'allowed_ips': ['127.0.0.1']})).json()['id']
                 self.assertEqual((await client.post(f'/admin/accounts/{account}/switch', json={})).status_code, 200)
                 self.assertEqual((await client.get('/admin/model-mappings')).json()['rules'], [])
-                self.assertEqual((await client.put('/admin/model-mappings', json={'rules': [rule()]})).status_code, 400)
+                other_rule = rule(id='other', name='Other alias', target_models=['other-model'])
+                self.assertEqual((await client.put('/admin/model-mappings', json={'rules': [other_rule]})).status_code, 200)
+                self.assertEqual((await client.get('/admin/model-mappings')).json()['rules'], [other_rule])
                 self.assertEqual((await client.get('/admin/model-mappings', headers={'Authorization': 'Bearer wrong'})).status_code, 401)
                 await client.post('/admin/accounts/default/switch', json={})
                 self.assertEqual((await client.get('/admin/model-mappings')).json()['rules'], [rule()])
                 restored = build_app(copy.deepcopy(cfg))
                 try:
                     self.assertEqual(restored.state.accounts.active.registry.model_mappings.rules, [rule()])
-                    self.assertEqual(restored.state.accounts.runtime(account).registry.model_mappings.rules, [])
+                    self.assertEqual(restored.state.accounts.runtime(account).registry.model_mappings.rules, [other_rule])
                 finally:
                     for runtime in restored.state.accounts.runtimes.values():
                         await runtime.registry.close_clients()

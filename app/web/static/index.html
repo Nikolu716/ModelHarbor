@@ -8,7 +8,7 @@
   <link rel="icon" href="/static/favicon.ico?v=4" sizes="any">
   <link rel="apple-touch-icon" href="/static/brand-mark-180.png?v=4">
   <link rel="stylesheet" href="/static/dashboard.css?v=53">
-  <link rel="stylesheet" href="/static/model-mappings.css?v=1">
+  <link rel="stylesheet" href="/static/model-mappings.css?v=4">
   <link rel="stylesheet" href="/static/visual-tests.css?v=10">
   <link rel="stylesheet" href="/static/selects.css?v=1">
 </head>
@@ -246,7 +246,7 @@
 
       <section id="mappings-wrap" class="mapping-panel section-panel" data-section-panel="stations" data-section="mappings" role="tabpanel" aria-labelledby="stations-tab-mappings" hidden>
         <header class="mapping-heading"><div><h2>模型映射</h2><p id="mapping-count">当前账号独立配置</p></div><div class="mapping-heading-actions"><button id="mapping-reload" class="button secondary" type="button">刷新</button><button id="mapping-add" class="button primary" type="button" disabled>新建映射</button></div></header>
-        <p class="mapping-policy">指定 IP 优先于所有来源；请求模型精确匹配。命中后只使用选定渠道，继续遵守白名单、健康状态和并发限制。</p>
+        <p class="mapping-policy">指定 IP 优先于所有来源；请求模型精确匹配。命中后按实际模型能力自动选择渠道，目标模型不可用时回退请求模型的正常路由，继续遵守白名单、健康状态和并发限制。</p>
         <div id="mapping-list" class="mapping-list"></div><p class="form-status" id="mapping-status" role="status" aria-live="polite"></p>
       </section>
 
@@ -509,7 +509,7 @@
     <form id="mapping-form"><div class="mapping-form-content">
       <div class="mapping-field-grid"><label for="mapping-name">规则名称<input id="mapping-name" maxlength="60" required placeholder="例如：GPT 请求交给 DeepSeek"></label><label for="mapping-model">客户端请求的模型<input id="mapping-model" maxlength="200" required placeholder="gpt-6-sol" spellcheck="false" autocomplete="off"></label></div>
       <div class="mapping-field-grid"><label for="mapping-scope">来源范围<select id="mapping-scope"><option value="all">所有来源</option><option value="ips">指定 IP</option></select></label><label for="mapping-ips" id="mapping-ips-label" hidden>客户端 IP<textarea id="mapping-ips" rows="2" placeholder="每行一个 IP，也可用逗号分隔" spellcheck="false"></textarea></label></div>
-      <section><div class="mapping-target-heading"><h3>实际回答的渠道与模型</h3><button id="mapping-target-add" class="button secondary" type="button">添加渠道</button></div><div id="mapping-targets"></div><p>多个目标按现有健康评分与优先级调度，失败后可在所选渠道内切换。仅限当前账号的 OpenAI 兼容模型。</p></section>
+      <section><div class="mapping-target-heading"><h3>实际回答模型 · 从上到下优先</h3><button id="mapping-target-add" class="button secondary" type="button">添加模型</button></div><div id="mapping-targets"></div><datalist id="mapping-model-options"></datalist><p>先尝试第一个模型的可用渠道，再尝试后续模型，最后回退请求模型；共用账号的调用次数与重试时限。目录正在读取时最多等待 2 秒。可填写当前目录暂未出现的模型，恢复后自动生效。</p></section>
       <label class="mapping-enable" for="mapping-enabled"><input id="mapping-enabled" type="checkbox" checked>启用此映射</label>
       <p>接入地址不变。日志保留请求模型与实际模型，用量按实际模型统计。Responses 转 Chat 支持文本和标准函数工具；图片、内置工具和服务端会话等无法转换时会明确报错。</p>
     </div><footer class="mapping-form-footer"><button id="mapping-delete" class="button is-destructive" type="button" hidden>删除</button><p id="mapping-form-status" class="form-status" role="status" aria-live="polite"></p><div class="dialog-actions"><button id="mapping-cancel" class="button secondary" type="button">取消</button><button id="mapping-save" class="button primary" type="submit">保存映射</button></div></footer></form>
@@ -642,7 +642,7 @@
   <script src="/static/analytics.js?v=8" defer></script>
   <script src="/static/accounts.js?v=17" defer></script>
   <script src="/static/visual-tests.js?v=13" defer></script>
-  <script src="/static/model-mappings.js?v=1" defer></script>
+  <script src="/static/model-mappings.js?v=4" defer></script>
   <script src="/static/selects.js?v=1" defer></script>
 
 

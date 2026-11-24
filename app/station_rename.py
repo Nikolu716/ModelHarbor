@@ -115,10 +115,6 @@ def rename_account_station(registry, eventlog, station_store, visual_store, runn
         if eventlog.durable and not eventlog.persist():
             raise OSError("重命名统计保存失败")
         rules = copy.deepcopy(saved_rules)
-        for rule in rules:
-            for target in rule["targets"]:
-                if target["station"] == old:
-                    target["station"] = new
         mappings.save(rules, None)
         with visual_store.connect() as db, db:
             row = db.execute("SELECT summary,result FROM results WHERE station=?", (old,)).fetchone()

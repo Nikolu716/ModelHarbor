@@ -15,6 +15,7 @@ import json
 import math
 import time
 import weakref
+from dataclasses import dataclass
 
 import httpx
 from fastapi import APIRouter, Request
@@ -38,7 +39,7 @@ from .health import _retry_after_seconds
 from .protocols import MESSAGES, GENERATE, STREAM_GENERATE, GEMINI_PATHS, inference_url, native_text, error_body
 from .providers import MissingOpenCodeSession, inference_headers, request_context
 from .wire import UnsupportedWireRequest
-from .model_mappings import supports_mapping
+from .model_mappings import pending_catalogs, resolve_target_stations, target_groups
 from .mapping_wire import (chat_to_responses as mapped_chat_to_responses,
                            ChatStreamToResponsesTranslator as MappedStreamTranslator)
 
@@ -49,6 +50,15 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+MAPPING_DISCOVERY_GRACE = 2.0
+
+
+@dataclass(frozen=True)
+class _RouteChoice:
+    station: StationState
+    model: str
+    mapped: bool = False
 
 
 class _RetryBudget:
@@ -866,21 +876,62 @@ class OpenAIProxy:
             "invalid_request_error",
         )
 
-    def _mapping_precondition_error(self, mapping, path):
-        targets = mapping['targets']
-        matching = [self.registry.states[target['station']] for target in targets
-                    if target['station'] in self.registry.states and supports_mapping(
-                        self.registry.states[target['station']], target['model'], path)]
+    def _mapping_matching_states(self, mapping, model, path):
+        names = resolve_target_stations(self.registry.states, mapping, path)
+        return [st for name, st in self.registry.states.items()
+                if name in names or st.supports_model(model, path)]
+
+    def _mapping_precondition_error(self, mapping, model, path):
+        matching = self._mapping_matching_states(mapping, model, path)
         if any(self._station_retryable(st) for st in matching):
             return None
         waiting = self._native_usage_wait_response(matching)
         if waiting is not None:
             return waiting
-        return _error_response(422, '映射规则指定的渠道已停用、额度不可用、模型已移除或协议不兼容；请检查当前账号的模型映射', 'invalid_request_error')
+        if pending_catalogs(self.registry.states, path):
+            response = _error_response(503, '模型目录尚未就绪，请稍后重试', 'server_error')
+            response.headers['Retry-After'] = '2'
+            return response
+        return _error_response(422, '映射目标模型与请求模型均无可用渠道；请检查当前账号的映射、渠道状态与模型目录',
+                               'invalid_request_error')
 
-    def _mapping_retryable(self, targets, path):
-        return any(self._station_retryable(st) and supports_mapping(st, targets[name], path)
-                   for name, st in self.registry.states.items() if name in targets)
+    async def _wait_for_mapping_catalog(self, request, body, mapping, path):
+        """Give startup discovery one bounded grace period, never trigger probes."""
+        until = time.monotonic() + MAPPING_DISCOVERY_GRACE
+        if body.retry_budget.deadline is not None:
+            until = min(until, body.retry_budget.deadline)
+        while pending_catalogs(self.registry.states, path):
+            targets = resolve_target_stations(self.registry.states, mapping, path)
+            if any(not self.router.unavailable_reason(self.registry.states[name]) for name in targets):
+                break
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                break
+            if not await self._wait_for_retry(request, min(.1, remaining)):
+                return False
+        return True
+
+    def _route_choices(self, model, path, stream, mapping=None):
+        """Model order first, health-ranked stations within each model, source last."""
+        if mapping is None:
+            return [_RouteChoice(st, model) for st in self.router.pick(model, path, stream=stream)]
+        choices, seen = [], set()
+        for actual, targets in target_groups(self.registry.states, mapping, path):
+            if not targets:
+                continue
+            for st in self.router.pick(model, path, stream=stream, targets=targets):
+                # Protect against stale/removed candidates during live edits.
+                if st.cfg.name in targets and (st.cfg.name, actual) not in seen:
+                    choices.append(_RouteChoice(st, actual, True))
+                    seen.add((st.cfg.name, actual))
+        for st in self.router.pick(model, path, stream=stream):
+            if (st.cfg.name, model) not in seen:
+                choices.append(_RouteChoice(st, model))
+        return choices
+
+    def _mapping_retryable(self, mapping, model, path):
+        return any(self._station_retryable(st)
+                   for st in self._mapping_matching_states(mapping, model, path))
 
     def _round_delay(self, round_index: int) -> float:
         """Return a capped exponential delay before the next retry round."""
@@ -988,6 +1039,8 @@ class OpenAIProxy:
         max_retry_seconds = self.gateway.max_retry_seconds
         deadline = (time.monotonic() + max_retry_seconds) if max_retry_seconds else None
         body.retry_budget.deadline = deadline
+        if mapping is not None and not await self._wait_for_mapping_catalog(request, body, mapping, path):
+            return self._client_disconnected_response()
         round_index = 0
         total_attempts = 0
         # 仅瞬时失败继续下一轮；确定性错误立即返回。所有客户端均按
@@ -995,8 +1048,10 @@ class OpenAIProxy:
         while self.gateway.max_rounds == 0 or round_index < self.gateway.max_rounds:
             if await request.is_disconnected():
                 return self._client_disconnected_response()
-            precondition_error = (self._mapping_precondition_error(mapping, path) if mapping is not None
-                                  else self._routing_precondition_error(model, path))
+            if mapping is not None:
+                precondition_error = self._mapping_precondition_error(mapping, model, path)
+            else:
+                precondition_error = self._routing_precondition_error(model, path)
             if precondition_error is not None:
                 return failure(model, precondition_error, total_attempts)
             remaining = None if deadline is None else deadline - time.monotonic()
@@ -1004,8 +1059,10 @@ class OpenAIProxy:
                 return failure(
                     model, self._retry_timeout_response(max_retry_seconds), total_attempts)
             try:
-                forward = (self._forward_stream(path, body, model, client_ip, client_headers) if stream
-                           else self._forward_json(path, body, model, client_ip, client_headers))
+                forward = (self._forward_stream(path, body, model, client_ip, client_headers,
+                                                mapping=mapping) if stream
+                           else self._forward_json(path, body, model, client_ip, client_headers,
+                                                   mapping=mapping))
                 if remaining is None:
                     result, has_transient = await forward
                 else:
@@ -1018,8 +1075,10 @@ class OpenAIProxy:
             if result.status_code == 502:
                 # A trial may just have renewed the usage wait, or another
                 # real request may have acquired the single recovery permit.
-                blocked = (self._mapping_precondition_error(mapping, path) if mapping is not None
-                           else self._routing_precondition_error(model, path))
+                if mapping is not None:
+                    blocked = self._mapping_precondition_error(mapping, model, path)
+                else:
+                    blocked = self._routing_precondition_error(model, path)
                 if blocked is not None and blocked.status_code == 429:
                     return failure(model, blocked, total_attempts)
             if getattr(result, "status_code", 0) != 502:
@@ -1035,7 +1094,8 @@ class OpenAIProxy:
                                     self._retry_timeout_response(max_retry_seconds),
                                     total_attempts,
                                 )
-                            forward = self._forward_json(path, degraded, model, client_ip, client_headers)
+                            forward = self._forward_json(path, degraded, model, client_ip, client_headers,
+                                                         mapping=mapping)
                             if remaining is None:
                                 result, _ = await forward
                             else:
@@ -1086,10 +1146,9 @@ class OpenAIProxy:
         for rule in self.registry.model_mappings.rules:
             matched = self.registry.model_mappings.match(rule['source_model'], peer.host if peer else None, '/responses')
             if matched and matched['id'] == rule['id']:
-                names = [target['station'] for target in matched['targets']
-                         if target['station'] in self.registry.states
-                         and self.registry.states[target['station']].enabled
-                         and supports_mapping(self.registry.states[target['station']], target['model'], '/responses')]
+                names = [name for name in resolve_target_stations(
+                    self.registry.states, matched, '/responses')
+                    if self.registry.states[name].enabled]
                 if names:
                     merged[rule['source_model']] = list(dict.fromkeys(names))
         data = [
@@ -1151,7 +1210,7 @@ class OpenAIProxy:
     # 非流式转发（完整缓冲，可无缝切换）
     # ------------------------------------------------------------------
     def _attempt_deadline(self, body, path, remaining_candidates,
-                          sent_attempts, targets=None, current_subscription=None, client_headers=None):
+                          sent_attempts, current_subscription=None, client_headers=None):
         """Share only the pre-commit retry window with usable fallback routes.
 
         No additional cap for a lone channel, unlimited global budgets, or a
@@ -1167,15 +1226,16 @@ class OpenAIProxy:
         if current_subscription is not None:
             subscriptions.add(current_subscription)
         fallbacks = 0
-        for st in remaining_candidates:
+        for choice in remaining_candidates:
+            st = choice.station
             subscription = st.cfg.chatgpt_account or st.cfg.name
             if st.cfg.provider == 'chatgpt' and subscription in subscriptions:
                 continue
             if self.router.unavailable_reason(st):
                 continue
             try:
-                routed_body = {**body, 'model': targets[st.cfg.name]} if targets is not None else body
-                target_path, _, _ = prepare_request(st, path, routed_body, allow_tools=targets is not None)
+                routed_body = {**body, 'model': choice.model} if choice.mapped else body
+                target_path, _, _ = prepare_request(st, path, routed_body, allow_tools=choice.mapped)
                 _build_headers(st, client_headers, target_path)
             except (MissingOpenCodeSession, UnsupportedWireRequest, ValueError):
                 continue
@@ -1193,30 +1253,31 @@ class OpenAIProxy:
         reserve = min(self.gateway.retry_backoff * fallbacks, max(0, remaining) / 2)
         return now + max(0, remaining - reserve) / (fallbacks + 1)
 
-    async def _forward_json(self, path: str, body: dict, model: str, client_ip: str | None = None, client_headers=None):
+    async def _forward_json(self, path: str, body: dict, model: str, client_ip: str | None = None,
+                            client_headers=None, *, mapping: dict | None = None):
         """非流式转发：完整缓冲 + 站级无缝切换。
 
         返回 (response, has_transient)：has_transient=True 表示本轮存在瞬时失败，
-        值得整体重试一轮（fail-fast 判断依据）。
+        值得整体重试一轮（fail-fast 判断依据）。映射目标与原模型共用一次
+        候选队列和调用次数预算；同模型内按渠道健康度调度。
         """
         attempts: list[str] = []
         skipped: list[str] = []
         has_transient = False
         local_errors: list[str] = []
-        mapping = getattr(body, 'mapping', None)
         requested_model = model
-        targets = {t['station']: t['model'] for t in mapping['targets']} if mapping else None
         log_mapping = {'requested_model': requested_model, 'mapping_id': mapping['id']} if mapping else {}
-        candidates = self.router.pick(model, path, stream=False, **({'targets': targets} if targets is not None else {}))
+        candidates = self._route_choices(model, path, False, mapping)
         # No candidates can mean all matching stations are in a temporary
         # cooldown/rate-limit window.  Preserve that signal so _dispatch can
         # apply the configured round retry budget instead of returning 502
         # immediately (which otherwise leaves retries solely to the client).
         if not candidates:
-            has_transient = self._mapping_retryable(targets, path) if targets is not None else self._has_retryable_station(model, path)
+            has_transient = self._mapping_retryable(mapping, model, path) if mapping else self._has_retryable_station(model, path)
 
         sent_attempts = 0
-        for idx, st in enumerate(candidates):
+        for idx, choice in enumerate(candidates):
+            st = choice.station
             subscription = st.cfg.chatgpt_account or st.cfg.name
             if st.cfg.provider == "chatgpt" and subscription in getattr(body, "subscription_attempts", ()):
                 continue
@@ -1228,13 +1289,13 @@ class OpenAIProxy:
                 has_transient = True
                 continue
             attempt_deadline = self._attempt_deadline(
-                body, path, candidates[idx + 1:], sent_attempts, targets,
+                body, path, candidates[idx + 1:], sent_attempts,
                 subscription if st.cfg.provider == 'chatgpt' else None, client_headers)
             try:
-                model = targets[st.cfg.name] if targets is not None else requested_model
-                routed_body = {**body, 'model': model} if mapping else body
+                model = choice.model
+                routed_body = {**body, 'model': model} if choice.mapped else body
                 signature = st.connection_signature()
-                target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
+                target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=choice.mapped)
                 from .chatgpt import authorized_headers
                 async with asyncio.timeout_at(attempt_deadline):
                     headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
@@ -1358,7 +1419,7 @@ class OpenAIProxy:
                             try:
                                 obj = json.loads(body_bytes.decode("utf-8", errors="replace"))
                                 body_bytes = json.dumps(
-                                    (mapped_chat_to_responses if mapping else chat_to_responses)(obj, model),
+                                    (mapped_chat_to_responses if choice.mapped else chat_to_responses)(obj, model),
                                     ensure_ascii=False).encode("utf-8")
                             except (ValueError, TypeError, KeyError):
                                 route_error = '上游响应不符合协议，无法转换'
@@ -1447,25 +1508,25 @@ class OpenAIProxy:
     # ------------------------------------------------------------------
     # 流式转发（SSE 透传，首字节前可切换）
     # ------------------------------------------------------------------
-    async def _forward_stream(self, path: str, body: dict, model: str, client_ip: str | None = None, client_headers=None):
+    async def _forward_stream(self, path: str, body: dict, model: str, client_ip: str | None = None,
+                              client_headers=None, *, mapping: dict | None = None):
         """流式转发：SSE 透传 + 首字节前无缝切换 + 长流保活。
 
-        返回 (response, has_transient)，语义同 _forward_json。
+        返回 (response, has_transient)，候选顺序与预算语义同 _forward_json。
         """
         attempts: list[str] = []
         skipped: list[str] = []
         has_transient = False
         local_errors: list[str] = []
-        mapping = getattr(body, 'mapping', None)
         requested_model = model
-        targets = {t['station']: t['model'] for t in mapping['targets']} if mapping else None
         log_mapping = {'requested_model': requested_model, 'mapping_id': mapping['id']} if mapping else {}
-        candidates = self.router.pick(model, path, stream=True, **({'targets': targets} if targets is not None else {}))
+        candidates = self._route_choices(model, path, True, mapping)
         if not candidates:
-            has_transient = self._mapping_retryable(targets, path) if targets is not None else self._has_retryable_station(model, path)
+            has_transient = self._mapping_retryable(mapping, model, path) if mapping else self._has_retryable_station(model, path)
 
         sent_attempts = 0
-        for idx, st in enumerate(candidates):
+        for idx, choice in enumerate(candidates):
+            st = choice.station
             subscription = st.cfg.chatgpt_account or st.cfg.name
             if st.cfg.provider == "chatgpt" and subscription in getattr(body, "subscription_attempts", ()):
                 continue
@@ -1477,13 +1538,13 @@ class OpenAIProxy:
                 has_transient = True
                 continue
             attempt_deadline = self._attempt_deadline(
-                body, path, candidates[idx + 1:], sent_attempts, targets,
+                body, path, candidates[idx + 1:], sent_attempts,
                 subscription if st.cfg.provider == 'chatgpt' else None, client_headers)
             try:
-                model = targets[st.cfg.name] if targets is not None else requested_model
-                routed_body = {**body, 'model': model} if mapping else body
+                model = choice.model
+                routed_body = {**body, 'model': model} if choice.mapped else body
                 signature = st.connection_signature()
-                target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=bool(mapping))
+                target_path, target_body, adapter = prepare_request(st, path, routed_body, allow_tools=choice.mapped)
                 from .chatgpt import authorized_headers
                 async with asyncio.timeout_at(attempt_deadline):
                     headers = await authorized_headers(self.registry, st.cfg, _build_headers(st, client_headers, target_path))
@@ -1674,7 +1735,7 @@ class OpenAIProxy:
                               stream_iter=stream_iter, route_id=route_id,
                               adapter=adapter, model=model):
                     nonlocal stream_outcome, stream_error
-                    translator = ((MappedStreamTranslator if mapping else ChatStreamToResponsesTranslator)(model)
+                    translator = ((MappedStreamTranslator if choice.mapped else ChatStreamToResponsesTranslator)(model)
                                   if adapter == ("r2c",) else None)
                     namespace_scanner = _NamespaceStreamScanner(self.namespace_memory) if target_path == '/responses' else None
                     pending_read = None

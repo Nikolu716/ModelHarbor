@@ -355,7 +355,7 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
             if mapped:
                 self.registry.model_mappings.save([{'id': 'native', 'name': 'Native alias',
                     'enabled': True, 'source_model': 'alias', 'source_ips': [],
-                    'targets': [{'station': 'Native', 'model': 'test-model'}]}], self.registry)
+                    'target_models': ['test-model']}], self.registry)
             class Request:
                 client, headers = None, {}
                 async def json(self):
@@ -427,7 +427,7 @@ class NativeLimitTests(unittest.IsolatedAsyncioTestCase):
         self.st.model_api_paths = {'test-model': ['/responses']}
         self.registry.model_mappings.save([{'id': 'native', 'name': 'Native alias',
             'enabled': True, 'source_model': 'alias', 'source_ips': [],
-            'targets': [{'station': 'Native', 'model': 'test-model'}]}], self.registry)
+            'target_models': ['test-model']}], self.registry)
         self.restrict()
         self.due()
         entered, release = asyncio.Event(), asyncio.Event()

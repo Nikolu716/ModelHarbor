@@ -57,11 +57,9 @@ with tempfile.TemporaryDirectory() as directory:
                 select.locator('..').locator('button').click()
                 page.locator('.mh-select-popup:not([hidden])').get_by_role('option', name=label, exact=True).click()
 
-            choose(page.locator('[data-target-station]').first, 'OpenCode Go')
-            choose(page.locator('[data-target-model]').first, 'deepseek-v4.1-flash')
+            page.locator('[data-target-model]').first.fill('deepseek-v4.1-flash')
             page.locator('#mapping-target-add').click()
-            choose(page.locator('[data-target-station]').nth(1), 'DeepSeek Backup')
-            choose(page.locator('[data-target-model]').nth(1), 'deepseek-chat')
+            page.locator('[data-target-model]').nth(1).fill('deepseek-chat')
             page.locator('#mapping-save').click()
             page.wait_for_function('!document.querySelector("#mapping-dialog").open')
             assert page.locator('.mapping-rule').count() == 1
@@ -72,14 +70,14 @@ with tempfile.TemporaryDirectory() as directory:
             page.locator('#stations-tab-mappings').click()
             page.locator('.mapping-rule').wait_for()
             assert app.state.accounts.active.registry.model_mappings.rules[0]['source_model'] == 'gpt-6-sol'
+            assert app.state.accounts.active.registry.model_mappings.rules[0]['target_models'] == ['deepseek-v4.1-flash', 'deepseek-chat']
             # Add a more specific rule using the same source model.
             page.locator('#mapping-add').click()
             page.locator('#mapping-name').fill('指定客户端')
             page.locator('#mapping-model').fill('gpt-6-sol')
             choose(page.locator('#mapping-scope'), '指定 IP')
             page.locator('#mapping-ips').fill('192.0.2.10\n192.0.2.11')
-            choose(page.locator('[data-target-station]'), 'OpenCode Go')
-            choose(page.locator('[data-target-model]'), 'deepseek-v4.1-flash')
+            page.locator('[data-target-model]').fill('deepseek-v4.1-flash')
             page.locator('#mapping-save').click()
             page.wait_for_function('!document.querySelector("#mapping-dialog").open')
             assert page.locator('.mapping-rule').count() == 2

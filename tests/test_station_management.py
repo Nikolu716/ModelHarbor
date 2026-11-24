@@ -172,7 +172,7 @@ class StationManagementTests(unittest.TestCase):
         self.registry.ensure_client(st)
         self.log.add("alpha", "configured-model", True, 100, tokens=23, client_ip="192.0.2.1")
         self.registry.model_mappings.save([dict(id="alias", name="alias", enabled=True,
-            source_model="requested-model", source_ips=[], targets=[dict(station="alpha", model="configured-model")])], self.registry)
+            source_model="requested-model", source_ips=[], target_models=["configured-model"])], self.registry)
         visual = VisualTestStore(self.tempdir.name)
         visual.save_result(st, dict(id="preview-1", station="alpha", model="configured-model", created_at=time.time(),
             ok=True, kind="svg", latency_ms=50, usage=None, http_status=200, artifact="<svg></svg>"))
@@ -195,7 +195,7 @@ class StationManagementTests(unittest.TestCase):
         self.assertIs(self.registry.get("My ChatGPT"), st)
         self.assertIs(st.client, client)
         self.assertEqual(st.probed_models, {"detected-model"})
-        self.assertEqual(self.registry.model_mappings.rules[0]["targets"][0]["station"], "My ChatGPT")
+        self.assertEqual(self.registry.model_mappings.rules[0]["target_models"], ["configured-model"])
         self.assertEqual(self.log.events[-1]["station"], "My ChatGPT")
         self.assertEqual(self.log.events[-1]["tokens"], 23)
         reloaded = EventLog(self.tempdir.name)
@@ -219,7 +219,7 @@ class StationManagementTests(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertIs(self.registry.get("alpha"), st)
         self.assertEqual(self.log.events[-1]["station"], "alpha")
-        self.assertEqual(self.registry.model_mappings.rules[0]["targets"][0]["station"], "alpha")
+        self.assertEqual(self.registry.model_mappings.rules[0]["target_models"], ["configured-model"])
         self.assertEqual(visual.result(st)["station"], "alpha")
         self.assertEqual(self.store.load()[0].name, "alpha")
         self.log.add("alpha", "configured-model", True, 20)

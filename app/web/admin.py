@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from ..config import GatewayConfig, StationConfig
-from ..model_mappings import ModelMappings
+from ..model_mappings import ModelMappings, mapping_preview
 from ..access_control import (
     AccessControlStore, is_ip_allowed, validate_allowed_ips,
 )
@@ -432,7 +432,9 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
 
     @api.get("/model-mappings")
     async def get_model_mappings():
-        return registry.model_mappings.view()
+        return {**registry.model_mappings.view(),
+                'previews': {rule['id']: mapping_preview(registry, rule)
+                             for rule in registry.model_mappings.rules}}
 
     @api.put("/model-mappings")
     async def save_model_mappings(body: dict):
@@ -444,7 +446,7 @@ def create_admin_router(registry: Registry, gateway: GatewayConfig,
             raise HTTPException(400, str(exc)) from exc
         except OSError as exc:
             raise HTTPException(500, '映射保存失败，原有规则未改变') from exc
-        return {**registry.model_mappings.view(), 'persisted': True}
+        return {**await get_model_mappings(), 'persisted': True}
 
     @api.put("/settings/scoring")
     async def update_scoring_settings(body: dict):

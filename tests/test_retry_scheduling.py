@@ -11,7 +11,7 @@ from unittest.mock import patch
 import httpx
 
 from app.config import GatewayConfig, StationConfig
-from app.proxy import OpenAIProxy, _RequestBody
+from app.proxy import OpenAIProxy, _RequestBody, _RouteChoice
 from app.state import Registry, STATUS_DOWN
 from app.stats import EventLog
 from app.wire import UnsupportedWireRequest, prepare_request
@@ -450,9 +450,9 @@ class RetrySchedulingTests(unittest.IsolatedAsyncioTestCase):
         b.cfg.provider = 'opencode'
         b.cfg.opencode_plan = 'go'
         b.model_api_paths = {'m': ['/responses']}
-        self.assertIsNone(self.proxy._attempt_deadline(body, '/responses', [b], 0))
+        self.assertIsNone(self.proxy._attempt_deadline(body, '/responses', [_RouteChoice(b, 'm')], 0))
         deadline = self.proxy._attempt_deadline(
-            body, '/responses', [b], 0, client_headers={'x-session-id': 'test-conversation'})
+            body, '/responses', [_RouteChoice(b, 'm')], 0, client_headers={'x-session-id': 'test-conversation'})
         self.assertIsNotNone(deadline)
         self.assertLess(deadline, body.retry_budget.deadline)
         self.assertEqual(self.calls, [])
@@ -460,7 +460,7 @@ class RetrySchedulingTests(unittest.IsolatedAsyncioTestCase):
         b.cfg.provider = 'chatgpt'
         b.cfg.chatgpt_account = 'same-binding'
         self.assertIsNone(self.proxy._attempt_deadline(
-            body, '/responses', [b], 0, current_subscription='same-binding'))
+            body, '/responses', [_RouteChoice(b, 'm')], 0, current_subscription='same-binding'))
 
     async def test_committed_stream_can_outlive_retry_budget(self):
         async def committed(req):

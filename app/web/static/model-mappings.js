@@ -1,71 +1,102 @@
 /* Account-local model routing. Opening this panel never calls an upstream. */
 (() => {
   'use strict';
-  let rules = [], stations = [], editing = null, busy = false, loaded = false;
+  let rules = [], stations = [], previews = {}, editing = null, busy = false, loaded = false;
   const el = id => document.getElementById(id);
   const esc = value => escapeHtml(String(value ?? ''));
   const status = (message, error = false) => {
     el('mapping-status').textContent = message;
     el('mapping-status').classList.toggle('text-danger', error);
   };
-  const option = (value, label = value) => `<option value="${esc(value)}">${esc(label)}</option>`;
+
+  function supportsModel(station, model) {
+    if (!station || ['anthropic', 'gemini'].includes(station.provider)) return false;
+    if (!(station.effective_models || []).includes(model)) return false;
+    const paths = station.model_api_paths?.[model];
+    return !paths?.length || paths.some(path => ['/responses', '/chat/completions'].includes(path));
+  }
+
+  function availabilityMarkup(rule) {
+    if (!rule.enabled) return '<div class="mapping-availability">已停用，按请求模型正常路由</div>';
+    return Object.entries({'/responses': 'Responses', '/chat/completions': 'Chat'}).map(([path, label]) => {
+      const plan = previews[rule.id]?.[path];
+      if (!plan) return `<div class="mapping-availability">${label}：正在同步路由状态</div>`;
+      const details = [...plan.targets.flatMap(target => target.stations.map(station =>
+        `${target.model} · ${station.name}：${station.available ? '可调度' : station.reason}`)),
+        ...plan.fallback.map(station => `原模型 · ${station.name}：${station.available ? '可调度' : station.reason}`)].join('\n');
+      const message = plan.mode === 'target' ? `优先 ${plan.model} · 当前候选：${plan.stations.join('、')}`
+        : plan.mode === 'pending' ? '模型目录正在读取，短暂等待后决定是否回退'
+        : plan.mode === 'fallback' ? `回退 ${rule.source_model} · 当前候选：${plan.stations.join('、')}`
+        : '目标与原模型当前均无可调度渠道';
+      return `<div class="mapping-availability ${plan.mode === 'target' ? '' : 'is-fallback'}" title="${esc(details)}">${label}：${esc(message)}</div>`;
+    }).join('');
+  }
+
+  function availableModels() {
+    const names = new Set();
+    for (const station of stations) {
+      for (const model of station.effective_models || []) {
+        if (supportsModel(station, model)) names.add(model);
+      }
+    }
+    for (const rule of rules) (rule.target_models || []).forEach(model => names.add(model));
+    return [...names].sort();
+  }
+
+  function refreshModelOptions() {
+    el('mapping-model-options').innerHTML = availableModels()
+      .map(model => `<option value="${esc(model)}"></option>`).join('');
+  }
+
   function render() {
     el('mapping-count').textContent = `${rules.filter(r => r.enabled).length} 条启用 · ${rules.length} 条规则`;
-    el('mapping-list').innerHTML = rules.map(rule => `<article class="mapping-rule" data-mapping-id="${esc(rule.id)}">
+    el('mapping-list').innerHTML = rules.map(rule => {
+      const models = rule.target_models || [];
+      return `<article class="mapping-rule" data-mapping-id="${esc(rule.id)}">
       <div class="mapping-rule-head"><strong>${esc(rule.name)}</strong><span class="mapping-state ${rule.enabled ? 'is-on' : ''}">${rule.enabled ? '已启用' : '已停用'}</span><span class="mapping-scope" title="${esc(rule.source_ips.join(' · ') || '所有通过当前账号白名单的来源')}">${rule.source_ips.length ? `${rule.source_ips.length} 个指定 IP` : '所有来源'}</span></div>
-      <div class="mapping-rule-body"><div class="mapping-source"><small>请求模型</small><code title="${esc(rule.source_model)}">${esc(rule.source_model)}</code></div><span class="mapping-arrow" aria-hidden="true">→</span><div class="mapping-destinations">${rule.targets.map(t => `<div><span title="${esc(t.station)}">${esc(t.station)}</span><code title="${esc(t.model)}">${esc(t.model)}</code></div>`).join('')}</div></div>
+      <div class="mapping-rule-body"><div class="mapping-source"><small>请求模型</small><code title="${esc(rule.source_model)}">${esc(rule.source_model)}</code></div><span class="mapping-arrow" aria-hidden="true">→</span><div class="mapping-destinations">${models.map(model => `<div><code title="${esc(model)}">${esc(model)}</code></div>`).join('')}</div></div>
+      ${availabilityMarkup(rule)}
       <div class="mapping-rule-foot"><span>${rule.source_ips.length ? esc(rule.source_ips.join(' · ')) : '匹配此模型的全部请求'}</span><div><button type="button" class="button secondary" data-mapping-action="edit">编辑</button><button type="button" class="button secondary" data-mapping-action="toggle">${rule.enabled ? '停用' : '启用'}</button></div></div>
-    </article>`).join('') || '<div class="mapping-empty"><h3>让一个模型名称连接更多渠道</h3><p>指定客户端请求的模型、来源 IP 与实际回答模型。可同时选择多个渠道，由网关调度。</p><button class="button secondary" type="button" id="mapping-empty-add">创建第一条映射</button></div>';
+    </article>`;
+    }).join('') || '<div class="mapping-empty"><h3>让一个模型名称使用另一个模型</h3><p>填写客户端请求的模型、来源 IP 与实际回答模型。网关按模型能力自动选择渠道，无需绑定具体站点。</p><button class="button secondary" type="button" id="mapping-empty-add">创建第一条映射</button></div>';
     el('mapping-empty-add')?.addEventListener('click', () => openEditor());
+    refreshModelOptions();
   }
+
   window.refreshModelMappings = async () => {
     if (busy || el('mapping-dialog').open) return;
     busy = true;
     el('mapping-add').disabled = true;
     try {
       const [data, catalog] = await Promise.all([api('/admin/model-mappings'), api('/admin/stations')]);
-      rules = data.rules; stations = catalog; loaded = true;
-      render(); status(data.error || '', Boolean(data.error));
+      rules = data.rules; stations = catalog; previews = data.previews || {}; loaded = true;
+      render(); status(data.error || data.migration_error || '', Boolean(data.error || data.migration_error));
     } catch (error) { status(error.message, true); }
     finally { busy = false; el('mapping-add').disabled = !loaded; }
   };
-  function modelsFor(station) {
-    if (!station || ['anthropic', 'gemini'].includes(station.provider)) return [];
-    return (station.effective_models || []).filter(m => !station.model_api_paths?.[m]?.length || station.model_api_paths[m].some(p => ['/responses', '/chat/completions'].includes(p)));
-  }
-  function fillModels(row, selected = '') {
-    const station = stations.find(s => s.name === row.querySelector('[data-target-station]').value);
-    const select = row.querySelector('[data-target-model]');
-    const custom = row.querySelector('[data-target-custom]');
-    const models = modelsFor(station);
-    select.innerHTML = option('', '选择实际模型') + models.map(m => option(m)).join('');
-    if (selected && !models.includes(selected)) select.insertAdjacentHTML('beforeend', option(selected, selected + '（请确认仍可用）'));
-    select.value = selected;
-    custom.hidden = !station?.accepts_any_model;
-    custom.required = Boolean(station?.accepts_any_model);
-    custom.value = selected;
-    select.hidden = Boolean(station?.accepts_any_model);
-    select.required = !station?.accepts_any_model;
-  }
-  function addTarget(target = {}) {
+
+  function addTarget(model = '') {
     if (el('mapping-targets').children.length >= 16) return;
-    const row = document.createElement('div'); row.className = 'mapping-target-row';
-    const eligible = stations.filter(s => !['anthropic', 'gemini'].includes(s.provider));
-    row.innerHTML = `<label>目标渠道<select data-target-station required>${option('', '选择当前账号的渠道')}${eligible.map(s => option(s.name, s.name + (s.enabled ? '' : '（已停用）'))).join('')}${target.station && !eligible.some(s => s.name === target.station) ? option(target.station, target.station + '（已删除）') : ''}</select></label><label>实际回答模型<select data-target-model required>${option('', '先选择渠道')}</select><input data-target-custom hidden maxlength="200" placeholder="输入渠道支持的模型名称" autocomplete="off"></label><button class="account-close mapping-remove-target" type="button" aria-label="移除此目标渠道">×</button>`;
+    const row = document.createElement('div');
+    row.className = 'mapping-target-row';
+    row.innerHTML = `<label>实际回答模型<input data-target-model list="mapping-model-options" maxlength="200" required placeholder="选择或输入模型名称" autocomplete="off" spellcheck="false"></label><button class="account-close mapping-remove-target" type="button" aria-label="移除此实际模型">×</button>`;
+    row.querySelector('[data-target-model]').value = model;
     el('mapping-targets').append(row);
-    row.querySelector('[data-target-station]').value = target.station || '';
-    fillModels(row, target.model || '');
-    row.querySelector('[data-target-station]').addEventListener('change', () => fillModels(row));
     row.querySelector('.mapping-remove-target').addEventListener('click', () => {
-      if (el('mapping-targets').children.length === 1) { el('mapping-form-status').textContent = '至少保留一个目标渠道'; return; }
+      if (el('mapping-targets').children.length === 1) {
+        el('mapping-form-status').textContent = '至少保留一个实际回答模型';
+        return;
+      }
       row.remove();
     });
   }
+
   function scopeChanged() {
     const specific = el('mapping-scope').value === 'ips';
     el('mapping-ips-label').hidden = !specific;
     el('mapping-ips').required = specific;
   }
+
   function openEditor(rule = null) {
     if (busy || !loaded) return;
     editing = rule?.id || null;
@@ -79,9 +110,11 @@
     el('mapping-delete').hidden = !rule;
     el('mapping-form-status').textContent = '';
     el('mapping-targets').replaceChildren();
-    (rule?.targets || [{}]).forEach(addTarget);
+    refreshModelOptions();
+    (rule?.target_models?.length ? rule.target_models : ['']).forEach(addTarget);
     scopeChanged(); el('mapping-dialog').showModal();
   }
+
   async function save(next, close = false) {
     if (busy) return;
     busy = true;
@@ -90,12 +123,13 @@
     controls.forEach(c => { c.disabled = true; });
     try {
       const data = await api('/admin/model-mappings', 'PUT', true, {rules: next});
-      rules = data.rules; render(); status('已保存，对新请求立即生效');
+      rules = data.rules; previews = data.previews || {}; render(); status('已保存，对新请求立即生效');
       if (close) el('mapping-dialog').close();
       el('mapping-form-status').textContent = '';
     } catch (error) { el('mapping-form-status').textContent = error.message; status(error.message, true); }
     finally { busy = false; controls.forEach(c => { c.disabled = false; }); }
   }
+
   el('mapping-add').addEventListener('click', () => openEditor());
   el('mapping-reload').addEventListener('click', () => window.refreshModelMappings());
   el('mapping-list').addEventListener('click', event => {
@@ -114,11 +148,26 @@
   });
   el('mapping-form').addEventListener('submit', event => {
     event.preventDefault();
+    const models = [...el('mapping-targets').querySelectorAll('[data-target-model]')]
+      .map(input => input.value.trim()).filter(Boolean);
+    const unique = [...new Set(models)];
+    if (!unique.length) {
+      el('mapping-form-status').textContent = '请至少填写一个实际回答模型';
+      return;
+    }
+    if (unique.length !== models.length) {
+      el('mapping-form-status').textContent = '同一规则中每个实际模型只能填写一次';
+      return;
+    }
     const rule = {id: editing || 'map_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
       name: el('mapping-name').value.trim(), enabled: el('mapping-enabled').checked,
       source_model: el('mapping-model').value.trim(), source_ips: el('mapping-scope').value === 'all' ? [] : el('mapping-ips').value.split(/[\s,，]+/).filter(Boolean),
-      targets: [...el('mapping-targets').children].map(row => ({station: row.querySelector('[data-target-station]').value,
-        model: (row.querySelector('[data-target-custom]').hidden ? row.querySelector('[data-target-model]').value : row.querySelector('[data-target-custom]').value).trim()}))};
+      target_models: unique};
     save(editing ? rules.map(r => r.id === editing ? rule : r) : [...rules, rule], true);
   });
+  setInterval(() => {
+    if (!document.hidden && el('mappings-wrap').getClientRects().length && !el('mapping-dialog').open && !busy) {
+      window.refreshModelMappings();
+    }
+  }, 5000);
 })();

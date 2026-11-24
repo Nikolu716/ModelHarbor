@@ -78,7 +78,7 @@ python gateway.py
 | Anthropic | `/v1/messages` |
 | Gemini | `/v1beta/models/{model}:generateContent`、`:streamGenerateContent` |
 
-默认路由保留请求模型；需要代答时，在「站点管理 → 模型映射」明确配置，例如 `gpt-6-sol → OpenCode Go / deepseek-v4.1-flash`。映射支持 OpenAI Responses / Chat，详见[匹配与兼容范围](docs/model-mappings.md)。OpenAI 客户端的 Base URL 通常填写 `http://你的主机:8000/v1`；其他客户端按其协议配置。
+默认路由保留请求模型；需要代答时，在「站点管理 → 模型映射」明确配置，例如 `gpt-6-sol → deepseek-v4.1-flash`，网关会自动选择提供该模型的渠道。映射支持 OpenAI Responses / Chat，详见[匹配与兼容范围](docs/model-mappings.md)。OpenAI 客户端的 Base URL 通常填写 `http://你的主机:8000/v1`；其他客户端按其协议配置。
 
 ## 使用边界
 

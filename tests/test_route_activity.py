@@ -277,7 +277,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             )
             request.client = SimpleNamespace(host="203.0.113.7")
 
-            async def successful_forward(path, body, model, client_ip=None, client_headers=None):
+            async def successful_forward(path, body, model, client_ip=None, client_headers=None, **_):
                 eventlog.add("alpha", model, True, 1, client_ip=client_ip)
                 return Response(status_code=200), False
 
@@ -366,7 +366,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
 
-            async def discover_then_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
+            async def discover_then_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None, **_):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
@@ -421,7 +421,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def flaky_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
+            async def flaky_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None, **_):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
@@ -448,7 +448,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def recovering_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
+            async def recovering_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None, **_):
                 nonlocal calls
                 calls += 1
                 if calls < 3:
@@ -514,7 +514,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             eventlog = EventLog(directory)
             proxy = OpenAIProxy(registry, gateway, eventlog)
 
-            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
+            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None, **_):
                 nonlocal calls
                 calls += 1
                 return Response(status_code=502), True
@@ -541,7 +541,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
+            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None, **_):
                 nonlocal calls
                 calls += 1
                 return Response(status_code=502), True
@@ -566,7 +566,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             cancelled = False
 
-            async def slow_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
+            async def slow_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None, **_):
                 nonlocal cancelled
                 try:
                     await asyncio.sleep(1.0)
@@ -595,7 +595,7 @@ class ProxyActivityTests(unittest.IsolatedAsyncioTestCase):
             proxy = OpenAIProxy(registry, gateway, EventLog(directory))
             calls = 0
 
-            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None):
+            async def unavailable_forward(path: str, body: dict, model: str, client_ip=None, client_headers=None, **_):
                 nonlocal calls
                 calls += 1
                 return Response(status_code=502), True
