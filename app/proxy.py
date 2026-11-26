@@ -28,6 +28,7 @@ from .errors import (
     classify_error,
     connect_error,
     first_byte_error,
+    INVALID_ENCRYPTED_CONTENT,
     timeout_error,
 )
 from .router import Router, RoutePermit
@@ -188,12 +189,16 @@ class _LeasedStreamingResponse(StreamingResponse):
             await self.lease.close()
 
 
-def _error_response(status: int, message: str, err_type: str = "upstream_error") -> JSONResponse:
+def _error_response(status: int, message: str, err_type: str = "upstream_error", *, code=None) -> JSONResponse:
     """OpenAI 兼容的错误响应格式。"""
     return JSONResponse(
         status_code=status,
-        content={"error": {"message": message, "type": err_type, "param": None, "code": status}},
+        content={"error": {"message": message, "type": err_type, "param": None, "code": status if code is None else code}},
     )
+
+
+def _encrypted_history_response(err: UpstreamError, attempts: int) -> Response:
+    return _annotate_attempts(_error_response(400, err.message, "invalid_request_error", code=err.code), attempts)
 
 
 def _error_sse(message: str, path="") -> bytes:
@@ -240,7 +245,7 @@ def _is_param_error(result) -> bool:
     except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
         return False
     err = body.get("error") if isinstance(body, dict) else None
-    if not isinstance(err, dict):
+    if not isinstance(err, dict) or err.get("code") == INVALID_ENCRYPTED_CONTENT:
         return False
     msg = str(err.get("message", "")).lower()
     return any(k in msg for k in PARAM_ERROR_KEYWORDS)
@@ -275,7 +280,7 @@ def _chunk_has_content(chunk: bytes) -> bool:
             continue
         if not isinstance(obj, dict):
             continue
-        if obj.get("error") or obj.get("type") == "error":
+        if obj.get("error") or obj.get("type") == "error" or obj.get("code") == INVALID_ENCRYPTED_CONTENT:
             return True
         if obj.get("type") == "content_block_delta":
             delta = obj.get("delta") or {}
@@ -343,20 +348,25 @@ def stream_text(chunk: bytes) -> str:
     return ""
 
 
-def _looks_like_error(chunk: bytes) -> bool:
-    """部分中转站用 200 + error JSON 表示失败，需识别并触发切换。"""
-    s = chunk.decode("utf-8", errors="replace").strip()
-    if s.startswith(("event:", "data:")):
-        return any(_looks_like_error(line[5:].strip().encode()) for line in s.splitlines() if line.startswith("data:"))
-    if s.startswith("data:"):
-        s = s[5:].strip()
-    if not s or s == "[DONE]":
-        return False
+def _response_error_payload(chunk: bytes) -> bytes | None:
+    """Return the actual error object, whether wrapped in SSE or sent as JSON."""
+    if chunk.lstrip().startswith((b":", b"event:", b"data:", b"id:", b"retry:")):
+        for line in chunk.splitlines():
+            if line.startswith(b"data:") and (payload := line[5:].strip()).startswith(b"{"):
+                if _response_error_payload(payload) is not None:
+                    return payload
+        return None
+    if not chunk.lstrip().startswith(b"{"):
+        return None
     try:
-        obj = json.loads(s)
-    except json.JSONDecodeError:
-        return False  # 无法解析，照常透传
-    return isinstance(obj, dict) and obj.get("error") is not None
+        obj = json.loads(chunk)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    resp = obj.get("response")
+    if (obj.get("error") is not None or obj.get("type") == "error" or obj.get("code") == INVALID_ENCRYPTED_CONTENT
+            or isinstance(resp, dict) and resp.get("error") is not None):
+        return chunk
+    return None
 
 
 def _usage_int(value) -> int | None:
@@ -549,7 +559,7 @@ class _StreamUsageParser:
             response = obj.get('response') or {}
             response = response if isinstance(response, dict) else {}
             err = obj.get('error') or response.get('error')
-            if not err and obj.get('type') == 'error':
+            if not err and (obj.get('type') == 'error' or obj.get('code') == INVALID_ENCRYPTED_CONTENT):
                 err = obj
             incomplete = response.get('incomplete_details') or {}
             expected_stop = (isinstance(incomplete, dict)
@@ -559,7 +569,7 @@ class _StreamUsageParser:
                 err = {'message': '上游响应未完整完成'}
             if err:
                 self.error = str(err.get("message", "上游流式错误") if isinstance(err, dict) else err)[:500]
-                self.error_payload = json.dumps({'error': err}).encode()
+                self.error_payload = json.dumps({'error': err, 'code': obj.get('code')}).encode()
         if isinstance(obj, dict):
             kind = obj.get("type")
             if kind == "message_stop":
@@ -1190,6 +1200,8 @@ class OpenAIProxy:
         - 429 限流 → 短冷却（rate_limit_cooldown 秒内不路由该站），
           订阅制站点尤其重要：避免重试风暴烧掉订阅配额
         """
+        if err.code == INVALID_ENCRYPTED_CONTENT:
+            return err  # Request-bound history is not evidence about station or origin health.
         self._record_request_failure(st, err, **evidence)
         if evidence.get('signature') is not None and evidence['signature'] != st.connection_signature():
             return err
@@ -1386,24 +1398,24 @@ class OpenAIProxy:
                         switched = bool(attempts)
                         detail = "成功" + (f" (经{len(attempts)}次切换)" if switched else "")
                         body_bytes = b"".join(chunks)
-                        if st.cfg.provider == "chatgpt":
+                        raw_error = _response_error_payload(body_bytes)
+                        if st.cfg.provider == "chatgpt" and raw_error is None:
                             from .chatgpt import completed_response
                             try:
                                 completed, subscription_error = completed_response(body_bytes)
                             except (ValueError, TypeError, AttributeError):
                                 completed, subscription_error = None, {"message": "ChatGPT 返回了无效的 Responses 事件流"}
                             if subscription_error:
-                                err = self._handle_failure(st, classify_error(st.cfg.name, 200, json.dumps({"error": subscription_error})),
-                                                           retry_after=resp.headers.get('retry-after'), model=model, path=target_path, signature=signature)
-                                route_error = str(err)
-                                attempts.append(str(err))
-                                has_transient |= not err.deterministic
-                                continue
-                            body_bytes = json.dumps(completed, ensure_ascii=False).encode()
-                        if _looks_like_error(body_bytes):
-                            err = self._handle_failure(st, classify_error(st.cfg.name, 200, body_bytes),
+                                raw_error = json.dumps({"error": subscription_error}).encode()
+                            else:
+                                body_bytes = json.dumps(completed, ensure_ascii=False).encode()
+                                raw_error = _response_error_payload(body_bytes)
+                        if raw_error is not None:
+                            err = self._handle_failure(st, classify_error(st.cfg.name, 200, raw_error),
                                                        retry_after=resp.headers.get('retry-after'), model=model, path=target_path, signature=signature)
                             route_error = str(err)
+                            if err.code == INVALID_ENCRYPTED_CONTENT:
+                                return _encrypted_history_response(err, sent_attempts), False
                             attempts.append(str(err))
                             has_transient |= not err.deterministic
                             continue
@@ -1452,6 +1464,8 @@ class OpenAIProxy:
                     err = classify_error(st.cfg.name, resp.status_code, payload)
                     err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=False, signature=signature)
                     route_error = str(err)
+                    if err.code == INVALID_ENCRYPTED_CONTENT:
+                        return _encrypted_history_response(err, sent_attempts), False
                     if not err.retryable:
                         # 客户端问题，无需再试其他站
                         return (_error_response(err.status_code or 400, err.message,
@@ -1623,6 +1637,8 @@ class OpenAIProxy:
                         err = classify_error(st.cfg.name, resp.status_code, payload)
                         err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
                         route_error = str(err)
+                        if err.code == INVALID_ENCRYPTED_CONTENT:
+                            return _encrypted_history_response(err, sent_attempts), False
                         if not err.retryable:
                             return (_error_response(err.status_code or 400, err.message,
                                                     "invalid_request_error"), False)
@@ -1654,15 +1670,14 @@ class OpenAIProxy:
                     first = buffered[0] if buffered else b""
 
                     # ---- 首块校验（200 + error JSON 的情况） ----
-                    if _looks_like_error(b"".join(buffered)):
-                        raw_error = b"".join(buffered)
-                        for line in raw_error.splitlines():
-                            if line.startswith(b"data:") and _looks_like_error(line[5:].strip()):
-                                raw_error = line[5:].strip()
-                                break
+                    raw_error = _response_error_payload(b"".join(buffered))
+                    if raw_error is not None:
+                        await stream_iter.aclose()
                         err = classify_error(st.cfg.name, 200, raw_error)
                         err = self._handle_failure(st, err, resp.headers.get("retry-after"), model=model, path=target_path, stream=True, signature=signature)
                         route_error = str(err)
+                        if err.code == INVALID_ENCRYPTED_CONTENT:
+                            return _encrypted_history_response(err, sent_attempts), False
                         if not err.retryable:
                             return (_error_response(400, err.message,
                                                     "invalid_request_error"), False)

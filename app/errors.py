@@ -50,6 +50,9 @@ USAGE_LIMIT_KEYWORDS = (
     "usage_limit_exceeded", "用量", "额度用尽", "已达上限",
 )
 
+INVALID_ENCRYPTED_CONTENT = "invalid_encrypted_content"
+_DECRYPTION_MESSAGE = "encrypted function output content could not be decrypted or decoded"
+
 TIMEOUT_MSG = "请求超时（上游无响应）"
 CONNECT_MSG = "连接失败"
 STUCK_MSG = "上游卡死（无数据输出）"
@@ -91,7 +94,7 @@ def _extract_message(payload: bytes | str) -> str:
         return "(空响应体)"
     try:
         data = json.loads(payload)
-        err = data.get("error") or (data.get("response") or {}).get("error")
+        err = data.get("error") or (data.get("response") or {}).get("error") or data
         if isinstance(err, dict):
             msg = err.get("message")
             if msg:
@@ -129,10 +132,18 @@ def classify_error(station: str, status_code: int, payload: bytes | str = "") ->
     lowered = message.lower()
     try:
         data = json.loads(payload)
-        error = data.get("error") or (data.get("response") or {}).get("error") or {}
-        code = (error.get("code") or error.get("type")) if isinstance(error, dict) else None
+        error = data.get("error") or (data.get("response") or {}).get("error") or data
+        if not isinstance(error, dict):
+            error = data
+        explicit_code = error.get("code") or data.get("code")
+        code = explicit_code or error.get("type")
     except (ValueError, TypeError, AttributeError):
-        code, error = None, {}
+        code, explicit_code, error = None, None, {}
+    if (explicit_code == INVALID_ENCRYPTED_CONTENT or lowered.rstrip(".") == _DECRYPTION_MESSAGE
+            or lowered.startswith(_DECRYPTION_MESSAGE + ". ")):
+        return UpstreamError(station, 400, "Encrypted conversation history could not be opened. "
+                             "Use the original upstream account or start a new conversation.",
+                             retryable=False, deterministic=True, code=INVALID_ENCRYPTED_CONTENT)
     if code == "usage_limit_reached":
         # Native Codex can report a usage limit inside an already-open stream.
         def positive(value):

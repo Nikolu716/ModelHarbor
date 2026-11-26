@@ -20,6 +20,7 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from . import __version__
+from .chatgpt import ChatGPTAuthError
 from .config import GatewayConfig
 from .errors import UpstreamError, classify_error
 from .notifier import Notifier
@@ -748,6 +749,13 @@ class HealthMonitor:
                         api_paths, unavailable = opencode_capabilities(json.loads(response.content)["data"], cfg.opencode_plan)
                     found = parsed_models
                     status = "ready"
+            except ChatGPTAuthError as e:
+                # CLI connection failures also inherit ValueError. Only a confirmed
+                # auth failure should pause retries; never publish raw CLI details.
+                if getattr(e, "code", None) == "codex_auth_required":
+                    status, error = "auth_error", "Codex 账号鉴权失败，请重新授权；自动刷新已暂停"
+                else:
+                    status, error = "error", "账号服务请求失败，已保留上次列表，稍后重试"
             except (ValueError, UnicodeError):
                 status, error = "invalid_response", "模型列表格式无效或不完整，已保留上次列表；自动刷新已暂停"
             except (httpx.TimeoutException, httpx.TransportError) as e:
@@ -813,11 +821,15 @@ class HealthMonitor:
             if response.is_success and cfg.provider == "chatgpt":
                 if len(response.content) > 2_000_000:
                     raise ValueError("Catalog too large")
-                models = response.json().get("models")
+                data = response.json()
+                models = data.get("models") if isinstance(data, dict) else None
                 if not isinstance(models, list) or any(not isinstance(item, dict) for item in models):
                     raise ValueError("Invalid ChatGPT model catalog")
+                visible = [item for item in models if item.get("visibility") == "list"]
+                if any(not isinstance(item.get("slug"), str) or not item["slug"].strip() for item in visible):
+                    raise ValueError("Invalid ChatGPT model identifier")
                 return httpx.Response(200, json={"data": [{"id": item["slug"], "display_name": item.get("display_name")}
-                    for item in models if item.get("visibility") == "list" and isinstance(item.get("slug"), str) and item["slug"]]})
+                    for item in visible]})
             if not response.is_success or cfg.provider not in ("anthropic", "gemini"):
                 return response
             if len(response.content) > 2_000_000:

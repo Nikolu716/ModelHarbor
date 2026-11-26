@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from app.codex_account import CodexAccountError
 from app.config import GatewayConfig, StationConfig
 from app.errors import UpstreamError
 from app.health import HealthMonitor, MODEL_REFRESH_INTERVAL
@@ -126,6 +127,48 @@ class ModelDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.expire()
         await self.monitor.discover_models(self.st)
         self.assertGreater(self.st.models_next_refresh_at, time.time() + 599)
+
+    async def test_cli_catalog_failures_retry_only_when_transient(self):
+        self.st.cfg = dataclasses.replace(self.st.cfg, provider='chatgpt', chatgpt_mode='codex_cli')
+        success = httpx.Response(200, json={'models': [{'visibility': 'list', 'slug': 'new'}]})
+        for code, transient in [('codex_workspace_timeout', True), ('codex_network_error', True),
+                                ('codex_rpc_error', True), ('codex_auth_required', False)]:
+            with self.subTest(code=code):
+                self.expire()
+                self.st.probed_models = {'cached'}
+                with patch.object(self.st.client, 'get', new_callable=AsyncMock) as get:
+                    get.side_effect = [CodexAccountError('Bearer secret-marker', code), success]
+                    await self.monitor.discover_models(self.st)
+                    self.assertEqual(self.st.models_discovery_status, 'error' if transient else 'auth_error')
+                    self.assertEqual(self.st.probed_models, {'cached'})
+                    for message in (self.st.models_discovery_error, self.st.last_probe_error):
+                        self.assertTrue(message)
+                        self.assertNotIn('secret-marker', message)
+                    if transient:
+                        self.assertGreater(self.st.models_next_refresh_at, time.time() + 299)
+                    else:
+                        self.assertEqual(self.st.models_next_refresh_at, 0)
+                    await self.monitor.discover_models(self.st)
+                    self.assertEqual(get.await_count, 1)
+                    self.expire()
+                    await self.monitor.discover_models(self.st)
+                    if not transient:
+                        self.assertEqual(get.await_count, 1)
+                        await self.monitor.discover_models(self.st, manual=True)
+                    self.assertEqual(self.st.models_discovery_status, 'ready')
+                    self.assertEqual(self.st.probed_models, {'new'})
+
+    async def test_invalid_chatgpt_catalog_pauses_without_replacing_cache(self):
+        self.st.cfg = dataclasses.replace(self.st.cfg, provider='chatgpt', chatgpt_mode='codex_cli')
+        self.st.probed_models = {'cached'}
+        for payload in ([], {'models': [{'slug': 'partial', 'visibility': 'list'},
+                                        {'slug': None, 'visibility': 'list'}]}):
+            self.expire()
+            self.response = httpx.Response(200, json=payload)
+            await self.monitor.discover_models(self.st, manual=True)
+            self.assertEqual(self.st.models_discovery_status, 'invalid_response')
+            self.assertEqual(self.st.probed_models, {'cached'})
+            self.assertEqual(self.st.models_next_refresh_at, 0)
 
     async def test_deterministic_failure_stops_until_manual_retry(self):
         for status, expected in [(401, 'auth_error'), (403, 'auth_error'),
